@@ -524,12 +524,28 @@ function updateSyncBadge(){
   if(p) p.innerHTML=html;
 }
 
+// If anything blocks a Firestore call without actually erroring it —
+// confirmed possible with Microsoft Edge's Tracking Prevention feature,
+// which can silently block cross-origin storage access — a plain await
+// would hang forever, never resolving and never rejecting, which no
+// try/catch can protect against. This forces every call to give up after
+// a few seconds either way, so the app can proceed with a safe fallback
+// instead of freezing indefinitely. Applied at the root here so it
+// protects every single read/write in the entire app, not just one screen.
+function withTimeout(promise, ms, label){
+  return Promise.race([
+    promise,
+    new Promise((_,reject)=>setTimeout(()=>reject(new Error('Timeout: '+(label||'storage call')+' took too long')), ms))
+  ]);
+}
+const STORAGE_TIMEOUT_MS = 3000; // short on purpose — several of these can run in sequence during login, and an 8s timeout compounding across them was taking over a minute in the worst case
+
 // Reads can legitimately return nothing just because a key hasn't been
 // written yet — that's normal and does NOT mean sync is broken, so it never
 // flips the badge.
 async function sGet(key, fallback){
   try{
-    const doc = await FS_KV.doc(key).get();
+    const doc = await withTimeout(FS_KV.doc(key).get(), STORAGE_TIMEOUT_MS, 'sGet:'+key);
     if(!doc.exists) return fallback;
     const d = doc.data();
     return d && d.value!==undefined ? JSON.parse(d.value) : fallback;
@@ -538,7 +554,7 @@ async function sGet(key, fallback){
 // A write failing is a real problem — Firestore unreachable, blocked by
 // security rules, or no internet connection.
 async function sSet(key, value){
-  try{ await FS_KV.doc(key).set({value: JSON.stringify(value)}); STORAGE_OK=true; }
+  try{ await withTimeout(FS_KV.doc(key).set({value: JSON.stringify(value)}), STORAGE_TIMEOUT_MS, 'sSet:'+key); STORAGE_OK=true; }
   catch(e){ STORAGE_OK=false; console.error('Storage sync mislukt / sync failed:',e); }
   finally { updateSyncBadge(); }
 }
@@ -546,10 +562,10 @@ async function sSet(key, value){
 // so every existing call site (loadHistDates etc.) needed zero changes.
 async function sList(prefix){
   try{
-    const snap = await FS_KV
+    const snap = await withTimeout(FS_KV
       .where(firebase.firestore.FieldPath.documentId(), '>=', prefix)
       .where(firebase.firestore.FieldPath.documentId(), '<', prefix + '\uf8ff')
-      .get();
+      .get(), STORAGE_TIMEOUT_MS, 'sList:'+prefix);
     return {keys: snap.docs.map(d=>d.id)};
   }catch{ return {keys: []}; }
 }
@@ -557,8 +573,8 @@ async function sList(prefix){
 // before any real save happens (a person just staring at the screen).
 async function checkStorageHealth(){
   try{
-    await FS_KV.doc('sys_heartbeat').set({value: String(Date.now())});
-    await FS_KV.doc('sys_heartbeat').get();
+    await withTimeout(FS_KV.doc('sys_heartbeat').set({value: String(Date.now())}), STORAGE_TIMEOUT_MS, 'heartbeat-set');
+    await withTimeout(FS_KV.doc('sys_heartbeat').get(), STORAGE_TIMEOUT_MS, 'heartbeat-get');
     STORAGE_OK=true;
   }catch(e){ STORAGE_OK=false; console.error('Storage nie beskikbaar nie:',e); }
   updateSyncBadge();
@@ -721,7 +737,15 @@ async function ensureLedgerSeeded(){
   const led=getLedger();
   let changed=false;
 
-  const already = await sGet('ledger_seeded_v1', false);
+  // Read all three flags at once instead of one after another — with
+  // three sequential round-trips, any slowness compounds three times over;
+  // in parallel, it only ever costs as much as the slowest single one.
+  const [already, cleaned, nameBackfilled] = await Promise.all([
+    sGet('ledger_seeded_v1', false),
+    sGet('ledger_name_cleanup_v1', false),
+    sGet('ledger_name_backfill_v1', false),
+  ]);
+
   if(!already){
     CLIENT_MASTER.forEach(c=>{
       if(!c.code) return;
@@ -738,18 +762,17 @@ async function ensureLedgerSeeded(){
         changed=true;
       }
     });
-    await sSet('ledger_seeded_v1', true);
+    sSet('ledger_seeded_v1', true); // not awaited — just a bookkeeping flag, doesn't need to block the user seeing their route
   }
 
   // One-time retroactive fix: any client already seeded with the old bug
   // (name duplicated as address, since the Pastel export never had a real
   // person-name column) gets its fake "name" cleared.
-  const cleaned = await sGet('ledger_name_cleanup_v1', false);
   if(!cleaned){
     Object.values(led).forEach(c=>{
       if(c.name && c.name===c.address){ c.name=''; changed=true; }
     });
-    await sSet('ledger_name_cleanup_v1', true);
+    sSet('ledger_name_cleanup_v1', true);
   }
 
   // The Pastel export never had a person's name at all — only code+address.
@@ -758,7 +781,6 @@ async function ensureLedgerSeeded(){
   // schedule and pull the real name across if it's there. Runs AFTER
   // seeding above, since backfilling into a still-empty ledger (on a brand
   // new setup) would silently do nothing.
-  const nameBackfilled = await sGet('ledger_name_backfill_v1', false);
   if(!nameBackfilled){
     const norm=s=>String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
     const nameByAddr={};
@@ -776,7 +798,7 @@ async function ensureLedgerSeeded(){
         if(found){ c.name=found; changed=true; }
       }
     });
-    await sSet('ledger_name_backfill_v1', true);
+    sSet('ledger_name_backfill_v1', true);
   }
 
   if(changed) saveLedger(led);
@@ -936,8 +958,10 @@ async function loginDriver(id){
   document.getElementById('d-name').textContent=d.name;
   document.getElementById('d-date').textContent=formatToday();
   document.querySelectorAll('#d-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab==='route'));
-  if(!CACHE.ready) await hydrateCache();
-  await ensureSchedule();
+  await Promise.all([
+    !CACHE.ready ? hydrateCache() : Promise.resolve(),
+    ensureSchedule(),
+  ]);
   await ensureLedgerSeeded();
   checkStorageHealth();
   // Load today's progress or fresh route
@@ -947,16 +971,14 @@ async function loginDriver(id){
     S.workers=saved.workers||{};
   } else {
     S.route=getTodayRoute(id);
-    try{
-      const skips=await getSkipList(id, todayKey());
-      if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
-    }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
-    try{
-      const overrides=await getDateOverrides(id, todayKey());
-      if(Object.keys(overrides).length){
-        S.route=S.route.map(g=>overrides[g.schedId]?{...g, ...overrides[g.schedId]}:g);
-      }
-    }catch(e){ console.error('Kon nie oorskrywings laai nie:', e); }
+    const [skips, overrides] = await Promise.all([
+      getSkipList(id, todayKey()).catch(e=>{ console.error('Kon nie skip-lys laai nie:', e); return []; }),
+      getDateOverrides(id, todayKey()).catch(e=>{ console.error('Kon nie oorskrywings laai nie:', e); return {}; }),
+    ]);
+    if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
+    if(Object.keys(overrides).length){
+      S.route=S.route.map(g=>overrides[g.schedId]?{...g, ...overrides[g.schedId]}:g);
+    }
     S.vehicle={kmStart:'',kmEnd:'',diesel:''};
     S.workers={};
     S.workers[d.name]={present:true,loan:''};
@@ -2489,19 +2511,16 @@ async function renderUpcoming(ct){
   const dateLbl=target.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
 
   let route=getRouteForDate(S.driver, target);
-  // These two used to be unguarded — if either ever threw (a network
-  // hiccup, a slow connection, anything), the whole function would stop
-  // right here and the screen would stay frozen on whatever it showed
-  // before, even though the date itself had already changed internally.
-  // Now a failure here can never block the date from actually updating.
-  try{
-    const skips=await getSkipList(S.driver, dateKey);
-    if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
-  }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
-  try{
-    const overrides=await getDateOverrides(S.driver, dateKey);
-    if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
-  }catch(e){ console.error('Kon nie oorskrywings laai nie:', e); }
+  // Run both at the same time instead of one after another — if either is
+  // ever slow or blocked, this halves the worst-case wait compared to
+  // doing them in sequence. Each is still individually protected, so one
+  // being slow can't block the other or freeze the screen.
+  const [skips, overrides] = await Promise.all([
+    getSkipList(S.driver, dateKey).catch(e=>{ console.error('Kon nie skip-lys laai nie:', e); return []; }),
+    getDateOverrides(S.driver, dateKey).catch(e=>{ console.error('Kon nie oorskrywings laai nie:', e); return {}; }),
+  ]);
+  if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
+  if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
 
   ct.innerHTML=`
     <div class="rhdr">
