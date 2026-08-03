@@ -925,6 +925,7 @@ document.getElementById('pin-go').onclick=()=>{
 
 async function loginDriver(id){
   S.driver=id; S.driverTab='route'; S.expanded=null;
+  UPCOMING_DATE=null; UPCOMING_STEP=0;
   const d=DRIVERS[id];
   show('driver');
   document.getElementById('d-content').innerHTML='<div class="loadmsg">Laai jou lys… / Loading your list…</div>';
@@ -2432,12 +2433,33 @@ async function endDriverDay(){
 // driver's — for the next week, so they can plan ahead. No action buttons
 // here on purpose: marking a job done only ever happens on the actual day,
 // via the Route tab.
-let UPCOMING_OFFSET=1; // 1 = tomorrow, up to 7 days out
+// Business-day-only navigation — the garden service doesn't work weekends,
+// so browsing "upcoming" should skip straight from Friday to Monday, not
+// land on Saturday/Sunday and fall back to showing some other day's list
+// mislabeled as that date (which is what was happening before).
+let UPCOMING_DATE=null; // ISO date string, lazily set to the first upcoming weekday
+let UPCOMING_STEP=0;    // how many weekdays forward from that first one, 0–6
+function nextBizDate(iso){
+  const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+1);
+  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
+  return d.toISOString().split('T')[0];
+}
+function prevBizDate(iso){
+  const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()-1);
+  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()-1);
+  return d.toISOString().split('T')[0];
+}
+function firstUpcomingBizDate(){
+  const d=new Date(); d.setDate(d.getDate()+1);
+  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
+  return d.toISOString().split('T')[0];
+}
 async function renderUpcoming(ct){
   ct.innerHTML='<div class="loadmsg">Laai... / Loading...</div>';
   const d=DRIVERS[S.driver];
-  const target=new Date(); target.setDate(target.getDate()+UPCOMING_OFFSET);
-  const dateKey=target.toISOString().split('T')[0];
+  if(!UPCOMING_DATE) UPCOMING_DATE=firstUpcomingBizDate();
+  const target=new Date(UPCOMING_DATE+'T00:00:00');
+  const dateKey=UPCOMING_DATE;
   const dateLbl=target.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
 
   let route=getRouteForDate(S.driver, target);
@@ -2452,8 +2474,8 @@ async function renderUpcoming(ct){
       <p>${route.length} tuine beplan</p>
     </div>
     <div style="display:flex;gap:8px;margin:12px 0">
-      <button class="btn-sec btn" style="flex:1" ${UPCOMING_OFFSET<=1?'disabled style="opacity:.4"':''} onclick="UPCOMING_OFFSET--;renderUpcoming(document.getElementById('d-content'))">← Vorige dag</button>
-      <button class="btn-sec btn" style="flex:1" ${UPCOMING_OFFSET>=7?'disabled style="opacity:.4"':''} onclick="UPCOMING_OFFSET++;renderUpcoming(document.getElementById('d-content'))">Volgende dag →</button>
+      <button class="btn-sec btn" style="flex:1" ${UPCOMING_STEP<=0?'disabled style="opacity:.4"':''} onclick="UPCOMING_STEP--;UPCOMING_DATE=prevBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">← Vorige dag</button>
+      <button class="btn-sec btn" style="flex:1" ${UPCOMING_STEP>=6?'disabled style="opacity:.4"':''} onclick="UPCOMING_STEP++;UPCOMING_DATE=nextBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">Volgende dag →</button>
     </div>
     <div id="upcoming-list"></div>`;
 
