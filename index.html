@@ -947,12 +947,16 @@ async function loginDriver(id){
     S.workers=saved.workers||{};
   } else {
     S.route=getTodayRoute(id);
-    const skips=await getSkipList(id, todayKey());
-    if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
-    const overrides=await getDateOverrides(id, todayKey());
-    if(Object.keys(overrides).length){
-      S.route=S.route.map(g=>overrides[g.schedId]?{...g, ...overrides[g.schedId]}:g);
-    }
+    try{
+      const skips=await getSkipList(id, todayKey());
+      if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
+    }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
+    try{
+      const overrides=await getDateOverrides(id, todayKey());
+      if(Object.keys(overrides).length){
+        S.route=S.route.map(g=>overrides[g.schedId]?{...g, ...overrides[g.schedId]}:g);
+      }
+    }catch(e){ console.error('Kon nie oorskrywings laai nie:', e); }
     S.vehicle={kmStart:'',kmEnd:'',diesel:''};
     S.workers={};
     S.workers[d.name]={present:true,loan:''};
@@ -2466,10 +2470,19 @@ async function renderUpcoming(ct){
   const dateLbl=target.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
 
   let route=getRouteForDate(S.driver, target);
-  const skips=await getSkipList(S.driver, dateKey);
-  if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
-  const overrides=await getDateOverrides(S.driver, dateKey);
-  if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
+  // These two used to be unguarded — if either ever threw (a network
+  // hiccup, a slow connection, anything), the whole function would stop
+  // right here and the screen would stay frozen on whatever it showed
+  // before, even though the date itself had already changed internally.
+  // Now a failure here can never block the date from actually updating.
+  try{
+    const skips=await getSkipList(S.driver, dateKey);
+    if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
+  }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
+  try{
+    const overrides=await getDateOverrides(S.driver, dateKey);
+    if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
+  }catch(e){ console.error('Kon nie oorskrywings laai nie:', e); }
 
   ct.innerHTML=`
     <div class="rhdr">
@@ -4587,9 +4600,11 @@ async function schedPreviewFinalList(){
   // not shown-with-a-badge like in the edit view.
   let route=getRouteForDate(driverId, dateObj);
   const totalBeforeSkip=route.length;
-  const skips=await getSkipList(driverId, nextDate);
+  let skips=[];
+  try{ skips=await getSkipList(driverId, nextDate); }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
   route=route.filter(g=>!skips.includes(g.schedId));
-  const overrides=await getDateOverrides(driverId, nextDate);
+  let overrides={};
+  try{ overrides=await getDateOverrides(driverId, nextDate); }catch(e){ console.error('Kon nie oorskrywings laai nie:', e); }
   if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
   const skippedCount=totalBeforeSkip-route.length;
 
@@ -4630,7 +4645,8 @@ async function renderScheduleEditor(forceScroll){
   const d=DRIVERS[driverId];
   const list=((SCHEDULE||ALL_ROUTES)[driverId]?.[week]?.[day])||[];
   const nextDate=nextOccurrenceDate(week,day);
-  const skippedIds=await getSkipList(driverId, nextDate);
+  let skippedIds=[];
+  try{ skippedIds=await getSkipList(driverId, nextDate); }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
   const bg=el('div','mbg'); bg.id='sched-modal';
   bg.innerHTML=`<div class="modal" style="height:97vh;max-height:97vh;padding:14px 14px 18px;gap:8px">
     <div class="mhdr" style="margin-bottom:0">${d.icon} ${d.name} se lys
