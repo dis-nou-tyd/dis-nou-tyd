@@ -928,7 +928,7 @@ document.getElementById('pin-go').onclick=()=>{
 
 async function loginDriver(id){
   S.driver=id; S.driverTab='route'; S.expanded=null;
-  UPCOMING_DATE=null; UPCOMING_STEP=0;
+  UPCOMING_DATE=null;
   const d=DRIVERS[id];
   show('driver');
   document.getElementById('d-content').innerHTML='<div class="loadmsg">Laai jou lys… / Loading your list…</div>';
@@ -2444,8 +2444,7 @@ async function endDriverDay(){
 // so browsing "upcoming" should skip straight from Friday to Monday, not
 // land on Saturday/Sunday and fall back to showing some other day's list
 // mislabeled as that date (which is what was happening before).
-let UPCOMING_DATE=null; // ISO date string, lazily set to the first upcoming weekday
-let UPCOMING_STEP=0;    // how many weekdays forward from that first one, 0–6
+let UPCOMING_DATE=null; // ISO date string — the ONLY state this feature tracks now
 function nextBizDate(iso){
   const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+1);
   while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
@@ -2461,10 +2460,30 @@ function firstUpcomingBizDate(){
   while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
   return d.toISOString().split('T')[0];
 }
+// Counts business days between two ISO dates — used only to decide when to
+// show "you've reached the end," never stored as separate state. This is
+// the fix: previously a SEPARATE counter tracked "how far out" alongside
+// the date itself, and the two could drift apart from each other under
+// rapid clicking (confirmed directly: seen showing step=13 next to the
+// date for step=0). Deriving it fresh from the date every time makes that
+// entire class of bug structurally impossible — there's nothing left that
+// can fall out of sync with the date, because there's only the date.
+function bizDaysBetween(fromISO,toISO){
+  let count=0;
+  const d=new Date(fromISO+'T00:00:00');
+  const end=new Date(toISO+'T00:00:00');
+  while(d.getTime()<end.getTime()){
+    d.setDate(d.getDate()+1);
+    if(d.getDay()!==0 && d.getDay()!==6) count++;
+  }
+  return count;
+}
 async function renderUpcoming(ct){
   ct.innerHTML='<div class="loadmsg">Laai... / Loading...</div>';
   const d=DRIVERS[S.driver];
   if(!UPCOMING_DATE) UPCOMING_DATE=firstUpcomingBizDate();
+  const anchor=firstUpcomingBizDate();
+  const stepNow=bizDaysBetween(anchor, UPCOMING_DATE);
   const target=new Date(UPCOMING_DATE+'T00:00:00');
   const dateKey=UPCOMING_DATE;
   const dateLbl=target.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
@@ -2490,10 +2509,10 @@ async function renderUpcoming(ct){
       <p>${route.length} tuine beplan</p>
     </div>
     <div style="display:flex;gap:8px;margin:12px 0">
-      <button class="btn-sec btn" style="flex:1" ${UPCOMING_STEP<=0?'disabled style="opacity:.4"':''} onclick="UPCOMING_STEP--;UPCOMING_DATE=prevBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">← Vorige dag</button>
-      <button class="btn-sec btn" style="flex:1" ${UPCOMING_STEP>=13?'disabled style="opacity:.4"':''} onclick="UPCOMING_STEP++;UPCOMING_DATE=nextBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">Volgende dag →</button>
+      <button class="btn-sec btn" style="flex:1" ${stepNow<=0?'disabled style="opacity:.4"':''} onclick="UPCOMING_DATE=prevBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">← Vorige dag</button>
+      <button class="btn-sec btn" style="flex:1" ${stepNow>=13?'disabled style="opacity:.4"':''} onclick="UPCOMING_DATE=nextBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">Volgende dag →</button>
     </div>
-    ${UPCOMING_STEP>=13?'<p style="text-align:center;font-size:.78rem;color:var(--t3);margin:-6px 0 10px">Einde van voorskou — 2 weke vorentoe. Kan nie verder gaan nie.</p>':''}
+    ${stepNow>=13?'<p style="text-align:center;font-size:.78rem;color:var(--t3);margin:-6px 0 10px">Einde van voorskou — 2 weke vorentoe. Kan nie verder gaan nie.</p>':''}
     <div id="upcoming-list"></div>`;
 
   const list=document.getElementById('upcoming-list');
