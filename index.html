@@ -678,7 +678,7 @@ function startPolling(){
           // feel like the page was constantly "kicking back to the top."
           const pc=document.getElementById('p-content');
           const prevScroll=pc?pc.scrollTop:0;
-          renderParentTab(S.parentTab);
+          await renderParentTab(S.parentTab);
           const newPc=document.getElementById('p-content');
           if(newPc) newPc.scrollTop=prevScroll;
         }
@@ -1136,8 +1136,8 @@ function payWeekKey(monday){ return monday.toISOString().split('T')[0]; }
 // from the same daily "Werkers" records each driver already fills in.
 async function pullWeekAttendance(driverId, employeeName, dateKeys){
   let days=0, loanEntered=0, noRecordDays=0;
-  for(const dk of dateKeys){
-    const prog=await sGet('progress_'+driverId+'_'+dk, null);
+  const progs=await Promise.all(dateKeys.map(dk=>sGet('progress_'+driverId+'_'+dk, null)));
+  progs.forEach(prog=>{
     const w=prog?.workers?.[employeeName];
     if(w){
       if(w.present) days++;
@@ -1145,7 +1145,7 @@ async function pullWeekAttendance(driverId, employeeName, dateKeys){
     } else if(!prog){
       noRecordDays++; // driver never logged in at all that day — not a confirmed absence
     }
-  }
+  });
   return {days, loanEntered, noRecordDays};
 }
 
@@ -1158,7 +1158,7 @@ let EXP_MONTH_OFFSET=0; // 0 = current month, -1 = last month, etc. — lets par
 let INC_MONTH_OFFSET=0;
 let EXP_FILTER={from:'',to:'',category:'',driverId:''};
 let INC_FILTER={from:'',to:'',clientKey:'',driverId:''};
-function renderPayroll(ct){
+async function renderPayroll(ct){
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
               ['uitgawes','🧾','Uitgawes'],['bank','🏦','Bank']];
   ct.innerHTML=`
@@ -1168,10 +1168,10 @@ function renderPayroll(ct){
                 onclick="BK_SUBTAB='${id}';renderPayroll(document.getElementById('p-content'))">${icon} ${label}</button>`).join('')}
     </div>
     <div id="bk-body"></div>`;
-  if(BK_SUBTAB==='lone') renderWages(document.getElementById('bk-body'));
-  else if(BK_SUBTAB==='inkomste') renderIncome(document.getElementById('bk-body'));
-  else if(BK_SUBTAB==='bank') renderBank(document.getElementById('bk-body'));
-  else renderExpenses(document.getElementById('bk-body'));
+  if(BK_SUBTAB==='lone') await renderWages(document.getElementById('bk-body'));
+  else if(BK_SUBTAB==='inkomste') await renderIncome(document.getElementById('bk-body'));
+  else if(BK_SUBTAB==='bank') await renderBank(document.getElementById('bk-body'));
+  else await renderExpenses(document.getElementById('bk-body'));
 }
 function renderWagesInto(){ renderWages(document.getElementById('bk-body')); }
 function renderIncomeInto(){ renderIncome(document.getElementById('bk-body')); }
@@ -2168,6 +2168,32 @@ async function renderWages(ct){
   let bodyHtml='', grandNetto=0, grandUIF=0, grandLeen=0;
   PR_DEDUCTIONS={};
 
+  // Phase 1: flatten every person across every group, then fetch every
+  // single one's attendance data AT THE SAME TIME instead of one after
+  // another. This used to be a driver-by-driver, day-by-day sequential
+  // chain — for ~28 people × 5 days each, that's 140+ round-trips done one
+  // at a time, which is exactly why this tab could feel like it loads
+  // forever. Gathering it all in parallel turns that into one wait, not 140.
+  const flatPeople=[];
+  for(const g of groups){
+    const rowNames = g.isDriver ? [{name:g.label.replace(/^\S+\s/,''),isLead:true,rate:g.rate,driverId:g.driverId}, ...g.members.map(m=>({name:m,isLead:false,rate:EMPLOYEE_RATES[m]??242,driverId:g.driverId}))]
+                                 : g.members.map(m=>({name:m,isLead:false,rate:EMPLOYEE_RATES[m]??0,driverId:null}));
+    for(const person of rowNames) flatPeople.push({g,person});
+  }
+  const attendanceData=await Promise.all(flatPeople.map(async ({person})=>{
+    if(!person.driverId) return {days:0,noRecordDays:0};
+    if(person.isLead){
+      const progs=await Promise.all(dateKeys.map(dk=>sGet('progress_'+person.driverId+'_'+dk,null)));
+      const d2=progs.filter(p=>p).length;
+      return {days:d2, noRecordDays:dateKeys.length-d2};
+    }
+    const att=await pullWeekAttendance(person.driverId, person.name, dateKeys);
+    return {days:att.days, noRecordDays:att.noRecordDays};
+  }));
+
+  // Phase 2: build the display — purely synchronous from here, everything
+  // needed is already sitting in attendanceData.
+  let flatIdx=0;
   for(const g of groups){
     const rowNames = g.isDriver ? [{name:g.label.replace(/^\S+\s/,''),isLead:true,rate:g.rate,driverId:g.driverId}, ...g.members.map(m=>({name:m,isLead:false,rate:EMPLOYEE_RATES[m]??242,driverId:g.driverId}))]
                                  : g.members.map(m=>({name:m,isLead:false,rate:EMPLOYEE_RATES[m]??0,driverId:null}));
@@ -2176,18 +2202,8 @@ async function renderWages(ct){
       const key=person.name;
       const rec=saved[key]||{};
       let days=rec.days, loanNew=rec.leenNew;
-      let noRecordDays=0;
-      if(person.driverId){
-        if(person.isLead){
-          let d2=0;
-          for(const dk of dateKeys){ const p=await sGet('progress_'+person.driverId+'_'+dk,null); if(p) d2++; else noRecordDays++; }
-          if(days===undefined) days=d2;
-        } else {
-          const att=await pullWeekAttendance(person.driverId, person.name, dateKeys);
-          noRecordDays=att.noRecordDays;
-          if(days===undefined) days=att.days;
-        }
-      } else if(days===undefined) days=0;
+      const {days:fetchedDays}=attendanceData[flatIdx]; flatIdx++;
+      if(days===undefined) days=person.driverId?fetchedDays:0;
       if(loanNew===undefined) loanNew=0;
       const rate = rec.rate!==undefined? rec.rate : person.rate;
       const totaal = (Number(days)||0)*(Number(rate)||0);
@@ -3114,19 +3130,19 @@ document.querySelectorAll('#p-tabs .tab').forEach(t=>{
   t.onclick=()=>renderParentTab(t.dataset.tab);
 });
 
-function renderParentTab(tab){
+async function renderParentTab(tab){
   if(S.isOffice && (tab==='invoices' || tab==='statements' || tab==='ledger' || tab==='payroll')) tab='overview';
   S.parentTab=tab;
   document.querySelectorAll('#p-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===tab));
   const c=document.getElementById('p-content');
   c.innerHTML='';
-  if(tab==='overview')   renderOverview(c);
-  if(tab==='quotes')     renderQuotesParent(c);
-  if(tab==='invoices')   renderInvoices(c);
-  if(tab==='ledger')     renderLedger(c);
-  if(tab==='statements') renderStatements(c);
-  if(tab==='payroll')    renderPayroll(c);
-  if(tab==='history')    renderHistory(c);
+  if(tab==='overview')   await renderOverview(c);
+  if(tab==='quotes')     await renderQuotesParent(c);
+  if(tab==='invoices')   await renderInvoices(c);
+  if(tab==='ledger')     await renderLedger(c);
+  if(tab==='statements') await renderStatements(c);
+  if(tab==='payroll')    await renderPayroll(c);
+  if(tab==='history')    await renderHistory(c);
 }
 
 // ══════════════════ PARENT: OVERVIEW ══════════════════════════════════════════
@@ -3163,13 +3179,13 @@ function renderOverview(ct){
       const doneToday=prog&&prog.route? prog.route.filter(g=>g.completed).length : 0;
       const skippedToday=prog&&prog.route? prog.route.filter(g=>g.skipReason).length : 0;
       const totalToday=prog&&prog.route? prog.route.length : dayCount;
-      const pct=totalToday>0? Math.round(100*doneToday/totalToday):0;
+      const pct=totalToday>0? Math.round(100*(doneToday+skippedToday)/totalToday):0;
       const started=!!prog;
       return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
         <div class="dsav" style="background:${d.color}">${d.icon}</div>
         <div class="dsi">
           <h3>${d.name}</h3>
-          <p>${started? doneToday+' / '+totalToday+' tuine klaar'+(skippedToday>0?' · '+skippedToday+' geskip':'') : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+          <p>${started? doneToday+' / '+totalToday+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
           <div class="dsprog"><div class="dspf" style="background:${d.color};width:${pct}%"></div></div>
         </div>
       </div>`;
@@ -3242,14 +3258,14 @@ function renderOfficeOverview(ct,now,dayEn,week){
     const doneToday=prog&&prog.route? prog.route.filter(g=>g.completed).length : 0;
     const skippedToday=prog&&prog.route? prog.route.filter(g=>g.skipReason).length : 0;
     const totalCount=route.length;
-    const pct=totalCount>0? Math.round(100*doneToday/totalCount):0;
+    const pct=totalCount>0? Math.round(100*(doneToday+skippedToday)/totalCount):0;
     const started=!!prog;
     grandTotal+=total;
     return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
       <div class="dsav" style="background:${d.color}">${d.icon}</div>
       <div class="dsi">
         <h3>${d.name}</h3>
-        <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' · '+skippedToday+' geskip':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+        <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
         <div class="dsprog"><div class="dspf" style="background:${d.color};width:${pct}%"></div></div>
         <p style="font-weight:800;font-size:1.05rem;color:${d.color};margin-top:4px">R${total.toFixed(0)}</p>
       </div>
