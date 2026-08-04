@@ -421,7 +421,6 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
     <button class="tab" data-tab="quotes">💬 Kwotasies</button>
     <button class="tab" data-tab="workers">📋 Dagstaat</button>
     <button class="tab" data-tab="summary">📊 Opsomming</button>
-    <button class="tab" data-tab="upcoming">📅 Vooruitskou</button>
   </div>
   <div class="content" id="d-content"></div>
 </div>
@@ -495,6 +494,7 @@ const S = {
   screen:'login', driver:null, driverTab:'route', parentTab:'overview',
   route:[], expanded:null, vehicle:{kmStart:'',kmEnd:'',diesel:''},
   workers:{}, selectedClient:null,
+  workDate:null, // null = working on today; set to an ISO date when backfilling a missed day
 };
 
 // ══════════════════ STORAGE (shared, live-synced across devices) ═════════════
@@ -604,15 +604,16 @@ async function hydrateCache(){
   CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.invSeq=invSeq; CACHE.quotes=quotes; CACHE.expenses=expenses; CACHE.bankTxns=bankTxns; CACHE.creditNotes=creditNotes; CACHE.ready=true;
 }
 
-async function loadProgress(dId){
-  const key='progress_'+dId+'_'+todayKey();
+async function loadProgress(dId, dateKey){
+  const dk=dateKey||todayKey();
+  const key='progress_'+dId+'_'+dk;
   const p = await sGet(key, null);
-  if(p) CACHE.progress[dId+'_'+todayKey()]=p;
+  if(p) CACHE.progress[dId+'_'+dk]=p;
   return p;
 }
 function saveProgress(){
   if(!S.driver) return;
-  const dk=todayKey(), ck=S.driver+'_'+dk, ts=Date.now();
+  const dk=S.workDate||todayKey(), ck=S.driver+'_'+dk, ts=Date.now();
   const payload={route:S.route, vehicle:S.vehicle, workers:S.workers, ts};
   CACHE.progress[ck]=payload;
   S._lastLocalSave=ts;
@@ -948,9 +949,39 @@ document.getElementById('pin-go').onclick=()=>{
   }
 };
 
+// Loads yesterday's route for backfilling — same loading logic as a normal
+// login, just pointed at yesterday's date instead of today's. Once saved,
+// this produces exactly the same invoices/progress records a normal day
+// would, dated for yesterday — nothing distinguishes it from a live entry.
+async function switchToYesterdayList(){
+  const id=S.driver;
+  const y=new Date(); y.setDate(y.getDate()-1);
+  const yk=y.toISOString().split('T')[0];
+  S.workDate=yk;
+  document.getElementById('d-content').innerHTML='<div class="loadmsg">Laai gister se lys… / Loading yesterday\'s list…</div>';
+  const saved=await loadProgress(id, yk);
+  if(saved && saved.route && saved.route.length>0){
+    S.route=saved.route; S.vehicle=saved.vehicle||{kmStart:'',kmEnd:'',diesel:''};
+    S.workers=saved.workers||{};
+  } else {
+    S.route=getRouteForDate(id, y);
+    const [skips, overrides] = await Promise.all([
+      getSkipList(id, yk).catch(()=>[]),
+      getDateOverrides(id, yk).catch(()=>({})),
+    ]);
+    if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
+    if(Object.keys(overrides).length) S.route=S.route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
+    S.vehicle={kmStart:'',kmEnd:'',diesel:''};
+    S.workers={};
+    const d=DRIVERS[id];
+    S.workers[d.name]={present:true,loan:''};
+    if(d.workers) d.workers.forEach(w=>{ S.workers[w]={present:true,loan:''}; });
+  }
+  renderDriverTab('route');
+}
+
 async function loginDriver(id){
-  S.driver=id; S.driverTab='route'; S.expanded=null;
-  UPCOMING_DATE=null;
+  S.driver=id; S.driverTab='route'; S.expanded=null; S.workDate=null;
   const d=DRIVERS[id];
   show('driver');
   document.getElementById('d-content').innerHTML='<div class="loadmsg">Laai jou lys… / Loading your list…</div>';
@@ -2419,7 +2450,6 @@ function renderDriverTab(tab){
   const c=document.getElementById('d-content');
   c.innerHTML='';
   if(tab==='route')    renderRoute(c);
-  if(tab==='upcoming') renderUpcoming(c);
   if(tab==='quotes')   renderQuotesDriver(c);
   if(tab==='workers')  renderWorkers(c);
   if(tab==='summary')  renderSummary(c);
@@ -2450,7 +2480,7 @@ async function shareHistoryDayPDF(){
 
 async function endDriverDay(){
   if(!confirm('Is jy seker jou dag is klaar? Bestuur sal jou verslag kan sien.\n\nAre you sure your day is done?')) return;
-  const dk=todayKey(), ck=S.driver+'_'+dk;
+  const dk=S.workDate||todayKey(), ck=S.driver+'_'+dk;
   const payload={route:S.route, vehicle:S.vehicle, workers:S.workers, ts:Date.now(), dayEnded:true, dayEndedAt:Date.now()};
   CACHE.progress[ck]=payload;
   await sSet('progress_'+S.driver+'_'+dk, payload);
@@ -2459,102 +2489,61 @@ async function endDriverDay(){
 
 // ══════════════════ UPCOMING (read-only preview of future days) ═══════════════
 // Drivers can now see what's coming — their own list only, never another
-// driver's — for the next week, so they can plan ahead. No action buttons
-// here on purpose: marking a job done only ever happens on the actual day,
-// via the Route tab.
-// Business-day-only navigation — the garden service doesn't work weekends,
-// so browsing "upcoming" should skip straight from Friday to Monday, not
-// land on Saturday/Sunday and fall back to showing some other day's list
-// mislabeled as that date (which is what was happening before).
-let UPCOMING_DATE=null; // ISO date string — the ONLY state this feature tracks now
-function nextBizDate(iso){
-  const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()+1);
-  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
-  return d.toISOString().split('T')[0];
-}
-function prevBizDate(iso){
-  const d=new Date(iso+'T00:00:00'); d.setDate(d.getDate()-1);
-  while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()-1);
-  return d.toISOString().split('T')[0];
-}
+// Shows tomorrow's list in a simple read-only popup — deliberately no
+// multi-day browsing, no stored "which day am I on" state, nothing that
+// can drift out of sync with anything else. Every time this opens, it
+// computes "tomorrow" fresh from scratch. Replaces an earlier multi-day
+// version that tracked navigation state separately from the displayed
+// date — under real-world conditions those two could fall out of sync
+// with each other, which no amount of patching fully resolved, so this
+// removes the state entirely instead.
 function firstUpcomingBizDate(){
   const d=new Date(); d.setDate(d.getDate()+1);
   while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
   return d.toISOString().split('T')[0];
 }
-// Counts business days between two ISO dates — used only to decide when to
-// show "you've reached the end," never stored as separate state. This is
-// the fix: previously a SEPARATE counter tracked "how far out" alongside
-// the date itself, and the two could drift apart from each other under
-// rapid clicking (confirmed directly: seen showing step=13 next to the
-// date for step=0). Deriving it fresh from the date every time makes that
-// entire class of bug structurally impossible — there's nothing left that
-// can fall out of sync with the date, because there's only the date.
-function bizDaysBetween(fromISO,toISO){
-  let count=0;
-  const d=new Date(fromISO+'T00:00:00');
-  const end=new Date(toISO+'T00:00:00');
-  while(d.getTime()<end.getTime()){
-    d.setDate(d.getDate()+1);
-    if(d.getDay()!==0 && d.getDay()!==6) count++;
-  }
-  return count;
-}
-async function renderUpcoming(ct){
-  ct.innerHTML='<div class="loadmsg">Laai... / Loading...</div>';
-  const d=DRIVERS[S.driver];
-  if(!UPCOMING_DATE) UPCOMING_DATE=firstUpcomingBizDate();
-  const anchor=firstUpcomingBizDate();
-  const stepNow=bizDaysBetween(anchor, UPCOMING_DATE);
-  const target=new Date(UPCOMING_DATE+'T00:00:00');
-  const dateKey=UPCOMING_DATE;
+async function showTomorrowList(){
+  document.getElementById('tomorrow-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='tomorrow-modal';
+  bg.innerHTML=`<div class="modal"><div id="tomorrow-body"><div class="loadmsg">Laai... / Loading...</div></div></div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+
+  const dateKey=firstUpcomingBizDate();
+  const target=new Date(dateKey+'T00:00:00');
   const dateLbl=target.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
 
   let route=getRouteForDate(S.driver, target);
-  // Run both at the same time instead of one after another — if either is
-  // ever slow or blocked, this halves the worst-case wait compared to
-  // doing them in sequence. Each is still individually protected, so one
-  // being slow can't block the other or freeze the screen.
   const [skips, overrides] = await Promise.all([
-    getSkipList(S.driver, dateKey).catch(e=>{ console.error('Kon nie skip-lys laai nie:', e); return []; }),
-    getDateOverrides(S.driver, dateKey).catch(e=>{ console.error('Kon nie oorskrywings laai nie:', e); return {}; }),
+    getSkipList(S.driver, dateKey).catch(()=>[]),
+    getDateOverrides(S.driver, dateKey).catch(()=>({})),
   ]);
   if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
   if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
 
-  ct.innerHTML=`
-    <div class="rhdr">
-      <h2>${dateLbl}</h2>
-      <p>${route.length} tuine beplan</p>
+  const body=document.getElementById('tomorrow-body');
+  if(!body) return; // modal was closed while this was loading
+  body.innerHTML=`
+    <div class="mhdr">📅 ${dateLbl}
+      <button class="mclose" onclick="document.getElementById('tomorrow-modal').remove()">✕</button>
     </div>
-    <div style="display:flex;gap:8px;margin:12px 0">
-      <button class="btn-sec btn" style="flex:1" ${stepNow<=0?'disabled style="opacity:.4"':''} onclick="UPCOMING_DATE=prevBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">← Vorige dag</button>
-      <button class="btn-sec btn" style="flex:1" ${stepNow>=13?'disabled style="opacity:.4"':''} onclick="UPCOMING_DATE=nextBizDate(UPCOMING_DATE);renderUpcoming(document.getElementById('d-content'))">Volgende dag →</button>
-    </div>
-    ${stepNow>=13?'<p style="text-align:center;font-size:.78rem;color:var(--t3);margin:-6px 0 10px">Einde van voorskou — 2 weke vorentoe. Kan nie verder gaan nie.</p>':''}
-    <div id="upcoming-list"></div>`;
-
-  const list=document.getElementById('upcoming-list');
-  if(route.length===0){
-    list.innerHTML='<div class="empty"><div class="ei">📋</div><h3>Geen tuine hierdie dag nie</h3></div>';
-    return;
-  }
-  route.forEach((g,i)=>{
-    const card=el('div','gc');
-    card.style.cssText='margin-bottom:10px;opacity:.92';
-    card.innerHTML=`
-      <div style="display:flex;gap:10px;align-items:start">
-        <div style="width:26px;height:26px;border-radius:50%;background:var(--bg);display:flex;
-                    align-items:center;justify-content:center;font-size:.78rem;font-weight:700;color:var(--t2);flex-shrink:0">${i+1}</div>
-        <div style="flex:1;min-width:0">
-          <div style="font-weight:700">${g.address}${g.name?' · '+g.name:''}</div>
-          ${g.notes?`<div style="font-size:.82rem;color:var(--t2);margin-top:2px">${g.notes}</div>`:''}
-          ${g.tydNote?`<div style="font-size:.78rem;color:var(--ora);margin-top:2px">⏱ ${g.tydNote}</div>`:''}
-          ${g.belangrik?`<div style="font-size:.78rem;color:#C62828;margin-top:2px">⚠️ ${g.belangrik}</div>`:''}
-        </div>
-      </div>`;
-    list.appendChild(card);
-  });
+    <p style="font-size:.85rem;color:var(--t2);margin:-4px 0 8px">${route.length} tuine beplan</p>
+    <div style="max-height:65vh;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
+      ${route.length===0?'<div class="empty"><div class="ei">📋</div><h3>Geen tuine hierdie dag nie</h3></div>':''}
+      ${route.map((g,i)=>`
+        <div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px">
+          <div style="display:flex;gap:10px;align-items:start">
+            <div style="width:24px;height:24px;border-radius:50%;background:var(--bg);display:flex;
+                        align-items:center;justify-content:center;font-size:.74rem;font-weight:700;color:var(--t2);flex-shrink:0">${i+1}</div>
+            <div style="flex:1;min-width:0">
+              <div style="font-weight:700">${g.address}${g.name?' · '+g.name:''}</div>
+              ${g.notes?`<div style="font-size:.8rem;color:var(--t2);margin-top:2px">${g.notes}</div>`:''}
+              ${g.tydNote?`<div style="font-size:.78rem;color:var(--ora);margin-top:2px">⏱ ${g.tydNote}</div>`:''}
+              ${g.belangrik?`<div style="font-size:.78rem;color:#C62828;margin-top:2px">⚠️ ${g.belangrik}</div>`:''}
+            </div>
+          </div>
+        </div>`).join('')}
+    </div>`;
 }
 
 function renderRoute(ct){
@@ -2562,14 +2551,15 @@ function renderRoute(ct){
     skipped=r.filter(g=>g.skipReason).length,
     left=r.length-done-skipped,
     pct=r.length?Math.round(done/r.length*100):0;
-  const now=new Date();
+  const now=S.workDate ? new Date(S.workDate+'T00:00:00') : new Date();
   const dayEn=now.toLocaleDateString('en-US',{weekday:'long'});
   const dayAf=DAYS_AF[dayEn]||dayEn;
   const d=DRIVERS[S.driver];
+  const isBackfill=!!S.workDate;
 
   // Day header
   const hdr=el('div','dayhdr');
-  hdr.innerHTML=`<h2>${dayAf}</h2>
+  hdr.innerHTML=`<h2>${dayAf}${isBackfill?' (gister)':''}</h2>
     <p class="sub">${r.length} tuine${d.vehicle?' · '+d.vehicle:''}
       ${r.length>0&&r[0]._fallback?' <span style="background:rgba(255,255,255,.2);border-radius:4px;padding:1px 6px;font-size:.68rem">Ander dag</span>':''}
     </p>
@@ -2580,6 +2570,28 @@ function renderRoute(ct){
       <div class="stat"><div class="v">${skipped}</div><div class="l">Geskip</div></div>
     </div>`;
   ct.appendChild(hdr);
+
+  // Backfill toggle — lets a driver fill in yesterday's list if they missed
+  // it, or switch back to today. Deliberately limited to yesterday only,
+  // and behaves exactly like a normal day once saved — same invoices, same
+  // everything, no special marker anywhere else in the app.
+  if(isBackfill){
+    const backBtn=el('button','btn-sec btn');
+    backBtn.style.cssText='width:100%;margin-bottom:10px;background:var(--g1);border-color:var(--g8);color:var(--g8);font-weight:700';
+    backBtn.innerHTML='← Terug na vandag / Back to today';
+    backBtn.onclick=()=>{ S.workDate=null; loginDriver(S.driver); };
+    ct.appendChild(backBtn);
+  } else {
+    const y=new Date(); y.setDate(y.getDate()-1);
+    const yWeekday=y.getDay();
+    if(yWeekday!==0 && yWeekday!==6){ // only offer this if yesterday was an actual work day
+      const fillBtn=el('button','btn-sec btn');
+      fillBtn.style.cssText='width:100%;margin-bottom:10px;font-size:.85rem';
+      fillBtn.innerHTML='📝 Was jy gister nie by nie? Vul gister se lys in';
+      fillBtn.onclick=()=>switchToYesterdayList();
+      ct.appendChild(fillBtn);
+    }
+  }
 
   if(r.length===0){
     const emp=el('div','empty');
@@ -2592,6 +2604,14 @@ function renderRoute(ct){
   ab.textContent='＋ Eenmalige kliënt / Once-off';
   ab.onclick=()=>showOnceOff();
   ct.appendChild(ab);
+
+  // Small, single-purpose button to peek at tomorrow's list — no
+  // multi-day browsing, nothing stored, just "what's tomorrow."
+  const tb=el('button','btn-sec btn');
+  tb.style.cssText='width:100%;margin-top:8px;font-size:.85rem';
+  tb.innerHTML='📅 Bekyk môre se lys / View tomorrow\'s list';
+  tb.onclick=()=>showTomorrowList();
+  ct.appendChild(tb);
 
   // Garden cards
   r.forEach((g,i)=>ct.appendChild(makeGardenCard(g,i)));
@@ -2747,9 +2767,9 @@ function calcDur(a,b){
 // ══════════════════ INVOICE CREATION ══════════════════════════════════════════
 function createInvoice(garden){
   const invs=getInvoices();
-  const now=new Date();
+  const now=S.workDate ? new Date(S.workDate+'T12:00:00') : new Date();
   const dateStr=now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  const dateKey=now.toISOString().split('T')[0];
+  const dateKey=S.workDate || now.toISOString().split('T')[0];
   const driver=DRIVERS[S.driver];
   const amount=(garden.cost||0)+(parseFloat(garden.extraWorkAmount)||0);
   const cashPaid=garden.cash&&garden.cashAmount;
