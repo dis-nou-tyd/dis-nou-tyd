@@ -454,21 +454,21 @@ const CLIENT_MASTER = [{"code":"3DE001","name":"3E LAAN 24 SKULD","d120":0.0,"d9
 
 // ══════════════════ CONFIG ════════════════════════════════════════════════════
 const PARENT_PIN = '2580';
-const OFFICE_PIN = '1470';
+const OFFICE_PIN = '1985';
 const DRIVERS = {
   jasper: {name:'Jasper', icon:'🌿', color:'#2E7D32', pin:'1',
     workers:['Pierre Jantjies','Mervin Nero','Lionel Pieterse','Dawid Faro','Ismael'],
     vehicle:'CFP11644', rate:350},
   johan:  {name:'Johan',  icon:'🌱', color:'#1565C0', pin:'2',
-    workers:['Darryl','Gavin Rosant','Cameron Schlimmert','Lario Witbooi','Keathwin'],
+    workers:['Darryl','Gavin Rosant','Cameron Schlimmert','Lario Witbooi','Sergio'],
     vehicle:'', rate:370},
   nickey: {name:'Nickey', icon:'🌾', color:'#6A1B9A', pin:'3',
-    workers:['Wayne Jansen','Waydie','Lolla Jansen','Brandon','Ruben'],
+    workers:['Wayne Jansen','Waydie','Lolla Jansen','Brandon','Will'],
     vehicle:'', rate:350},
   gordon: {name:'Gordon', icon:'🍃', color:'#E65100', pin:'4',
-    workers:['Boeta Jagers','Sergio','Poenkels','Will','Reagan Jantjies','Emile'],
+    workers:['Boeta Jagers','Poenkels','Reagan Jantjies','Emile'],
     vehicle:'', rate:370},
-  pierre: {name:'Pierre (Reserwevoertuig)', icon:'🚗', color:'#00695C', pin:'5',
+  pierre: {name:'Pierre (Terreinbestuurder)', icon:'🚗', color:'#00695C', password:'vanzyl1975',
     workers:[],  // casuals only — differ day to day, added via the "Voeg werker by" field
     vehicle:'', rate:350},
 };
@@ -670,19 +670,38 @@ function startPolling(){
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
         await Promise.all(Object.keys(DRIVERS).map(fetchDriverProgress));
         const NO_AUTOREFRESH_TABS=['payroll','map','statements'];
-        if(S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)) renderParentTab(S.parentTab);
+        if(S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
+          // Preserve scroll position across this background refresh — a
+          // full re-render was resetting scroll to the top every ~6
+          // seconds on tabs not in the exclusion list above (confirmed on
+          // Geskiedenis, and on Jan's overview specifically), making it
+          // feel like the page was constantly "kicking back to the top."
+          const pc=document.getElementById('p-content');
+          const prevScroll=pc?pc.scrollTop:0;
+          renderParentTab(S.parentTab);
+          const newPc=document.getElementById('p-content');
+          if(newPc) newPc.scrollTop=prevScroll;
+        }
       } else if(S.screen==='driver' && S.driver){
         if(S.driverTab==='quotes'){
           CACHE.quotes=await sGet('quotes',CACHE.quotes);
           renderQuotesDriver(document.getElementById('d-content'));
         }
-        // Lightweight self-check in case this driver is also open on another tablet.
-        const dk=todayKey(), ck=S.driver+'_'+dk;
-        const remote = await sGet('progress_'+S.driver+'_'+dk, null);
-        if(remote && remote.ts && (!CACHE.progress[ck] || remote.ts>CACHE.progress[ck].ts) && remote.ts>(S._lastLocalSave||0)){
-          S.route=remote.route; S.vehicle=remote.vehicle||S.vehicle; S.workers=remote.workers||S.workers;
-          CACHE.progress[ck]=remote;
-          if(S.driverTab==='route') refresh();
+        // Lightweight self-check in case this driver is also open on another
+        // tablet — but only when working on TODAY. While backfilling a past
+        // day (S.workDate set), this used to still hardcode today's date,
+        // silently overwriting the backfill screen with today's live route
+        // every ~6 seconds — and if anything was saved during that window,
+        // today's content got written under yesterday's storage key,
+        // corrupting it. Skipping entirely during backfill avoids that.
+        if(!S.workDate){
+          const dk=todayKey(), ck=S.driver+'_'+dk;
+          const remote = await sGet('progress_'+S.driver+'_'+dk, null);
+          if(remote && remote.ts && (!CACHE.progress[ck] || remote.ts>CACHE.progress[ck].ts) && remote.ts>(S._lastLocalSave||0)){
+            S.route=remote.route; S.vehicle=remote.vehicle||S.vehicle; S.workers=remote.workers||S.workers;
+            CACHE.progress[ck]=remote;
+            if(S.driverTab==='route') refresh();
+          }
         }
       }
     }catch(e){ /* stay silent, retry next tick */ }
@@ -867,7 +886,15 @@ function makeFresh(dId,clients,isF){
   return clients.map((c,i)=>({
     ...c,
     schedId:c.id,
-    id:dId+'_'+i+'_'+todayKey(),
+    // Was dId+'_'+i+'_'+todayKey() — used the item's POSITION in whatever
+    // array was passed in. That's fine for a full day's route (positions
+    // 0,1,2... are naturally unique there), but anything processed as its
+    // own small array — like a single client added live via a schedule
+    // edit — also got position 0, colliding with whatever was already at
+    // position 0 in the main route. One tap would then update every
+    // client sharing that id at once. Using the client's own schedule id
+    // instead is unique regardless of what array it's processed alongside.
+    id:dId+'_'+(c.id||i)+'_'+todayKey(),
     completed:false, active:false,
     timeIn:'', timeOut:'', durationMin:0,
     cash:false, cashAmount:'',
@@ -904,8 +931,18 @@ function initLogin(){
   ob.onclick=()=>openPin('office');
   grid.appendChild(ob);
 
-  // Drivers
+  // Pierre (Terreinbestuurder) — a supervisory role now, not just a driver,
+  // so he gets a full-width button like Bestuur/Jan, right below Jan.
+  const prb=document.createElement('button');
+  prb.className='dbtn pbtn';
+  prb.innerHTML=`<div class="dav" style="background:${DRIVERS.pierre.color}">${DRIVERS.pierre.icon}</div><span>Pierre (Terreinbestuurder)</span>`;
+  prb.onclick=()=>openPin('pierre');
+  grid.appendChild(prb);
+
+  // Drivers (Pierre excluded here — he has his own big button above, though
+  // he still keeps his normal driver tabs once logged in)
   Object.entries(DRIVERS).forEach(([id,d])=>{
+    if(id==='pierre') return;
     const b=document.createElement('button');
     b.className='dbtn';
     b.innerHTML=`<div class="dav" style="background:${d.color}">${d.icon}</div><span>${d.name.split(' ')[0]}</span>`;
@@ -938,9 +975,11 @@ document.getElementById('pin-in').addEventListener('keydown',e=>{
 
 document.getElementById('pin-go').onclick=()=>{
   const val=document.getElementById('pin-in').value.trim();
+  const targetDriver=PIN_TARGET && DRIVERS[PIN_TARGET];
+  const driverMatch=targetDriver && val===(targetDriver.password!==undefined?targetDriver.password:targetDriver.pin);
   if(PIN_TARGET==='parents' && val===PARENT_PIN){ loginParent(); }
   else if(PIN_TARGET==='office' && val===OFFICE_PIN){ loginOffice(); }
-  else if(PIN_TARGET && DRIVERS[PIN_TARGET] && val===DRIVERS[PIN_TARGET].pin){ loginDriver(PIN_TARGET); }
+  else if(driverMatch){ loginDriver(PIN_TARGET); }
   else {
     document.getElementById('pin-err').innerHTML=
       '<div class="err">Verkeerde wagwoord / Wrong password</div>';
@@ -2643,9 +2682,13 @@ function makeGardenCard(g,idx){
 
   let actbtn='';
   if(g.completed)
-    actbtn=`<span class="donelbl">✓ Klaar</span>`;
+    actbtn=`<span class="donelbl">✓ Klaar</span>
+      <button onclick="if(confirm('Ontdoen? Die faktuur sal ook verwyder word.'))undoFinish('${g.id}',event)" title="Ontdoen"
+              style="background:none;border:none;color:var(--t3);font-size:.85rem;padding:2px 4px;cursor:pointer">↩️</button>`;
   else if(g.active)
-    actbtn=`<button class="finbtn" onclick="finishGarden('${g.id}',event)">✓ Klaar</button>`;
+    actbtn=`<button class="finbtn" onclick="finishGarden('${g.id}',event)">✓ Klaar</button>
+      <button onclick="undoStart('${g.id}',event)" title="Ontdoen Begin"
+              style="background:none;border:none;color:var(--t3);font-size:.85rem;padding:2px 4px;cursor:pointer">↩️</button>`;
   else
     actbtn=`<button class="startbtn" onclick="startGarden('${g.id}',event)">▶ Begin</button>`;
 
@@ -2728,14 +2771,55 @@ function finishGarden(id,e){
   upd(id,g=>{
     const dur=calcDur(g.timeIn,t);
     const updated={...g,active:false,completed:true,timeOut:t,durationMin:dur};
-    // Auto-create invoice
-    createInvoice(updated);
-    return {...updated,invoiced:true};
+    // Auto-create invoice — keep its id on the garden so an undo can find
+    // and safely remove the exact right invoice, not guess by matching.
+    const inv=createInvoice(updated);
+    return {...updated,invoiced:true,invId:inv?inv.id:null};
   });
   S.expanded=null;
   refresh();
   const g=S.route.find(r=>r.id===id);
   toast('✓ Klaar! '+( g?g.durationMin+' min':'')+'  · Faktuur gegenereer');
+}
+
+// Lets a driver undo an accidental tap — Begin just reverts the start time;
+// Klaar also removes the invoice it created, but only if that invoice is
+// still pending (never sent). Once sent, undoing here would be confusing
+// for the client's records — a credit note is the right tool at that point.
+function undoStart(id,e){
+  if(e) e.stopPropagation();
+  upd(id,g=>({...g,active:false,timeIn:''}));
+  toast('↩️ Begin ontdoen');
+  refresh();
+}
+function undoFinish(id,e){
+  if(e) e.stopPropagation();
+  const g=S.route.find(r=>r.id===id);
+  if(!g) return;
+  if(g.invId){
+    const invs=getInvoices();
+    const inv=invs.find(i=>i.id===g.invId);
+    if(inv && inv.status==='sent'){
+      alert('Hierdie faktuur is reeds gestuur — kan nie sommer ontdoen word nie. Gebruik eerder \'n Krediet Nota.\n\nThis invoice has already been sent — use a Credit Note instead.');
+      return;
+    }
+    if(inv){
+      const idx=invs.indexOf(inv);
+      invs.splice(idx,1);
+      saveInvoices(invs);
+      // Reverse the ledger entry this invoice created
+      const led=getLedger();
+      const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
+      if(key){
+        led[key].entries=(led[key].entries||[]).filter(e2=>e2.invId!==inv.id);
+        led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
+        saveLedger(led);
+      }
+    }
+  }
+  upd(id,gg=>({...gg,completed:false,timeOut:'',durationMin:0,invoiced:false,invId:null}));
+  toast('↩️ Klaar ontdoen — faktuur verwyder');
+  refresh();
 }
 
 function toggleExp(id){
@@ -2748,7 +2832,12 @@ function setSkip(id,r){
   upd(id,g=>({...g,skipReason:r,completed:r?false:g.completed,active:false}));
   refresh();
 }
-function upd(id,fn){ S.route=S.route.map(g=>g.id===id?fn(g):g); saveProgress(); }
+function upd(id,fn){
+  const idx=S.route.findIndex(g=>g.id===id);
+  if(idx===-1) return;
+  S.route=S.route.map((g,i)=>i===idx?fn(g):g);
+  saveProgress();
+}
 function refresh(){
   saveProgress();
   if(S.driverTab==='route'){
@@ -2800,6 +2889,7 @@ function createInvoice(garden){
   saveInvoices(invs);
   // Update client ledger
   addLedgerEntry(inv);
+  return inv;
 }
 
 // ══════════════════ LEDGER ════════════════════════════════════════════════════
@@ -2881,18 +2971,22 @@ function renderWorkers(ct){
     </div>`;
   ct.appendChild(vc);
 
-  const ec=el('div','vcard');
-  ec.innerHTML=`<div class="vtitle">🔧 Toerusting / Masjiene brandstof</div>
-    <p style="font-size:.78rem;color:var(--t2);margin:0 0 8px">Petrol/diesel gekoop vir grassnyers, weedeaters, ens. — apart van die voertuig se tenk.</p>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-      <div class="vf"><label>Brandstof (Liters)</label>
-        <input class="inp" type="number" placeholder="0" value="${km.equipLiters||''}"
-               oninput="setVeh('equipLiters',this.value)" style="padding:9px 10px"></div>
-      <div class="vf"><label>Brandstof (R)</label>
-        <input class="inp" type="number" placeholder="0" value="${km.equipDiesel||''}"
-               oninput="setVeh('equipDiesel',this.value)" style="padding:9px 10px"></div>
-    </div>`;
-  ct.appendChild(ec);
+  // Equipment/machine fuel is now Pierre's responsibility alone — regular
+  // drivers no longer need this on their Dagstaat.
+  if(S.driver==='pierre'){
+    const ec=el('div','vcard');
+    ec.innerHTML=`<div class="vtitle">🔧 Toerusting / Masjiene brandstof</div>
+      <p style="font-size:.78rem;color:var(--t2);margin:0 0 8px">Petrol/diesel gekoop vir grassnyers, weedeaters, ens. — apart van die voertuig se tenk.</p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div class="vf"><label>Brandstof (Liters)</label>
+          <input class="inp" type="number" placeholder="0" value="${km.equipLiters||''}"
+                 oninput="setVeh('equipLiters',this.value)" style="padding:9px 10px"></div>
+        <div class="vf"><label>Brandstof (R)</label>
+          <input class="inp" type="number" placeholder="0" value="${km.equipDiesel||''}"
+                 oninput="setVeh('equipDiesel',this.value)" style="padding:9px 10px"></div>
+      </div>`;
+    ct.appendChild(ec);
+  }
 
   const wc=el('div','vcard');
   const casualNames=Object.keys(S.workers).filter(n=>S.workers[n]?.casual&&!(d.workers||[]).includes(n)&&n!==d.name);
@@ -3067,6 +3161,7 @@ function renderOverview(ct){
       const dayCount=((SCHEDULE||ALL_ROUTES)[id]?.[week]?.[dayEn]||[]).length;
       const prog=CACHE.progress[id+'_'+todayKey()];
       const doneToday=prog&&prog.route? prog.route.filter(g=>g.completed).length : 0;
+      const skippedToday=prog&&prog.route? prog.route.filter(g=>g.skipReason).length : 0;
       const totalToday=prog&&prog.route? prog.route.length : dayCount;
       const pct=totalToday>0? Math.round(100*doneToday/totalToday):0;
       const started=!!prog;
@@ -3074,7 +3169,7 @@ function renderOverview(ct){
         <div class="dsav" style="background:${d.color}">${d.icon}</div>
         <div class="dsi">
           <h3>${d.name}</h3>
-          <p>${started? doneToday+' / '+totalToday+' tuine klaar' : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+          <p>${started? doneToday+' / '+totalToday+' tuine klaar'+(skippedToday>0?' · '+skippedToday+' geskip':'') : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
           <div class="dsprog"><div class="dspf" style="background:${d.color};width:${pct}%"></div></div>
         </div>
       </div>`;
@@ -3113,6 +3208,7 @@ async function populateDayReports(){
     const d=DRIVERS[f.driverId];
     const route=f.prog.route||[];
     const done=route.filter(g=>g.completed).length;
+    const skipped=route.filter(g=>g.skipReason).length;
     const total=route.filter(g=>g.completed).reduce((s,g)=>s+(g.cost||0)+(parseFloat(g.extraWorkAmount)||0),0);
     const row=el('div');
     row.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;cursor:pointer';
@@ -3120,7 +3216,7 @@ async function populateDayReports(){
     row.innerHTML=`
       <div>
         <div style="font-weight:700">${d.icon} ${d.name} · ${f.dateKey}</div>
-        <div style="font-size:.78rem;color:var(--t2)">${done}/${route.length} tuine klaar · R${total.toFixed(0)}</div>
+        <div style="font-size:.78rem;color:var(--t2)">${done}/${route.length} tuine klaar${skipped>0?' · '+skipped+' geskip':''} · R${total.toFixed(0)}</div>
       </div>
       <div style="color:var(--g8);font-weight:700;font-size:.82rem">⬇️ Laai af</div>`;
     box.appendChild(row);
@@ -3144,14 +3240,18 @@ function renderOfficeOverview(ct,now,dayEn,week){
     const route=(prog&&prog.route&&prog.route.length)? prog.route : getTodayRoute(id);
     const total=route.reduce((s,g)=>s+(Number(g.cost)||0)+(Number(g.extraWorkAmount)||0),0);
     const doneToday=prog&&prog.route? prog.route.filter(g=>g.completed).length : 0;
+    const skippedToday=prog&&prog.route? prog.route.filter(g=>g.skipReason).length : 0;
     const totalCount=route.length;
+    const pct=totalCount>0? Math.round(100*doneToday/totalCount):0;
+    const started=!!prog;
     grandTotal+=total;
     return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
       <div class="dsav" style="background:${d.color}">${d.icon}</div>
       <div class="dsi">
         <h3>${d.name}</h3>
-        <p>${totalCount} tuine vandag ${prog? '· '+doneToday+' klaar':''}</p>
-        <p style="font-weight:800;font-size:1.05rem;color:${d.color}">R${total.toFixed(0)}</p>
+        <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' · '+skippedToday+' geskip':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+        <div class="dsprog"><div class="dspf" style="background:${d.color};width:${pct}%"></div></div>
+        <p style="font-weight:800;font-size:1.05rem;color:${d.color};margin-top:4px">R${total.toFixed(0)}</p>
       </div>
     </div>`;
   }).join('');
@@ -4876,11 +4976,15 @@ function schedSkipOnceModal(clientId, address){
 async function submitSkipOnce(clientId){
   const date=document.getElementById('skip-date').value;
   if(!date){ alert('Kies n datum'); return; }
-  const {driverId}=SCHED_ED;
+  const {driverId,week,day}=SCHED_ED;
   await addSkipForDate(driverId, clientId, date);
   document.getElementById('sched-skip-modal')?.remove();
   toast(`✓ Oorgeslaan vir ${date} — verskyn weer volgende rotasie`);
   renderScheduleEditor(SCHED_SCROLL_CAPTURE);
+  // Only patch an already-loaded live route if the skip is for TODAY
+  // specifically — matching by exact date, not just the week/day pattern,
+  // since that pattern could also match a different, future occurrence.
+  if(date===todayKey()) await schedPatchLiveIfToday(driverId,week,day,clientId,null,'remove');
 }
 
 // Only touches TODAY's live list for that driver, and only for jobs not yet
