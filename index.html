@@ -644,6 +644,69 @@ function saveQuotes(qs){ CACHE.quotes=qs; sSet('quotes', qs); }
 function getExpenses(){ return CACHE.expenses; }
 function saveExpenses(list){ CACHE.expenses=list; sSet('expenses', list); }
 
+const CATEGORY_ICONS={
+  'Diesel/Petrol':'⛽','Olie':'🛢️','Gif/Chemikalieë':'🧪','Tuintoerusting':'🔧',
+  'Voertuig Onderhoud':'🚗','Trackers':'📡','Selfone':'📱','Kantoor Toerusting':'🖥️',
+  'Salarisse (ekstra)':'💵','Verlof Uitbetaling':'🏖️','Jaareinde Bonusse':'🎁','Ander':'📦',
+};
+
+// Small, dependency-free SVG bar chart — takes [{label, value, color?}], no
+// external charting library needed (keeps the app self-contained and fast
+// to load on a tablet, rather than pulling in another CDN script).
+function svgBarChart(data, opts={}){
+  const w=opts.width||600, h=opts.height||220, pad={t:16,r:16,b:36,l:16};
+  const max=Math.max(1, ...data.map(d=>d.value));
+  const barW=(w-pad.l-pad.r)/data.length;
+  const bars=data.map((d,i)=>{
+    const bh=Math.round((h-pad.t-pad.b)*(d.value/max));
+    const x=pad.l+i*barW+barW*0.15;
+    const bw=barW*0.7;
+    const y=h-pad.b-bh;
+    return `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="4" fill="${d.color||'#2E7D32'}"/>
+      <text x="${x+bw/2}" y="${y-6}" text-anchor="middle" font-size="11" font-weight="700" fill="#333">R${Math.round(d.value)}</text>
+      <text x="${x+bw/2}" y="${h-pad.b+16}" text-anchor="middle" font-size="10" fill="#666">${(d.label||'').length>10?(d.label.slice(0,9)+'…'):(d.label||'')}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;font-family:inherit">
+    <line x1="${pad.l}" y1="${h-pad.b}" x2="${w-pad.r}" y2="${h-pad.b}" stroke="#ddd"/>
+    ${bars}
+  </svg>`;
+}
+
+// Small dependency-free SVG line chart with two series (income/expense) or
+// one (diesel usage) — [{label, values:[{key,val,color}]}]
+function svgLineChart(series, opts={}){
+  const w=opts.width||600, h=opts.height||220, pad={t:20,r:16,b:30,l:40};
+  const allVals=series.flatMap(s=>s.points.map(p=>p.val));
+  const max=Math.max(1, ...allVals);
+  const stepX=(w-pad.l-pad.r)/Math.max(1,(series[0]?.points.length||1)-1);
+  const legendY=pad.t-8;
+  const legend=series.map((s,i)=>`<circle cx="${pad.l+i*90}" cy="${legendY}" r="4" fill="${s.color}"/>
+    <text x="${pad.l+i*90+9}" y="${legendY+4}" font-size="10" fill="#555">${s.name}</text>`).join('');
+  const lines=series.map(s=>{
+    const pts=s.points.map((p,i)=>{
+      const x=pad.l+i*stepX;
+      const y=h-pad.b-(h-pad.t-pad.b)*(p.val/max);
+      return `${x},${y}`;
+    }).join(' ');
+    const dots=s.points.map((p,i)=>{
+      const x=pad.l+i*stepX;
+      const y=h-pad.b-(h-pad.t-pad.b)*(p.val/max);
+      return `<circle cx="${x}" cy="${y}" r="3" fill="${s.color}"/>`;
+    }).join('');
+    return `<polyline points="${pts}" fill="none" stroke="${s.color}" stroke-width="2.5"/>${dots}`;
+  }).join('');
+  const labels=(series[0]?.points||[]).map((p,i)=>{
+    const x=pad.l+i*stepX;
+    return `<text x="${x}" y="${h-pad.b+16}" text-anchor="middle" font-size="10" fill="#666">${p.label}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;font-family:inherit">
+    ${legend}
+    <line x1="${pad.l}" y1="${h-pad.b}" x2="${w-pad.r}" y2="${h-pad.b}" stroke="#ddd"/>
+    ${lines}
+    ${labels}
+  </svg>`;
+}
+
 function getBankTxns(){ return CACHE.bankTxns; }
 function saveBankTxns(list){ CACHE.bankTxns=list; sSet('bank_txns', list); }
 
@@ -1389,102 +1452,106 @@ async function renderExpenses(ct){
   const rangeLbl=isCustom?`${EXP_FILTER.from||'…'} tot ${EXP_FILTER.to||'…'}`:mr.label;
 
   let filtered=getExpenses().filter(e=>dateInRange(e.date,from,to));
-  if(EXP_FILTER.category) filtered=filtered.filter(e=>e.category===EXP_FILTER.category);
   if(EXP_FILTER.driverId==='__general__') filtered=filtered.filter(e=>!e.driverId);
   else if(EXP_FILTER.driverId) filtered=filtered.filter(e=>e.driverId===EXP_FILTER.driverId);
-  filtered=filtered.slice().sort((a,b)=>b.date.localeCompare(a.date));
-
-  const total=filtered.reduce((s,e)=>s+(e.amount||0),0);
 
   const byCat={};
   filtered.forEach(e=>{ byCat[e.category]=(byCat[e.category]||0)+(e.amount||0); });
   const catRows=Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
-  const maxCat=catRows.length?catRows[0][1]:0;
+  const total=filtered.reduce((s,e)=>s+(e.amount||0),0);
 
-  const byDrv={};
-  filtered.forEach(e=>{ const k=e.driverId||''; byDrv[k]=(byDrv[k]||0)+(e.amount||0); });
-  const drvRows=Object.entries(byDrv).map(([id,amt])=>({id, name:id?(DRIVERS[id]?DRIVERS[id].name:id):'Algemeen', amt}))
-    .sort((a,b)=>b.amt-a.amt);
+  // ── Folder open: show ONLY this category, clean and drilled-in ──
+  if(EXP_FILTER.category){
+    const catItems=filtered.filter(e=>e.category===EXP_FILTER.category).slice().sort((a,b)=>b.date.localeCompare(a.date));
+    const catTotal=catItems.reduce((s,e)=>s+(e.amount||0),0);
+    const isDiesel=EXP_FILTER.category==='Diesel/Petrol';
+    let dieselChartHtml='';
+    if(isDiesel){
+      // Diesel usage over time, per bakkie — the specific graph asked for
+      const months=[]; for(let i=5;i>=0;i--) months.push(monthRange(-i));
+      const byDriverMonth={};
+      Object.keys(DRIVERS).forEach(id=>{ byDriverMonth[id]=months.map(m=>getExpenses().filter(e=>e.category==='Diesel/Petrol'&&e.driverId===id&&dateInRange(e.date,m.from,m.to)).reduce((s,e)=>s+(e.amount||0),0)); });
+      const colors=['#2E7D32','#1565C0','#6A1B9A','#E65100','#00695C'];
+      const series=Object.entries(DRIVERS).map(([id,d],i)=>({
+        name:d.name, color:colors[i%colors.length],
+        points:months.map((m,mi)=>({label:MONTHS_AF[m.from.split('-')[1]-1]?.slice(0,3)||m.from.slice(5,7), val:byDriverMonth[id][mi]}))
+      }));
+      dieselChartHtml=`<div class="divlbl" style="margin-top:14px">⛽ DIESEL PER BAKKIE — LAASTE 6 MAANDE</div>
+        <div style="border:1px solid var(--brd);border-radius:10px;padding:10px;margin-bottom:12px">${svgLineChart(series)}</div>`;
+    }
+    ct.innerHTML=`
+      <button class="btn-sec btn" style="margin-bottom:10px" onclick="EXP_FILTER.category='';renderExpensesInto()">← Terug na kategorieë</button>
+      <div class="ovhdr"><h2>${CATEGORY_ICONS[EXP_FILTER.category]||'📦'} ${EXP_FILTER.category}</h2><p>${rangeLbl}</p></div>
+      <div class="ovgrid">
+        <div class="ovc"><div class="v" style="color:#C62828">R${catTotal.toFixed(0)}</div><div class="l">Totaal</div></div>
+        <div class="ovc"><div class="v">${catItems.length}</div><div class="l">Aantal items</div></div>
+      </div>
+      ${dieselChartHtml}
+      <button class="btn btn-blue" style="margin:10px 0" onclick="showAddExpense()">＋ Voeg uitgawe by</button>
+      <div class="divlbl">TRANSAKSIES</div>
+      <div id="exp-list"></div>`;
+    renderExpenseList(catItems);
+    return;
+  }
 
+  // ── Folder view: category cards + breakdown chart, no flat list ──
   const dieselSuggestions=(!isCustom&&EXP_MONTH_OFFSET===0) ? await getDieselSuggestions() : [];
+  const chartData=catRows.slice(0,8).map(([cat,amt])=>({label:cat, value:amt, color:'#C62828'}));
 
   ct.innerHTML=`
     <div class="ovhdr"><h2>🧾 Uitgawes / Expenses</h2><p>${rangeLbl}</p></div>
-    <div style="border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-bottom:12px">
-      <div style="display:flex;gap:8px;margin-bottom:8px">
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="EXP_MONTH_OFFSET--;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">← Vorige maand</button>
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="EXP_MONTH_OFFSET=0;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">Hierdie maand</button>
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem;${EXP_MONTH_OFFSET>=0&&!isCustom?'opacity:.4;pointer-events:none':''}" onclick="EXP_MONTH_OFFSET++;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">Volgende →</button>
-      </div>
-      <div class="divlbl" style="margin:6px 0">OF FILTREER SPESIFIEK</div>
-      <div style="display:flex;gap:6px;margin-bottom:6px">
-        <input class="inp" type="date" id="exp-f-from" value="${EXP_FILTER.from}" style="flex:1;padding:7px;font-size:.8rem">
-        <input class="inp" type="date" id="exp-f-to" value="${EXP_FILTER.to}" style="flex:1;padding:7px;font-size:.8rem">
-      </div>
-      <div style="display:flex;gap:6px;margin-bottom:6px">
-        <select class="inp" id="exp-f-cat" style="flex:1;padding:7px;font-size:.8rem">
-          <option value="">Alle kategorieë</option>
-          ${EXPENSE_CATEGORIES.map(c=>`<option value="${c}" ${EXP_FILTER.category===c?'selected':''}>${c}</option>`).join('')}
-        </select>
-        <select class="inp" id="exp-f-drv" style="flex:1;padding:7px;font-size:.8rem">
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="EXP_MONTH_OFFSET--;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">← Vorige maand</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="EXP_MONTH_OFFSET=0;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">Hierdie maand</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem;${EXP_MONTH_OFFSET>=0&&!isCustom?'opacity:.4;pointer-events:none':''}" onclick="EXP_MONTH_OFFSET++;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">Volgende →</button>
+    </div>
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;font-size:.8rem;color:var(--t2);font-weight:700;padding:6px 0">🔍 Spesifieke datums of voertuig filtreer</summary>
+      <div style="border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-top:6px">
+        <div style="display:flex;gap:6px;margin-bottom:6px">
+          <input class="inp" type="date" id="exp-f-from" value="${EXP_FILTER.from}" style="flex:1;padding:7px;font-size:.8rem">
+          <input class="inp" type="date" id="exp-f-to" value="${EXP_FILTER.to}" style="flex:1;padding:7px;font-size:.8rem">
+        </div>
+        <select class="inp" id="exp-f-drv" style="width:100%;padding:7px;font-size:.8rem;margin-bottom:6px">
           <option value="">Alle voertuie</option>
           <option value="__general__" ${EXP_FILTER.driverId==='__general__'?'selected':''}>Algemeen</option>
           ${Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}" ${EXP_FILTER.driverId===id?'selected':''}>${d.name}</option>`).join('')}
         </select>
+        <div style="display:flex;gap:8px">
+          <button class="btn" style="flex:1;background:var(--g8);font-size:.8rem" onclick="applyExpFilter()">Filtreer</button>
+          <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="resetExpFilter()">Herstel</button>
+        </div>
       </div>
-      <div style="display:flex;gap:8px">
-        <button class="btn" style="flex:1;background:var(--g8);font-size:.8rem" onclick="applyExpFilter()">Filtreer</button>
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="resetExpFilter()">Herstel</button>
-      </div>
-    </div>
+    </details>
     <div class="ovgrid">
       <div class="ovc"><div class="v" style="color:#C62828">R${total.toFixed(0)}</div><div class="l">Totale uitgawes</div></div>
       <div class="ovc"><div class="v">${filtered.length}</div><div class="l">Aantal items</div></div>
     </div>
-    ${catRows.length?`
+    ${chartData.length?`
     <div class="divlbl" style="margin-top:12px">PER KATEGORIE</div>
-    <div id="exp-cat-breakdown" style="margin-bottom:12px"></div>`:''}
-    ${drvRows.length?`
-    <div class="divlbl" style="margin-top:12px">PER VOERTUIG / BESTUURDER</div>
-    <div id="exp-driver-breakdown" style="margin-bottom:12px"></div>`:''}
+    <div style="border:1px solid var(--brd);border-radius:10px;padding:10px;margin-bottom:12px">${svgBarChart(chartData)}</div>` : ''}
     ${dieselSuggestions.length?`
     <div class="divlbl" style="margin-top:12px">⛽ VOORGESTELDE DIESEL-UITGAWES (${dieselSuggestions.length})</div>
     <p style="font-size:.78rem;color:var(--t2);margin:-4px 0 8px">Uit wat bestuurders al in Dagstaat ingetik het — tik ✓ om by te voeg.</p>
     <div id="diesel-sugg"></div>` : ''}
+    <div class="divlbl" style="margin-top:12px">KATEGORIEË <span style="font-weight:400;color:var(--t3)">· tik om oop te maak</span></div>
+    <div id="exp-cat-folders" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px"></div>
     <button class="btn btn-blue" style="margin:10px 0" onclick="showAddExpense()">＋ Voeg uitgawe by / Add expense</button>
-    <button class="btn-sec btn" style="margin-bottom:10px" onclick="shareExpenseReportPDF()">📄 Genereer PDF-verslag</button>
-    <div class="divlbl">UITGAWES (${filtered.length})</div>
-    <div id="exp-list"></div>`;
+    <button class="btn-sec btn" style="margin-bottom:10px" onclick="shareExpenseReportPDF()">📄 Genereer PDF-verslag</button>`;
 
-  if(catRows.length){
-    const cc=document.getElementById('exp-cat-breakdown');
+  const cc=document.getElementById('exp-cat-folders');
+  if(catRows.length===0){
+    cc.style.display='block';
+    cc.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen uitgawes hierdie tydperk nie.</p>';
+  } else {
     catRows.forEach(([cat,amt])=>{
-      const pct=maxCat?Math.round((amt/maxCat)*100):0;
-      const row=el('div');
-      row.style.cssText='margin-bottom:8px;cursor:pointer';
-      row.onclick=()=>{ EXP_FILTER.category=cat; renderExpensesInto(); };
-      row.innerHTML=`
-        <div style="display:flex;justify-content:space-between;font-size:.82rem;margin-bottom:3px">
-          <span style="font-weight:600">${cat}</span><span style="font-weight:700">R${amt.toFixed(0)}</span>
-        </div>
-        <div style="background:var(--bg);border-radius:100px;height:7px;overflow:hidden">
-          <div style="background:var(--g8);width:${pct}%;height:100%"></div>
-        </div>`;
-      cc.appendChild(row);
-    });
-  }
-
-  if(drvRows.length){
-    const dc=document.getElementById('exp-driver-breakdown');
-    drvRows.forEach(r=>{
       const card=el('div');
-      card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:9px 12px;margin-bottom:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
-      card.onclick=()=>showDriverBookDetail(r.id, from, to, rangeLbl);
-      card.innerHTML=`<div style="font-weight:700;font-size:.85rem">${r.name}</div>
-        <div style="display:flex;align-items:center;gap:8px">
-          <b style="color:#C62828">R${r.amt.toFixed(0)}</b><span style="color:var(--t3)">›</span>
-        </div>`;
-      dc.appendChild(card);
+      card.style.cssText='border:1px solid var(--brd);border-radius:12px;padding:14px 10px;cursor:pointer;text-align:center;background:var(--card)';
+      card.onclick=()=>{ EXP_FILTER.category=cat; renderExpensesInto(); };
+      card.innerHTML=`<div style="font-size:1.6rem;margin-bottom:4px">${CATEGORY_ICONS[cat]||'📦'}</div>
+        <div style="font-weight:700;font-size:.8rem">${cat}</div>
+        <div style="font-weight:800;color:#C62828;margin-top:2px">R${amt.toFixed(0)}</div>`;
+      cc.appendChild(card);
     });
   }
 
@@ -1505,13 +1572,15 @@ async function renderExpenses(ct){
       sc.appendChild(row);
     });
   }
+}
 
+function renderExpenseList(items){
   const list=document.getElementById('exp-list');
-  if(filtered.length===0){
+  if(items.length===0){
     list.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen uitgawes in hierdie periode nie.</p>';
     return;
   }
-  filtered.forEach(e=>{
+  items.forEach(e=>{
     const card=el('div');
     card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:start;gap:8px';
     const drvName=e.driverId&&DRIVERS[e.driverId]?DRIVERS[e.driverId].name:'';
@@ -1530,7 +1599,6 @@ async function renderExpenses(ct){
 function applyExpFilter(){
   EXP_FILTER.from=document.getElementById('exp-f-from').value;
   EXP_FILTER.to=document.getElementById('exp-f-to').value;
-  EXP_FILTER.category=document.getElementById('exp-f-cat').value;
   EXP_FILTER.driverId=document.getElementById('exp-f-drv').value;
   renderExpensesInto();
 }
