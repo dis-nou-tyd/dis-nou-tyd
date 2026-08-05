@@ -190,6 +190,13 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
   background:var(--bg);color:var(--text);font-size:.9rem}
 .inp:focus{outline:none;border-color:var(--g7)}
 @media(prefers-color-scheme:dark){.inp{background:var(--card)}}
+/* Every number input (garden/quote/invoice prices, loans, etc.) is always
+   typed directly on a keypad, never nudged up/down — the little spinner
+   arrows browsers add by default were just clutter and an easy misclick,
+   so they're removed everywhere in the app rather than field-by-field. */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield}
 .flbl{font-size:.72rem;font-weight:700;color:var(--t2)}
 .cashrow{background:var(--goldp);border-radius:10px;padding:10px 12px;
   display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -529,7 +536,38 @@ function updateSyncBadge(){
   const d=document.getElementById('d-sync'), p=document.getElementById('p-sync');
   if(d) d.innerHTML=html;
   if(p) p.innerHTML=html;
+  updateSyncFailBanner();
 }
+// A small text badge in the header is easy to never notice while actively
+// working through a list — and if someone closes the tablet while saves
+// are silently failing, whatever hasn't reached the database yet is lost
+// with no record it ever happened. This makes a failure impossible to
+// miss, and the beforeunload warning below stops someone from closing the
+// app at exactly the wrong moment without at least being asked first.
+let SYNC_FAIL_SINCE=null;
+function updateSyncFailBanner(){
+  let bar=document.getElementById('sync-fail-banner');
+  if(!STORAGE_OK){
+    if(!SYNC_FAIL_SINCE) SYNC_FAIL_SINCE=Date.now();
+    if(!bar){
+      bar=document.createElement('div');
+      bar.id='sync-fail-banner';
+      bar.style.cssText='position:fixed;left:0;right:0;top:0;z-index:99998;background:#C62828;color:#fff;padding:10px 14px;text-align:center;font-weight:700;font-size:.82rem;box-shadow:0 2px 8px rgba(0,0,0,.2)';
+      document.body.appendChild(bar);
+    }
+    bar.textContent='⚠️ Nie gesinkroniseer nie — moet nie hierdie tablet toemaak of herlaai nie totdat dit weer groen is';
+  } else {
+    SYNC_FAIL_SINCE=null;
+    if(bar) bar.remove();
+  }
+}
+window.addEventListener('beforeunload', (e)=>{
+  if(!STORAGE_OK){
+    e.preventDefault();
+    e.returnValue='Nie alles is gestoor nie — is jy seker jy wil toemaak?';
+    return e.returnValue;
+  }
+});
 
 // If anything blocks a Firestore call without actually erroring it —
 // confirmed possible with Microsoft Edge's Tracking Prevention feature,
@@ -589,8 +627,8 @@ async function sGetCritical(key, fallback, retries=2){
 // A write failing is a real problem — Firestore unreachable, blocked by
 // security rules, or no internet connection.
 async function sSet(key, value){
-  try{ await withTimeout(FS_KV.doc(key).set({value: JSON.stringify(value)}), STORAGE_TIMEOUT_MS, 'sSet:'+key); STORAGE_OK=true; }
-  catch(e){ STORAGE_OK=false; console.error('Storage sync mislukt / sync failed:',e); }
+  try{ await withTimeout(FS_KV.doc(key).set({value: JSON.stringify(value)}), STORAGE_TIMEOUT_MS, 'sSet:'+key); STORAGE_OK=true; return true; }
+  catch(e){ STORAGE_OK=false; console.error('Storage sync mislukt / sync failed:',e); return false; }
   finally { updateSyncBadge(); }
 }
 // Matches the shape of Claude's old window.storage.list() — {keys:[...]} —
@@ -1002,6 +1040,7 @@ async function nextInvNum(){
 // ══════════════════ LIVE POLLING ═══════════════════════════════════════════════
 // Keeps parent + driver screens in sync with what's happening on other devices.
 let POLL_TIMER=null;
+let POLL_SLOW_TIMER=null;
 // South Africa is a single fixed UTC+2 zone with no daylight saving — but
 // device timezone bugs are one story. Separately: this is a single-page
 // app on GitHub Pages, reopened directly by drivers rather than reloaded
@@ -1013,7 +1052,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-30'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-43'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1039,10 +1078,44 @@ let PARENT_DATA_SIG=''; // last-seen signature of invoices/ledger/quotes, used t
 let PIERRE_SPANNE_SIG=''; // last-seen signature of Spanne tab data, used to skip no-op re-renders during polling
 function startPolling(){
   stopPolling();
+  // FAST tier — cheap, high-value checks only: the storage heartbeat, and
+  // (for a driver) picking up if another device already saved newer
+  // progress for the same driver. Nothing here reads more than a handful
+  // of small documents.
   POLL_TIMER=setInterval(async ()=>{
     try{
+      // A tablet left open on a truck seat with the screen off, or a
+      // background browser tab nobody's looking at, was still polling
+      // Firestore on the exact same schedule as an actively-watched
+      // screen — reads that bought nothing, since nobody was there to see
+      // the update anyway. Skipping entirely while hidden is the single
+      // biggest lever here: on a typical workday, screens are actually
+      // being looked at only a fraction of the time they're left open.
+      if(document.hidden) return;
       await checkStorageHealth();
       checkForNewVersion();
+      if(S.screen==='driver' && S.driver && !S.workDate){
+        const dk=todayKey(), ck=S.driver+'_'+dk;
+        const remote = await sGet('progress_'+S.driver+'_'+dk, null);
+        if(remote && remote.ts && (!CACHE.progress[ck] || remote.ts>CACHE.progress[ck].ts) && remote.ts>(S._lastLocalSave||0)){
+          S.route=remote.route; S.vehicle=remote.vehicle||S.vehicle; S.workers=remote.workers||S.workers;
+          CACHE.progress[ck]=remote;
+          if(S.driverTab==='route') refresh();
+        }
+      }
+    }catch(e){ /* stay silent, retry next tick */ }
+  }, 30000);
+
+  // SLOW tier — everything that reads a whole collection or several
+  // documents at once. These used to all run on the fast 6s tier above;
+  // that's what was burning through the daily Firestore quota so fast.
+  // Nothing here needs sub-minute freshness for a business like this one —
+  // a client's account or a schedule edit showing up within a couple of
+  // minutes instead of a couple of seconds is a completely fine trade for
+  // not running out of quota by mid-morning.
+  POLL_SLOW_TIMER=setInterval(async ()=>{
+    try{
+      if(document.hidden) return; // see FAST tier above — same reasoning, bigger stakes here since this tier does the expensive full-collection reads
       if(S.screen==='parent'){
         const [invoices, ledger, quotes] = await Promise.all([
           collGetAll('invoices').catch(()=>CACHE.invoices),
@@ -1055,11 +1128,33 @@ function startPolling(){
         // had changed, which is exactly what made tabs like State feel
         // like they were "constantly refreshing" even while just sitting
         // there looking at them.
-        const newSig=JSON.stringify({invoices, ledger, quotes});
+        //
+        // Sorted before comparing: Firestore doesn't guarantee documents
+        // come back in the same order on every unordered .get() call, so
+        // comparing the raw fetch order could still flag "changed" purely
+        // from reordering with zero actual data difference — which would
+        // have made this whole diff check a no-op in practice and left
+        // the constant-refresh feeling exactly as it was.
+        const sortedInvoices=invoices.slice().sort((a,b)=>(a.id||'').localeCompare(b.id||''));
+        const sortedLedgerKeys=Object.keys(ledger).sort();
+        const sortedLedger={}; sortedLedgerKeys.forEach(k=>{ sortedLedger[k]=ledger[k]; });
+        const sortedQuotes=quotes.slice().sort((a,b)=>(a.id||'').localeCompare(b.id||''));
+        const newSig=JSON.stringify({invoices:sortedInvoices, ledger:sortedLedger, quotes:sortedQuotes});
         const dataChanged = newSig!==PARENT_DATA_SIG;
         PARENT_DATA_SIG=newSig;
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
         await Promise.all(Object.keys(DRIVERS).map(fetchDriverProgress));
+        // A driver tapping "Dag Klaar" only ever touches their own
+        // progress doc — never invoices/ledger/quotes — so the
+        // dataChanged check above could never detect it, and this list
+        // would then silently never refresh again until Bestuur happened
+        // to navigate away from Oorsig and back (or a genuinely unrelated
+        // invoice/ledger change happened to also trigger a re-render).
+        // That's exactly why one driver's end-of-day would show up while
+        // everyone else's — who finished later, with nothing else
+        // triggering a refresh in between — wouldn't. Refreshed on its
+        // own here, independent of that gate.
+        if(S.parentTab==='overview') await populateDayReports(true);
         const NO_AUTOREFRESH_TABS=['payroll','map','history'];
         if(dataChanged && S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
           // Preserve scroll position across this background refresh — a
@@ -1130,13 +1225,7 @@ function startPolling(){
         // today's content got written under yesterday's storage key,
         // corrupting it. Skipping entirely during backfill avoids that.
         if(!S.workDate){
-          const dk=todayKey(), ck=S.driver+'_'+dk;
-          const remote = await sGet('progress_'+S.driver+'_'+dk, null);
-          if(remote && remote.ts && (!CACHE.progress[ck] || remote.ts>CACHE.progress[ck].ts) && remote.ts>(S._lastLocalSave||0)){
-            S.route=remote.route; S.vehicle=remote.vehicle||S.vehicle; S.workers=remote.workers||S.workers;
-            CACHE.progress[ck]=remote;
-            if(S.driverTab==='route') refresh();
-          }
+          const dk=todayKey();
           // Pick up schedule edits Bestuur/Jan make against TODAY after this
           // driver's list was already loaded — e.g. removing a garden via
           // the schedule editor used to only affect tomorrow onward; a job
@@ -1174,9 +1263,21 @@ function startPolling(){
         }
       }
     }catch(e){ /* stay silent, retry next tick */ }
-  }, 6000);
+  }, 180000);
 }
-function stopPolling(){ if(POLL_TIMER){ clearInterval(POLL_TIMER); POLL_TIMER=null; } }
+function stopPolling(){
+  if(POLL_TIMER){ clearInterval(POLL_TIMER); POLL_TIMER=null; }
+  if(POLL_SLOW_TIMER){ clearInterval(POLL_SLOW_TIMER); POLL_SLOW_TIMER=null; }
+}
+// Polling above skips entirely while the tab is hidden (that's most of the
+// quota savings) — this makes sure coming back to it doesn't then sit
+// stale for up to 3 minutes waiting for the next tick. One fresh render
+// the instant the tab is visible again, same cost as a single normal tick.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden) return;
+  if(S.screen==='parent') renderParentTab(S.parentTab);
+  else if(S.screen==='driver' && S.driver) renderDriverTab(S.driverTab);
+});
 
 // ══════════════════ WEEK / DAY ════════════════════════════════════════════════
 function getWeekNum(d){
@@ -1219,12 +1320,44 @@ async function ensureSchedule(){
 // stale SCHEDULE would actually mislead someone (like the tomorrow
 // preview), since a tablet left open across a schedule edit would
 // otherwise never see that edit until a full page reload.
+//
+// A failed or transient read here (patchy signal out in a garden is
+// completely normal) used to fall all the way back to ALL_ROUTES — the
+// original hardcoded routes from before the app ever had any schedule
+// edits at all — silently discarding EVERY edit ever made, not just
+// whichever one prompted this refresh, for as long as reads kept
+// failing. That's exactly the kind of thing that would make a manually-
+// added client vanish from a driver's tomorrow preview only to reappear
+// after a hard refresh (a fresh page load starts SCHEDULE at null, so the
+// very next successful read repopulates it correctly). Now a failed read
+// just keeps whatever was already loaded; ALL_ROUTES is only ever used
+// as a genuine first-time fallback, when nothing has been loaded yet.
 async function refreshSchedule(){
   const stored = await sGet('schedule', null);
-  SCHEDULE = stored || JSON.parse(JSON.stringify(ALL_ROUTES));
+  if(stored) SCHEDULE = stored;
+  else if(!SCHEDULE) SCHEDULE = JSON.parse(JSON.stringify(ALL_ROUTES));
   return SCHEDULE;
 }
-function saveSchedule(){ sSet('schedule', SCHEDULE); }
+// This used to fire-and-forget: called sSet() but never awaited or
+// checked it, so the editing session's own in-memory SCHEDULE looked
+// correct immediately (since the edit had already been applied to it
+// locally) regardless of whether the write to Firestore actually
+// succeeded. That's exactly the kind of gap that leaves one person's edit
+// looking saved on their own screen while nobody else — another tablet,
+// a driver's tomorrow preview, Bestuur's own schedule editor later —
+// ever actually receives it. Now it waits, verifies, retries once, and
+// warns clearly if it still didn't go through.
+async function saveSchedule(){
+  let ok = await sSet('schedule', SCHEDULE);
+  if(!ok){
+    await new Promise(r=>setTimeout(r,1500));
+    ok = await sSet('schedule', SCHEDULE);
+  }
+  if(!ok){
+    alert('⚠️ Kon nie die skedule-verandering stoor nie — kontroleer die internetverbinding en probeer weer.\n\nCould not save this schedule change — check the internet connection and try again.');
+  }
+  return ok;
+}
 
 // ══════════════════ CLIENT LEDGER SEEDING (from Pastel master list) ═══════════
 // One-time: pulls opening balances for every real client account into the
@@ -1364,7 +1497,7 @@ async function getSkipList(driverId, dateKey){ return await sGet('skip_'+driverI
 async function addSkipForDate(driverId, schedId, dateKey){
   const list=await getSkipList(driverId, dateKey);
   if(!list.includes(schedId)) list.push(schedId);
-  await sSet('skip_'+driverId+'_'+dateKey, list);
+  return await sSet('skip_'+driverId+'_'+dateKey, list);
 }
 
 // "Edit once" — changes a client's notes/price/etc for one specific date
@@ -1385,7 +1518,7 @@ async function setDateOverride(driverId, dateKey, schedId, fields){
 // else's clients for a single day, tagged so it's obvious on the list
 // where they came from.
 async function getExtraForDate(driverId, dateKey){ return await sGet('extra_'+driverId+'_'+dateKey, []); }
-async function setExtraForDate(driverId, dateKey, list){ await sSet('extra_'+driverId+'_'+dateKey, list); }
+async function setExtraForDate(driverId, dateKey, list){ return await sSet('extra_'+driverId+'_'+dateKey, list); }
 
 function getTodayRoute(dId){ return getRouteForDate(dId, sastNow()); }
 
@@ -3168,7 +3301,22 @@ async function endDriverDay(){
   const dk=S.workDate||todayKey(), ck=S.driver+'_'+dk;
   const payload={route:S.route, vehicle:S.vehicle, workers:S.workers, ts:Date.now(), dayEnded:true, dayEndedAt:Date.now()};
   CACHE.progress[ck]=payload;
-  await sSet('progress_'+S.driver+'_'+dk, payload);
+  // sSet used to be treated as always successful here — it swallows its
+  // own errors internally and never throws, so this toast used to fire
+  // unconditionally even when the save genuinely failed (bad connection,
+  // Firestore hiccup, etc.), leaving no trace that "Dag Klaar" hadn't
+  // actually saved anything. Now it actually checks, retries once after a
+  // beat in case it was just a transient blip, and tells the driver
+  // clearly if it still didn't go through instead of a false "success."
+  let ok = await sSet('progress_'+S.driver+'_'+dk, payload);
+  if(!ok){
+    await new Promise(r=>setTimeout(r,1500));
+    ok = await sSet('progress_'+S.driver+'_'+dk, payload);
+  }
+  if(!ok){
+    alert('⚠️ Kon nie jou dag se verslag stoor nie — kontroleer jou internetverbinding en probeer weer. Jou "Dag Klaar" is NIE gestoor nie.\n\nCould not save your day-end report — check your internet connection and try again. Your "Day Done" was NOT saved.');
+    return;
+  }
   toast('🏁 Dag klaar — mooi gewerk!');
 }
 
@@ -3320,6 +3468,16 @@ function renderRoute(ct){
   ab.textContent='＋ Eenmalige kliënt / Once-off';
   ab.onclick=()=>showOnceOff();
   ct.appendChild(ab);
+
+  // For cash a client hands over for a PAST job, not today's — logged
+  // independently of any specific garden so it never gets silently
+  // attached to whatever's on today's list. Bestuur allocates it to the
+  // right client's account afterward.
+  const icb=el('button','btn-sec btn');
+  icb.style.cssText='width:100%;margin-top:10px;font-size:.85rem';
+  icb.innerHTML='💵 Log kontant vir vorige diens / Log cash for a past job';
+  icb.onclick=()=>showLogIndependentCash();
+  ct.appendChild(icb);
 
   // End-of-day report — placed last, at the very bottom, on purpose. Drivers
   // scroll past everything else first, so it's much harder to tap by accident.
@@ -3834,8 +3992,32 @@ function toggleExp(id){
 }
 function tog(id,f){ upd(id,g=>({...g,[f]:!g[f]})); refresh(); }
 function setf(id,f,v){ upd(id,g=>({...g,[f]:v})); saveProgress(); }
-function setSkip(id,r){
-  upd(id,g=>({...g,skipReason:r,completed:r?false:g.completed,active:false}));
+// Applying a skip reason (e.g. "Oorgesit") to a garden that's already
+// marked done used to just silently flip completed back to false with no
+// regard for whether an invoice already existed for it — the invoice
+// itself was never touched, so it kept existing and kept billing the
+// client for a job now marked as not actually done/postponed. This now
+// mirrors undoFinish's exact safety check: a still-pending invoice gets
+// properly deleted and reversed off the ledger first; an already-sent
+// one blocks the change entirely and points to a Credit Note instead,
+// since the client may have already seen that invoice.
+async function setSkip(id,r){
+  const g=S.route.find(x=>x.id===id);
+  if(!g) return;
+  if(r && g.completed && g.invId){
+    const inv=getInvoices().find(i=>i.id===g.invId);
+    if(inv && inv.status==='sent'){
+      alert('Hierdie tuin is reeds klaar gemerk en die faktuur is reeds gestuur — kan nie sommer as oorgesit gemerk word nie. Gebruik eerder \'n Krediet Nota.\n\nThis garden is already marked done and its invoice already sent — use a Credit Note instead.');
+      return;
+    }
+    if(!confirm('Hierdie tuin is reeds klaar gemerk en het \'n faktuur. Merk dit as oorgesit sal die faktuur verwyder. Voortgaan?\n\nThis garden is already marked done and has an invoice. Marking it skipped will delete that invoice. Continue?')) return;
+    await deleteInvoiceAndReverseLedger(g.invId);
+    upd(id,gg=>({...gg,skipReason:r,completed:false,active:false,invoiced:false,invId:null}));
+    toast('⏭️ Gemerk as oorgesit — faktuur verwyder');
+    refresh();
+    return;
+  }
+  upd(id,gx=>({...gx,skipReason:r,completed:r?false:gx.completed,active:false}));
   refresh();
 }
 function upd(id,fn){
@@ -4060,9 +4242,12 @@ async function renderSpanneTab(ct){
 
 // Pierre's view of every driver's daily progress — same bars Jan and
 // Bestuur see, but with absolutely no pricing anywhere on this tab,
-// including inside the per-client status view it links to.
+// including inside the per-client status view it links to. Includes
+// Pierre's own row too — he still runs his own garden route alongside
+// his admin/management work, so his progress belongs here just like
+// everyone else's, not just theirs.
 function renderVorderingTab(ct){
-  const rows=Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,d])=>{
+  const rows=Object.entries(DRIVERS).map(([id,d])=>{
     const prog=CACHE.progress[id+'_'+todayKey()];
     const hasRealProgress = prog && prog.route && prog.route.length>0;
     const route=hasRealProgress? prog.route : getTodayRoute(id);
@@ -4082,7 +4267,7 @@ function renderVorderingTab(ct){
           </div>
         </div>
       </div>
-      <button class="btn-sec btn" style="position:absolute;top:8px;right:8px;padding:4px 8px;font-size:.7rem" onclick="showDriverDayStatus('${id}', true)">👁️ Status</button>
+      <button style="position:absolute;top:8px;right:8px;display:inline-block;width:auto;max-width:fit-content;padding:4px 10px;font-size:.7rem;border-radius:8px;background:var(--bg);color:var(--t2);border:2px solid var(--brd);font-weight:700;cursor:pointer" onclick="showDriverDayStatus('${id}', true)">👁️ Status</button>
     </div>`;
   }).join('');
   ct.innerHTML=`
@@ -4451,7 +4636,7 @@ async function renderOverview(ct){
       <div class="ovc"><div class="v">R${todayCash.toFixed(0)}</div><div class="l">Kontant vandag</div></div>
       <div class="ovc"><div class="v">${Object.keys(getLedger()).length}</div><div class="l">Kliënte totaal</div></div>
     </div>
-    <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Transfer list</button>
+    <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showTransferModal()">🔀 Transfer</button>
     <div class="divlbl">📋 DAGVERSLAE <span style="font-weight:400;color:var(--t3)">· bestuurders wat hul dag klaargemaak het</span></div>
     <div id="day-reports-list"><p style="color:var(--t2);font-size:.82rem;padding:6px 0">Laai...</p></div>
     <div class="divlbl">BESTUURDER STATUS <span style="font-weight:400;color:var(--t3)">· tik op 'n bestuurder om sy lys te wysig</span></div>
@@ -4464,8 +4649,8 @@ async function renderOverview(ct){
       const totalToday=hasRealProgress? prog.route.length : dayCount;
       const pct=totalToday>0? Math.round(100*(doneToday+skippedToday)/totalToday):0;
       const started=hasRealProgress;
-      return `<div class="dsc" style="position:relative">
-        <div onclick="openScheduleEditor('${id}')" style="cursor:pointer;display:flex;gap:10px;align-items:center;flex:1">
+      return `<div class="dsc" style="cursor:pointer" onclick="openScheduleEditor('${id}')">
+        <div style="display:flex;gap:10px;align-items:center;flex:1">
           <div class="dsav" style="background:${d.color}">${d.icon}</div>
           <div class="dsi">
             <h3>${d.name}</h3>
@@ -4476,7 +4661,6 @@ async function renderOverview(ct){
             </div>
           </div>
         </div>
-        <button class="btn-sec btn" style="position:absolute;top:8px;right:8px;padding:4px 8px;font-size:.7rem" onclick="event.stopPropagation();showDriverDayStatus('${id}', false)">👁️ Status</button>
       </div>`;
     }).join('')}
     <button class="btn btn-blue" onclick="showOnceOff()">
@@ -4488,16 +4672,26 @@ async function renderOverview(ct){
 let DAY_REPORTS_BUSY=false;
 let DAY_REPORTS_LAST_FETCH=0;
 let DAY_REPORTS_LAST_HTML=null;
+let DAY_REPORTS_KNOWN={}; // driverId -> {driverId, dateKey, prog} — latest known day-ended entry per driver, carried across both full and quick scans so a quick scan can never make a real entry disappear
 // Scans the last 3 days across every driver for a "day ended" flag, so
 // Bestuur sees exactly what would otherwise only "pop up in the morning" —
 // each one opens the same PDF report the driver generated, regenerated
 // on-demand from the stored data (nothing extra to store separately).
-async function populateDayReports(){
+//
+// quickCheck=true only looks at TODAY (5 reads) instead of the full 3-day
+// window (15 reads) — used by the periodic poll refresh, since a driver
+// who ended their day yesterday was already caught by the full scan when
+// this tab was first opened; the only thing that can newly change on a
+// later tick is someone finishing TODAY. The full 3-day scan still runs
+// once whenever this tab is actually opened/navigated to, so nothing from
+// the last few days is ever missed — this just avoids re-doing that full
+// scan on every single poll tick indefinitely while sitting on the tab.
+async function populateDayReports(quickCheck){
   const box=document.getElementById('day-reports-list');
   if(!box) return;
   const now=Date.now();
   // Reuse the last result for a short while instead of re-fetching (and
-  // re-flashing "Laai...") on every single ~6s poll tick — day-end
+  // re-flashing "Laai...") on every single poll tick — day-end
   // reports only change when a driver finishes their whole day, a rare,
   // discrete event, not something that needs live-second refreshing.
   if(DAY_REPORTS_LAST_HTML!==null && now-DAY_REPORTS_LAST_FETCH<20000){
@@ -4505,38 +4699,35 @@ async function populateDayReports(){
     return;
   }
   // Without this, a slow connection could still have the PREVIOUS scan's
-  // 15 lookups in flight when the next poll tick starts a second scan —
+  // lookups in flight when the next poll tick starts a second scan —
   // both would end up appending rows into the same box at once, which is
   // exactly how the same driver/date was showing up twice.
   if(DAY_REPORTS_BUSY) return;
   DAY_REPORTS_BUSY=true;
   try{
-    const found=[];
     const baseKey=sastDateKey();
+    const daysToScan = quickCheck ? [baseKey] : [baseKey, shiftDateKey(baseKey,-1), shiftDateKey(baseKey,-2)];
     const lookups=[];
-    for(let i=0;i<3;i++){
-      const dk=shiftDateKey(baseKey,-i);
+    for(const dk of daysToScan){
       for(const driverId of Object.keys(DRIVERS)){
         lookups.push(
           sGet('progress_'+driverId+'_'+dk, null).then(prog=>{
-            if(prog && prog.dayEnded) found.push({driverId, dateKey:dk, prog});
+            if(!(prog && prog.dayEnded)) return;
+            const existing=DAY_REPORTS_KNOWN[driverId];
+            if(!existing || (prog.dayEndedAt||0)>=(existing.prog.dayEndedAt||0)){
+              DAY_REPORTS_KNOWN[driverId]={driverId, dateKey:dk, prog};
+            }
           })
         );
       }
     }
-    await Promise.all(lookups); // all 15 lookups run at once instead of one after another
-    found.sort((a,b)=> (b.prog.dayEndedAt||0)-(a.prog.dayEndedAt||0));
+    await Promise.all(lookups); // every lookup in this scan runs at once instead of one after another
     // Only the latest day-ended report per driver belongs in this list —
-    // scanning 3 days back is just to make sure we don't miss one, not to
-    // show a driver's history here (that's what Geskiedenis is for). Kept
-    // showing every match in the window used to mean a driver who ended
-    // their day on back-to-back days appeared twice in a row.
-    const seenDrivers=new Set();
-    const deduped=found.filter(f=>{
-      if(seenDrivers.has(f.driverId)) return false;
-      seenDrivers.add(f.driverId);
-      return true;
-    });
+    // DAY_REPORTS_KNOWN already only ever keeps one (the most recent) per
+    // driver, carried over from whichever scan (full or quick) last saw it.
+    const found=Object.values(DAY_REPORTS_KNOWN);
+    found.sort((a,b)=> (b.prog.dayEndedAt||0)-(a.prog.dayEndedAt||0));
+    const deduped=found;
     if(!box.isConnected) return; // tab may have changed while this was loading
 
     let html;
@@ -4605,8 +4796,8 @@ function renderOfficeOverview(ct,now,dayEn,week){
     const pct=totalCount>0? Math.round(100*(doneToday+skippedToday)/totalCount):0;
     const started=hasRealProgress;
     grandTotal+=total;
-    return `<div class="dsc" style="position:relative">
-      <div onclick="openScheduleEditor('${id}')" style="cursor:pointer;display:flex;gap:10px;align-items:center;flex:1">
+    return `<div class="dsc" style="cursor:pointer" onclick="openScheduleEditor('${id}')">
+      <div style="display:flex;gap:10px;align-items:center;flex:1">
         <div class="dsav" style="background:${d.color}">${d.icon}</div>
         <div class="dsi">
           <h3>${d.name}</h3>
@@ -4618,7 +4809,6 @@ function renderOfficeOverview(ct,now,dayEn,week){
           <p style="font-weight:800;font-size:1.05rem;color:${d.color};margin-top:4px">R${total.toFixed(0)}</p>
         </div>
       </div>
-      <button class="btn-sec btn" style="position:absolute;top:8px;right:8px;padding:4px 8px;font-size:.7rem" onclick="event.stopPropagation();showDriverDayStatus('${id}', true)">👁️ Status</button>
     </div>`;
   }).join('');
 
@@ -4630,73 +4820,163 @@ function renderOfficeOverview(ct,now,dayEn,week){
     <div class="ovgrid">
       <div class="ovc" style="grid-column:1 / -1"><div class="v">R${grandTotal.toFixed(0)}</div><div class="l">Totale begroting vandag / Total budget today</div></div>
     </div>
-    <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Transfer list</button>
+    <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showTransferModal()">🔀 Transfer</button>
     <div class="divlbl">LYSTE VANDAG / TODAY'S LISTS <span style="font-weight:400;color:var(--t3)">· tik op 'n lys om te wysig</span></div>
     ${rows}`;
 }
 
-// Moves one driver's ENTIRE list for one specific date onto another
-// driver — e.g. Pierre covering Jasper's Friday route for a week Jasper's
-// off. One-time only: doesn't touch the recurring schedule, so both
-// drivers' normal weeks are unaffected going forward. Reuses the existing
-// skip mechanism to remove the day from the source driver, and the new
-// "extra clients" mechanism to add it onto the destination driver — both
-// already wired into every place a route gets built (login, tomorrow
-// preview, live sync), so this shows up correctly everywhere immediately.
-function showMoveDayBetweenDriversModal(){
-  document.getElementById('move-wholeday-modal')?.remove();
-  const bg=el('div','mbg'); bg.id='move-wholeday-modal';
+// Transfers either a whole day's list OR a single garden from one
+// driver/date onto another driver/date — the two dates can differ (e.g.
+// something from last Tuesday needs doing by someone else tomorrow).
+// One-time only: doesn't touch the recurring schedule. Reuses the
+// existing skip mechanism to remove a recurring-schedule client from the
+// source, and the "extra clients" mechanism to add onto the
+// destination — both already wired into every place a route gets built
+// (login, tomorrow preview, live sync), so this shows up correctly
+// everywhere immediately, for Jan/Bestuur/Pierre's previews and editors
+// alike, and on the receiving driver's own list the moment that date
+// comes around.
+function showTransferModal(){
+  document.getElementById('transfer-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='transfer-modal';
   const driverOptions=Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}">${d.icon} ${d.name}</option>`).join('');
   bg.innerHTML=`<div class="modal">
-    <div class="mhdr">🔀 Skuif hele dag na ander bestuurder
-      <button class="mclose" onclick="document.getElementById('move-wholeday-modal').remove()">✕</button>
+    <div class="mhdr">🔀 Transfer
+      <button class="mclose" onclick="document.getElementById('transfer-modal').remove()">✕</button>
     </div>
     <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
-      Skuif een bestuurder se hele lys vir 'n spesifieke datum na 'n ander bestuurder. Dit is eenmalig — raak nie enige toekomstige weke of die gewone skedule nie.
+      Skuif 'n hele dag se lys, of net een tuin, van een bestuurder na 'n ander — die datums kan verskil. Dit is eenmalig — raak nie enige toekomstige weke of die gewone skedule nie.
     </p>
+    <div><div class="flbl" style="margin-bottom:5px">Wat wil jy skuif? / What to transfer *</div>
+      <select class="inp" id="tr-type" onchange="transferTypeChanged()">
+        <option value="day">Hele dag se lys / Whole day's list</option>
+        <option value="garden">Net een tuin / Just one garden</option>
+      </select></div>
     <div><div class="flbl" style="margin-bottom:5px">Van bestuurder / From driver *</div>
-      <select class="inp" id="mwd-from">${driverOptions}</select></div>
-    <div><div class="flbl" style="margin-bottom:5px">Datum / Date *</div>
-      <input class="inp" id="mwd-date" type="date" value="${todayKey()}"></div>
+      <select class="inp" id="tr-from" onchange="transferFromChanged()">${driverOptions}</select></div>
+    <div><div class="flbl" style="margin-bottom:5px">Van datum / From date *</div>
+      <input class="inp" id="tr-from-date" type="date" value="${todayKey()}" onchange="transferFromChanged()"></div>
+    <div id="tr-garden-picker" style="display:none">
+      <div class="flbl" style="margin-bottom:5px">Watter tuin? / Which garden *</div>
+      <select class="inp" id="tr-garden"><option value="">— kies 'n datum eers —</option></select>
+    </div>
     <div><div class="flbl" style="margin-bottom:5px">Na bestuurder / To driver *</div>
-      <select class="inp" id="mwd-to">${driverOptions}</select></div>
-    <button class="btn" onclick="submitMoveDayBetweenDrivers()">🔀 Skuif / Move</button>
-    <button class="btn btn-sec" onclick="document.getElementById('move-wholeday-modal').remove()">Kanselleer</button>
+      <select class="inp" id="tr-to">${driverOptions}</select></div>
+    <div><div class="flbl" style="margin-bottom:5px">Na datum / To date *</div>
+      <input class="inp" id="tr-to-date" type="date" value="${todayKey()}"></div>
+    <button class="btn" onclick="submitTransfer()">🔀 Skuif / Transfer</button>
+    <button class="btn btn-sec" onclick="document.getElementById('transfer-modal').remove()">Kanselleer</button>
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
   document.body.appendChild(bg);
+  transferTypeChanged();
 }
-async function submitMoveDayBetweenDrivers(){
-  const fromId=document.getElementById('mwd-from').value;
-  const toId=document.getElementById('mwd-to').value;
-  const dateKey=document.getElementById('mwd-date').value;
-  if(!dateKey){ alert('Kies n datum'); return; }
-  if(fromId===toId){ alert('Kies twee verskillende bestuurders'); return; }
-
+function transferTypeChanged(){
+  const type=document.getElementById('tr-type').value;
+  document.getElementById('tr-garden-picker').style.display = type==='garden' ? 'block':'none';
+  if(type==='garden') transferFromChanged();
+}
+// Fetches the FROM driver/date's actual real list (schedule + skips +
+// overrides + any extras already sitting there) so a single garden can be
+// picked from it — the exact same computation the driver's own app uses,
+// so what's offered here always matches what's really on that list.
+async function transferFromChanged(){
+  if(document.getElementById('tr-type')?.value!=='garden') return;
+  const fromId=document.getElementById('tr-from').value;
+  const dateKey=document.getElementById('tr-from-date').value;
+  const sel=document.getElementById('tr-garden');
+  if(!sel) return;
+  if(!dateKey){ sel.innerHTML='<option value="">— kies \'n datum eers —</option>'; return; }
+  sel.innerHTML='<option value="">Laai... / Loading...</option>';
   await refreshSchedule();
   const dateObj=new Date(dateKey+'T12:00:00');
   let route=getRouteForDate(fromId, dateObj);
-  const [skips, overrides] = await Promise.all([
+  const [skips, overrides, extra] = await Promise.all([
     getSkipList(fromId, dateKey).catch(()=>[]),
     getDateOverrides(fromId, dateKey).catch(()=>({})),
+    getExtraForDate(fromId, dateKey).catch(()=>[]),
   ]);
   if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
   if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
+  route=[...route, ...extra];
+  if(route.length===0){ sel.innerHTML='<option value="">Geen tuine hierdie dag nie</option>'; sel.dataset.route=''; return; }
+  sel.innerHTML=route.map((g,i)=>`<option value="${i}">${g.address}${g.name?' · '+g.name:''} — R${g.cost||0}</option>`).join('');
+  sel.dataset.route=JSON.stringify(route);
+}
+async function submitTransfer(){
+  const type=document.getElementById('tr-type').value;
+  const fromId=document.getElementById('tr-from').value;
+  const toId=document.getElementById('tr-to').value;
+  const fromDate=document.getElementById('tr-from-date').value;
+  const toDate=document.getElementById('tr-to-date').value;
+  if(!fromDate||!toDate){ alert('Kies albei datums'); return; }
+  if(fromId===toId && fromDate===toDate){ alert('Kies \'n ander bestuurder of datum om na toe te skuif'); return; }
 
-  if(route.length===0){ alert('Geen tuine gevind vir '+DRIVERS[fromId].name+' op '+dateKey+' nie.'); return; }
-  if(!confirm(`Skuif ${route.length} tuine van ${DRIVERS[fromId].name} na ${DRIVERS[toId].name} vir ${dateKey}?`)) return;
+  await refreshSchedule();
 
-  // Remove from source (same "skip once" mechanism the schedule editor uses)
-  for(const g of route){
-    await addSkipForDate(fromId, g.schedId, dateKey);
+  // Every write below returns true/false now — a failed save here used to
+  // look identical to a successful one (a toast either way), which for a
+  // schedule change is exactly the kind of silent gap that leaves one
+  // driver's list wrong with nobody the wiser. Now it's checked at each
+  // step and the whole transfer stops with a clear error rather than
+  // half-completing silently.
+  if(type==='day'){
+    const dateObj=new Date(fromDate+'T12:00:00');
+    let route=getRouteForDate(fromId, dateObj);
+    const [skips, overrides, extra] = await Promise.all([
+      getSkipList(fromId, fromDate).catch(()=>[]),
+      getDateOverrides(fromId, fromDate).catch(()=>({})),
+      getExtraForDate(fromId, fromDate).catch(()=>[]),
+    ]);
+    if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
+    if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
+    route=[...route, ...extra];
+    if(route.length===0){ alert('Geen tuine gevind vir '+DRIVERS[fromId].name+' op '+fromDate+' nie.'); return; }
+    if(!confirm(`Skuif ${route.length} tuine van ${DRIVERS[fromId].name} (${fromDate}) na ${DRIVERS[toId].name} (${toDate})?`)) return;
+
+    for(const g of route){
+      if(!g.schedId) continue; // handled below by clearing the source's extra list instead
+      const ok=await addSkipForDate(fromId, g.schedId, fromDate);
+      if(!ok){ alert('⚠️ Kon nie die skuif stoor nie (by "'+g.address+'") — kontroleer die internetverbinding en probeer weer.'); return; }
+    }
+    if(extra.length){
+      const ok=await setExtraForDate(fromId, fromDate, []);
+      if(!ok){ alert('⚠️ Kon nie die skuif stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
+    }
+
+    const tagged=route.map(g=>({...g, borrowedFrom:DRIVERS[fromId].name}));
+    const existingExtra=await getExtraForDate(toId, toDate).catch(()=>[]);
+    const ok=await setExtraForDate(toId, toDate, [...existingExtra, ...tagged]);
+    if(!ok){ alert('⚠️ Kon nie na '+DRIVERS[toId].name+' se lys stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
+
+    document.getElementById('transfer-modal')?.remove();
+    toast(`✓ ${route.length} tuine geskuif na ${DRIVERS[toId].name}`);
+  } else {
+    const sel=document.getElementById('tr-garden');
+    const idx=sel.value;
+    if(idx===''){ alert('Kies \'n tuin'); return; }
+    const route=JSON.parse(sel.dataset.route||'[]');
+    const g=route[idx];
+    if(!g){ alert('Kon nie tuin kry nie — probeer weer'); return; }
+    if(!confirm(`Skuif "${g.address}" van ${DRIVERS[fromId].name} (${fromDate}) na ${DRIVERS[toId].name} (${toDate})?`)) return;
+
+    if(g.schedId){
+      const ok=await addSkipForDate(fromId, g.schedId, fromDate);
+      if(!ok){ alert('⚠️ Kon nie die skuif stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
+    } else {
+      const fromExtra=await getExtraForDate(fromId, fromDate).catch(()=>[]);
+      const ok=await setExtraForDate(fromId, fromDate, fromExtra.filter(e=>e.id!==g.id));
+      if(!ok){ alert('⚠️ Kon nie die skuif stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
+    }
+
+    const tagged={...g, borrowedFrom:DRIVERS[fromId].name};
+    const existingExtra=await getExtraForDate(toId, toDate).catch(()=>[]);
+    const ok=await setExtraForDate(toId, toDate, [...existingExtra, tagged]);
+    if(!ok){ alert('⚠️ Kon nie na '+DRIVERS[toId].name+' se lys stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
+
+    document.getElementById('transfer-modal')?.remove();
+    toast(`✓ "${g.address}" geskuif na ${DRIVERS[toId].name}`);
   }
-  // Add onto destination, tagged so it's clear on their list where these came from
-  const tagged=route.map(g=>({...g, borrowedFrom:DRIVERS[fromId].name}));
-  const existingExtra=await getExtraForDate(toId, dateKey).catch(()=>[]);
-  await setExtraForDate(toId, dateKey, [...existingExtra, ...tagged]);
-
-  document.getElementById('move-wholeday-modal')?.remove();
-  toast(`✓ ${route.length} tuine geskuif na ${DRIVERS[toId].name}`);
 }
 
 // Shows budgeted totals (from the schedule, not actual completed work)
@@ -4874,6 +5154,104 @@ async function recoverInvoices(dateKey, missingByDriver){
   toast(`✓ ${recovered} faktuur/fakture herstel`);
 }
 
+// Finds the opposite problem from the recovery tool above: a garden
+// that's marked with a skip reason (Oorgesit, Reën, etc.) but still has
+// a live invoice sitting against it — which used to be possible if
+// someone finished a garden, an invoice was created, and it was only
+// afterward changed to skipped, since the old setSkip() never checked
+// for or reversed an existing invoice. Fixed going forward; this is for
+// cleaning up anything that already happened before that fix.
+function showWronglyInvoicedScan(){
+  document.getElementById('wrong-inv-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='wrong-inv-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">🔍 Foutief gefaktureerde tuine
+      <button class="mclose" onclick="document.getElementById('wrong-inv-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Kyk deur elke bestuurder se eie dagrekord vir tuine wat as oorgesit/geskip gemerk is, maar waarvoor 'n faktuur steeds bestaan — en verwyder daardie faktuur (en pas die kliënt se rekening reg).
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Datum</div>
+      <input class="inp" id="wrong-inv-date" type="date" value="${todayKey()}"></div>
+    <button class="btn" onclick="scanForWronglyInvoiced()">🔍 Deursoek / Scan</button>
+    <div id="wrong-inv-results"></div>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+async function scanForWronglyInvoiced(){
+  const dateKey=document.getElementById('wrong-inv-date').value;
+  if(!dateKey){ alert('Kies n datum'); return; }
+  const results=document.getElementById('wrong-inv-results');
+  results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Deursoek…</p>';
+
+  const currentInvs=(await collGetAllCritical('invoices')) || getInvoices();
+  CACHE.invoices=currentInvs;
+  const invById={}; currentInvs.forEach(i=>{ invById[i.id]=i; });
+  const wrongByDriver={};
+  let totalWrong=0, totalValue=0, totalSent=0;
+
+  for(const driverId of Object.keys(DRIVERS)){
+    const prog=await sGet('progress_'+driverId+'_'+dateKey, null);
+    if(!prog||!prog.route) continue;
+    const wrong=prog.route.filter(g=>g.skipReason && g.invId && invById[g.invId]);
+    if(wrong.length){
+      wrongByDriver[driverId]=wrong;
+      totalWrong+=wrong.length;
+      wrong.forEach(g=>{
+        const inv=invById[g.invId];
+        totalValue+=inv.amount||0;
+        if(inv.status==='sent') totalSent++;
+      });
+    }
+  }
+
+  if(totalWrong===0){
+    results.innerHTML='<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ Geen foutiewelik gefaktureerde tuine gevind vir hierdie datum nie.</p>';
+    return;
+  }
+
+  results.innerHTML=`
+    <div style="background:#FFF3CD;border:1px solid #FFE082;border-radius:10px;padding:12px;margin:10px 0">
+      <div style="font-weight:800;font-size:1.05rem">${totalWrong} tuin(e) foutief gefaktureer — R${totalValue.toFixed(2)}</div>
+      ${totalSent>0?`<div style="font-size:.8rem;color:#856404;margin-top:4px">⚠️ ${totalSent} van hierdie fakture is reeds gestuur — dié sal nie outomaties verwyder word nie, gebruik eerder 'n Krediet Nota.</div>`:''}
+      ${Object.entries(wrongByDriver).map(([id,items])=>
+        `<div style="font-size:.82rem;margin-top:6px;font-weight:700">${DRIVERS[id].icon} ${DRIVERS[id].name}:</div>
+        ${items.map(g=>{
+          const inv=invById[g.invId];
+          return `<div style="font-size:.78rem;padding:2px 0 2px 20px">${g.address} — ${g.skipReason} — R${(inv.amount||0).toFixed(2)}${inv.status==='sent'?' <span style="color:#C62828;font-weight:700">(reeds gestuur)</span>':''}</div>`;
+        }).join('')}`
+      ).join('')}
+    </div>
+    <button class="btn" style="background:var(--g8)" onclick='fixWronglyInvoiced(${JSON.stringify(dateKey)}, ${JSON.stringify(wrongByDriver)})'>✓ Herstel die ${totalWrong-totalSent} wat nog nie gestuur is nie</button>
+  `;
+}
+async function fixWronglyInvoiced(dateKey, wrongByDriver){
+  const results=document.getElementById('wrong-inv-results');
+  results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Herstel besig…</p>';
+  let fixed=0, skippedSent=0, failed=0;
+  for(const [driverId, gardens] of Object.entries(wrongByDriver)){
+    let prog=await sGet('progress_'+driverId+'_'+dateKey, null);
+    if(!prog||!prog.route) continue;
+    let progChanged=false;
+    for(const g of gardens){
+      const inv=getInvoices().find(i=>i.id===g.invId);
+      if(!inv){ continue; } // already gone somehow — nothing to do
+      if(inv.status==='sent'){ skippedSent++; continue; }
+      try{
+        await deleteInvoiceAndReverseLedger(g.invId);
+        prog.route=prog.route.map(r=>r.id===g.id?{...r, invoiced:false, invId:null}:r);
+        progChanged=true;
+        fixed++;
+      }catch(e){ failed++; console.error('Kon nie herstel nie:', g.address, e); }
+    }
+    if(progChanged) await sSet('progress_'+driverId+'_'+dateKey, prog);
+  }
+  results.innerHTML=`<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${fixed} faktu(u)r(e) verwyder en rekeninge reggestel${skippedSent>0?` · ${skippedSent} was reeds gestuur (gebruik Krediet Nota)`:''}${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
+  toast(`✓ ${fixed} foutiewe faktuur/fakture herstel`);
+  renderParentTab('invoices');
+}
+
 // Which dates are expanded in the Fakture accordion — today starts open,
 // everything else starts collapsed, so opening the tab isn't an
 // overwhelming wall of every invoice ever created. Persists across
@@ -5001,6 +5379,17 @@ function renderInvoices(ct){
   recBtn.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
   recBtn.onclick=showRecoverInvoices;
   ct.appendChild(recBtn);
+
+  // Companion tool for the opposite problem: a garden marked done (and
+  // invoiced), then later changed to a skip reason like "Oorgesit" without
+  // the invoice ever being reversed — which used to be possible before
+  // setSkip() checked for this. Finds any invoice still sitting there for
+  // a garden that's now marked skipped, so it can be cleaned up.
+  const wrongBtn=el('button','btn-sec btn');
+  wrongBtn.style.cssText='margin-top:8px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
+  wrongBtn.innerHTML='🔍 Vind foutief gefaktureerde (oorgesit ens.) tuine';
+  wrongBtn.onclick=showWronglyInvoicedScan;
+  ct.appendChild(wrongBtn);
 }
 
 // ══════════════════ CREDIT NOTES ═══════════════════════════════════════════════
@@ -5956,7 +6345,7 @@ async function historyDeleteInvoice(gardenId){
 
 // ══════════════════ PARENT: LEDGER ════════════════════════════════════════════
 let LEDGER_SEARCH='';
-function renderLedger(ct){
+async function renderLedger(ct){
   const led=getLedger();
   const clients=Object.entries(led).sort((a,b)=>b[1].balance-a[1].balance);
 
@@ -5967,6 +6356,25 @@ function renderLedger(ct){
     return;
   }
   ct.innerHTML=addBtn;
+
+  // Cash a driver logged for a past job, not tied to any garden — shown
+  // here so Bestuur can match it to the real client's account. Stays
+  // visible until allocated; nothing here ever auto-matches on its own,
+  // since a free-text name typed by a driver is exactly the kind of thing
+  // that can be ambiguous (see findLedgerClientIn's whole reason for
+  // preferring address over name).
+  const pendingCash=(await sGet('pending_cash', [])).filter(e=>!e.resolved);
+  if(pendingCash.length){
+    const pc=el('div');
+    pc.style.cssText='background:#FFF3CD;border:2px solid #FFE082;border-radius:var(--r);padding:12px 16px;margin-bottom:12px';
+    pc.innerHTML=`<div style="font-weight:800;font-size:.9rem;color:#856404;margin-bottom:8px">💵 Kontant wag op toewysing (${pendingCash.length})</div>
+      ${pendingCash.map(e=>`<div style="background:#fff;border-radius:8px;padding:10px 12px;margin-bottom:6px">
+        <div style="font-weight:700;font-size:.88rem">R${e.amount.toFixed(2)} — ${e.clientText}</div>
+        <div style="font-size:.76rem;color:var(--t2);margin-top:2px">${e.driverName} · ${e.date}${e.note?' · '+e.note:''}</div>
+        <button class="btn-sec btn" style="margin-top:6px;width:auto;padding:6px 12px;font-size:.78rem" onclick="showAllocateCashModal('${e.id}')">Ken toe aan kliënt / Allocate</button>
+      </div>`).join('')}`;
+    ct.appendChild(pc);
+  }
 
   // Search
   const srch=el('input','inp');
@@ -5984,6 +6392,55 @@ function renderLedger(ct){
 
   renderLedgerList(ct);
 }
+// Lets Bestuur match a driver-logged "cash for a past job" entry to the
+// real client and apply it as a payment on their account — same
+// mechanism (addPayment) as the manual "+ Betaling" flow, so it shows up
+// on the ledger/statement identically either way. The entry is only
+// marked resolved once the payment itself has actually been applied.
+async function showAllocateCashModal(entryId){
+  const list=await sGet('pending_cash', []);
+  const entry=list.find(e=>e.id===entryId);
+  if(!entry){ toast('Kon nie hierdie inskrywing kry nie'); return; }
+  document.getElementById('alloc-cash-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='alloc-cash-modal';
+  const led=getLedger();
+  const clientOptions=Object.entries(led)
+    .sort((a,b)=>a[1].address.localeCompare(b[1].address))
+    .map(([key,c])=>`<option value="${key}">${c.address}${c.name?' ('+c.name+')':''}</option>`).join('');
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">Ken kontant toe / Allocate cash
+      <button class="mclose" onclick="document.getElementById('alloc-cash-modal').remove()">✕</button>
+    </div>
+    <div style="background:var(--bg);border-radius:10px;padding:10px 12px;margin-bottom:10px">
+      <div style="font-weight:700">R${entry.amount.toFixed(2)} — "${entry.clientText}"</div>
+      <div style="font-size:.78rem;color:var(--t2);margin-top:2px">${entry.driverName} · ${entry.date}${entry.note?' · '+entry.note:''}</div>
+    </div>
+    <div><div class="flbl" style="margin-bottom:5px">Werklike kliënt / Actual client *</div>
+      <select class="inp" id="ac-client"><option value="">— kies —</option>${clientOptions}</select></div>
+    <button class="btn" onclick="submitAllocateCash('${entryId}')">✓ Ken toe / Allocate</button>
+    <button class="btn btn-sec" onclick="document.getElementById('alloc-cash-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+async function submitAllocateCash(entryId){
+  const key=document.getElementById('ac-client').value;
+  if(!key){ alert('Kies \'n kliënt'); return; }
+  const list=await sGet('pending_cash', []);
+  const entry=list.find(e=>e.id===entryId);
+  if(!entry){ toast('Kon nie hierdie inskrywing kry nie'); return; }
+
+  await addPayment(key, entry.amount, entry.dateKey, 'Kontant (vorige diens, deur '+entry.driverName+')', entry.driverId);
+
+  const updated=list.map(e=>e.id===entryId?{...e, resolved:true, resolvedKey:key, resolvedAt:Date.now()}:e);
+  const ok=await sSet('pending_cash', updated);
+  if(!ok){ alert('⚠️ Betaling is toegepas, maar kon nie die wag-lys bywerk nie — dit mag weer hier verskyn. Kontroleer gerus.'); }
+
+  document.getElementById('alloc-cash-modal')?.remove();
+  toast('✓ Kontant toegeken');
+  renderParentTab('ledger');
+}
+
 function renderLedgerList(ct){
   const led=getLedger();
   const clients=Object.entries(led).sort((a,b)=>b[1].balance-a[1].balance);
@@ -6233,138 +6690,175 @@ function submitPayment(key){
 // ══════════════════ PARENT: STATEMENTS ════════════════════════════════════════
 let STMT_MONTH_OFFSET=0;
 let STMT_SEARCH='';
+let STMT_OPEN_MONTHS=new Set(); // which month groups are expanded
+let STMT_OPEN_DAYS=new Set();   // which day groups (within an expanded month) are expanded, keyed 'YYYY-MM_YYYY-MM-DD'
+
+// Previously this was "one month at a time" via Prev/This/Next buttons,
+// with a flat list of clients underneath. Replaced with a proper
+// drill-down: every month that has invoice activity, newest first, click
+// to expand — and inside an expanded month, every day that had
+// invoices, newest first, click to expand — and inside an expanded day,
+// the clients invoiced that day with the same Stuur/Bekyk/Laai-af actions
+// as before. The bulk "Send Queue"/"Een PDF" actions still exist, just
+// scoped to whichever month is currently expanded instead of a single
+// globally-selected month.
 async function renderStatements(ct){
   const led=getLedger();
   const invs=getInvoices();
-  const clients=Object.entries(led);
-  const mr=monthRange(STMT_MONTH_OFFSET);
-  const monthName=mr.label;
-  const monthKey=mr.from.slice(0,7);
 
-  if(clients.length===0){
+  if(Object.keys(led).length===0){
     ct.innerHTML='<div class="empty"><div class="ei">📄</div><h3>Geen state nog</h3><p>State word gegenereer sodra kliënte fakture het.</p></div>';
     return;
   }
 
-  // The moment anyone opens this tab in a new month, this month's statements
-  // are already prepared from live invoice/ledger data — no one has to
-  // remember to "generate" anything, it's just ready and flagged once.
+  const now=sastNow();
+  const curYM=now.getFullYear()*12+now.getMonth();
   const nowMonthKey=sastDateKey().slice(0,7);
+  // Current month starts expanded so opening the tab still shows
+  // something useful immediately, instead of an all-collapsed wall.
+  if(STMT_OPEN_MONTHS.size===0) STMT_OPEN_MONTHS.add(nowMonthKey);
+
   const lastSeenMonth=await sGet('stmt_month_marker', null);
-  const isNewMonth=lastSeenMonth!==nowMonthKey && STMT_MONTH_OFFSET===0;
+  const isNewMonth=lastSeenMonth!==nowMonthKey;
   if(isNewMonth) sSet('stmt_month_marker', nowMonthKey);
 
-  // "Grouped for a period" = clients actually billed in that period — not
-  // just whoever currently has a balance. Lets her pull up exactly last
-  // month's batch of work, whether or not it's been paid since.
-  const monthClientKeys=new Set(invs.filter(i=>dateInRange(i.dateKey,mr.from,mr.to)).map(i=>i.pastelCode||i.address));
-  const inPeriod=clients.filter(([key])=>monthClientKeys.has(key));
-  const owing=inPeriod.filter(([,c])=>c.balance>0);
+  const byMonth={};
+  invs.forEach(inv=>{
+    const ym=inv.dateKey.slice(0,7);
+    (byMonth[ym]=byMonth[ym]||{});
+    (byMonth[ym][inv.dateKey]=byMonth[ym][inv.dateKey]||[]).push(inv);
+  });
+  const monthKeys=Object.keys(byMonth).sort((a,b)=>b.localeCompare(a));
 
   ct.innerHTML='';
-  if(isNewMonth && owing.length){
-    const banner=el('div');
-    banner.style.cssText='background:#FFF3CD;border:2px solid #FFE082;border-radius:var(--r);padding:12px 16px;margin-bottom:10px';
-    banner.innerHTML=`<div style="font-weight:800;font-size:.9rem;color:#856404">🆕 ${monthName} se state is gereed</div>
-      <div style="font-size:.8rem;color:#856404;margin-top:2px">${owing.length} kliënte het uitstaande saldo's — deurloop en stuur wanneer gemaklik.</div>`;
-    ct.appendChild(banner);
+
+  if(isNewMonth){
+    const owingNow=Object.values(led).filter(c=>(c.balance||0)>0).length;
+    if(owingNow){
+      const mr0=monthRange(0);
+      const banner=el('div');
+      banner.style.cssText='background:#FFF3CD;border:2px solid #FFE082;border-radius:var(--r);padding:12px 16px;margin-bottom:10px';
+      banner.innerHTML=`<div style="font-weight:800;font-size:.9rem;color:#856404">🆕 ${mr0.label} se state is gereed</div>
+        <div style="font-size:.8rem;color:#856404;margin-top:2px">${owingNow} kliënte het uitstaande saldo's — deurloop en stuur wanneer gemaklik.</div>`;
+      ct.appendChild(banner);
+    }
   }
-
-  const nav=el('div');
-  nav.style.cssText='display:flex;gap:8px;margin-bottom:10px';
-  nav.innerHTML=`
-    <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="STMT_MONTH_OFFSET--;renderParentTab('statements')">← Vorige maand</button>
-    <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="STMT_MONTH_OFFSET=0;renderParentTab('statements')">Hierdie maand</button>
-    <button class="btn-sec btn" style="flex:1;font-size:.8rem;${STMT_MONTH_OFFSET>=0?'opacity:.4;pointer-events:none':''}" onclick="STMT_MONTH_OFFSET++;renderParentTab('statements')">Volgende →</button>`;
-  ct.appendChild(nav);
-
-  const hdr=el('div');
-  hdr.innerHTML=`
-    <div style="background:var(--g1);border-radius:var(--r);border:2px solid var(--g2);
-                padding:14px 16px;margin-bottom:10px">
-      <div style="font-weight:800;font-size:.95rem">📄 State – ${monthName}</div>
-      <div style="font-size:.78rem;color:var(--t2);margin-top:2px">
-        ${inPeriod.length} kliënte gefaktureer hierdie tydperk · ${owing.length} met uitstaande saldo's
-      </div>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="btn-sm" style="flex:1;background:var(--g8);color:#fff"
-                onclick="showStatementQueue(${STMT_MONTH_OFFSET})">▶ Deurloop Almal / Send Queue</button>
-        <button class="btn-sm" style="flex:1;background:var(--bg);border:2px solid var(--brd);color:var(--t2)"
-                onclick="shareAllStatementsPDF(${STMT_MONTH_OFFSET})">📦 Een PDF</button>
-      </div>
-    </div>`;
-  ct.appendChild(hdr);
-
-  const sorted=inPeriod.sort((a,b)=>a[1].address.localeCompare(b[1].address));
-  const sentSet=await getSentStatements(monthKey);
 
   const srch=el('input','inp');
   srch.placeholder='Soek kliënt / Search client…';
   srch.style.marginBottom='10px';
   srch.value=STMT_SEARCH;
-  srch.oninput=()=>{ STMT_SEARCH=srch.value; renderStatementList(); };
+  srch.oninput=()=>{ STMT_SEARCH=srch.value; renderParentTab('statements'); };
   ct.appendChild(srch);
 
-  const listWrap=el('div'); listWrap.id='stmt-list';
-  ct.appendChild(listWrap);
+  const q=STMT_SEARCH.trim().toLowerCase();
+  const matchesClient=(inv)=>{
+    if(!q) return true;
+    const key=Object.keys(led).find(k=>invoiceMatchesClient(inv,led[k]));
+    const c=key?led[key]:null;
+    return (inv.address||'').toLowerCase().includes(q) || (c?.name||'').toLowerCase().includes(q) || (c?.code||'').toLowerCase().includes(q);
+  };
 
-  function renderStatementList(){
-    const q=STMT_SEARCH.toLowerCase();
-    const filtered=q?sorted.filter(([,c])=>
-      c.address.toLowerCase().includes(q)||
-      (c.name||'').toLowerCase().includes(q)||
-      (c.code||'').toLowerCase().includes(q)):sorted;
-    listWrap.innerHTML='';
-    const lbl=el('div','divlbl');
-    lbl.style.marginTop='0';
-    lbl.textContent=q?`${filtered.length} / ${sorted.length} KLIËNTE`:`KLIËNTE HIERDIE TYDPERK (${sorted.length})`;
-    listWrap.appendChild(lbl);
-
-    if(filtered.length===0){
-      const empty=el('p');
-      empty.style.cssText='color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0';
-      empty.textContent=q?'Geen kliënte pas by jou soektog nie.':'Geen kliënte gefaktureer in hierdie tydperk nie.';
-      listWrap.appendChild(empty);
-      return;
-    }
-
-    filtered.forEach(([key,c])=>{
-    const bal=c.balance||0;
-    const monthInvs=invs.filter(i=>invoiceMatchesClient(i,c)&&dateInRange(i.dateKey,mr.from,mr.to));
-    const alreadySent=sentSet.has(key);
-
-    const card=el('div','stmt-item');
-    const monthPays=getMonthPayments(c, monthKey);
-    card.innerHTML=`
-      <div class="stmt-hdr">
-        <div>
-          <div class="stmt-name">${c.address}${alreadySent?' <span style="background:var(--g1);color:var(--g8);font-size:.68rem;font-weight:700;padding:2px 7px;border-radius:100px;margin-left:4px">✓ Gestuur</span>':''}</div>
-          <div style="font-size:.75rem;color:var(--t2);margin-top:2px">
-            ${c.code||''} ${c.name?'· '+c.name:''}
-            · ${monthInvs.length} fakt.
-          </div>
-        </div>
-        <div class="stmt-bal ${bal<=0?'paid':''}">R${Math.abs(bal).toFixed(2)}</div>
-      </div>
-      <div class="stmt-actions">
-        <button class="inv-wa" style="background:var(--g8);flex:1" onclick="shareStatementPDF('${key}',${STMT_MONTH_OFFSET})">
-          📄 Stuur Staat (PDF)
-        </button>
-        <button onclick="viewStatementPDF('${key}',${STMT_MONTH_OFFSET})"
-                style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;
-                       padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">
-          👁
-        </button>
-        <button onclick="downloadStatementPDF('${key}',${STMT_MONTH_OFFSET})"
-                style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;
-                       padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">
-          ⬇️
-        </button>
-      </div>`;
-    listWrap.appendChild(card);
-    });
+  if(monthKeys.length===0){
+    const empty=el('p'); empty.style.cssText='color:var(--t2);text-align:center;padding:20px 0';
+    empty.textContent='Geen fakture gegenereer nie.';
+    ct.appendChild(empty);
+    return;
   }
-  renderStatementList();
+
+  let anyMonthShown=false;
+
+  for(const ym of monthKeys){
+    const dayMap=byMonth[ym];
+    const allMonthInvs=Object.values(dayMap).flat();
+    const filteredMonthInvs=allMonthInvs.filter(matchesClient);
+    if(q && filteredMonthInvs.length===0) continue;
+    anyMonthShown=true;
+
+    const [y,m]=ym.split('-').map(Number);
+    const offset=(y*12+(m-1))-curYM;
+    const monthLabel=MONTHS_AF[m-1]+' '+y;
+    const isMonthOpen=STMT_OPEN_MONTHS.has(ym) || !!q;
+
+    const mHdr=el('div');
+    mHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;background:var(--g1);border:2px solid var(--g2);border-radius:var(--r);padding:12px 16px;margin-top:10px';
+    mHdr.innerHTML=`<div>
+        <div style="font-weight:800;font-size:.95rem">${isMonthOpen?'▾':'▸'} ${monthLabel}</div>
+        <div style="font-size:.78rem;color:var(--t2);margin-top:2px">${filteredMonthInvs.length} fakture</div>
+      </div>
+      <div style="font-weight:800">R${filteredMonthInvs.reduce((s,i)=>s+i.amount,0).toFixed(0)}</div>`;
+    mHdr.onclick=()=>{ if(STMT_OPEN_MONTHS.has(ym)) STMT_OPEN_MONTHS.delete(ym); else STMT_OPEN_MONTHS.add(ym); renderParentTab('statements'); };
+    ct.appendChild(mHdr);
+
+    if(!isMonthOpen) continue;
+
+    const bulkRow=el('div');
+    bulkRow.style.cssText='display:flex;gap:8px;margin:8px 0 4px 0';
+    bulkRow.innerHTML=`
+      <button class="btn-sm" style="flex:1;background:var(--g8);color:#fff" onclick="showStatementQueue(${offset})">▶ Deurloop Almal / Send Queue</button>
+      <button class="btn-sm" style="flex:1;background:var(--bg);border:2px solid var(--brd);color:var(--t2)" onclick="shareAllStatementsPDF(${offset})">📦 Een PDF</button>`;
+    ct.appendChild(bulkRow);
+
+    const sentSet=await getSentStatements(ym);
+    const dayKeys=Object.keys(dayMap).sort((a,b)=>b.localeCompare(a));
+
+    for(const dk of dayKeys){
+      const dayInvs=dayMap[dk].filter(matchesClient);
+      if(dayInvs.length===0) continue;
+
+      const dayKeyFull=ym+'_'+dk;
+      const isDayOpen=STMT_OPEN_DAYS.has(dayKeyFull) || !!q;
+      const dayLbl=dayInvs[0].date||dk;
+
+      const dHdr=el('div');
+      dHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:9px 12px;margin:6px 0 0 10px';
+      dHdr.innerHTML=`<div style="font-size:.86rem;font-weight:700">${isDayOpen?'▾':'▸'} ${dayLbl}</div>
+        <div style="font-size:.78rem;color:var(--t2)">${dayInvs.length} · R${dayInvs.reduce((s,i)=>s+i.amount,0).toFixed(0)}</div>`;
+      dHdr.onclick=()=>{ if(STMT_OPEN_DAYS.has(dayKeyFull)) STMT_OPEN_DAYS.delete(dayKeyFull); else STMT_OPEN_DAYS.add(dayKeyFull); renderParentTab('statements'); };
+      ct.appendChild(dHdr);
+
+      if(!isDayOpen) continue;
+
+      // Group this day's invoices by client, so one client with 2 jobs
+      // the same day still gets a single card, not two duplicates.
+      const byClient={};
+      dayInvs.forEach(inv=>{
+        const key=Object.keys(led).find(k=>invoiceMatchesClient(inv,led[k]));
+        const gk=key||('__nomatch__'+inv.address);
+        (byClient[gk]=byClient[gk]||{key,invs:[]}).invs.push(inv);
+      });
+
+      Object.values(byClient).forEach(({key,invs:clientInvs})=>{
+        const c=key?led[key]:null;
+        const addr=c?c.address:clientInvs[0].address;
+        const nm=c?.name?' ('+c.name+')':'';
+        const bal=c?(c.balance||0):0;
+        const alreadySent=c&&sentSet.has(key);
+        const card=el('div','stmt-item');
+        card.style.marginLeft='20px';
+        card.innerHTML=`
+          <div class="stmt-hdr">
+            <div>
+              <div class="stmt-name">${addr}${nm}${alreadySent?' <span style="background:var(--g1);color:var(--g8);font-size:.68rem;font-weight:700;padding:2px 7px;border-radius:100px;margin-left:4px">✓ Gestuur</span>':''}</div>
+              <div style="font-size:.75rem;color:var(--t2);margin-top:2px">${clientInvs.map(i=>i.id).join(', ')} · R${clientInvs.reduce((s,i)=>s+i.amount,0).toFixed(2)}</div>
+            </div>
+            ${c?`<div class="stmt-bal ${bal<=0?'paid':''}">R${Math.abs(bal).toFixed(2)}</div>`:''}
+          </div>
+          ${c?`<div class="stmt-actions">
+            <button class="inv-wa" style="background:var(--g8);flex:1" onclick="shareStatementPDF('${key}',${offset})">📄 Stuur Staat (PDF)</button>
+            <button onclick="viewStatementPDF('${key}',${offset})" style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">👁</button>
+            <button onclick="downloadStatementPDF('${key}',${offset})" style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">⬇️</button>
+          </div>`:''}`;
+        ct.appendChild(card);
+      });
+    }
+  }
+
+  if(!anyMonthShown){
+    const empty=el('p'); empty.style.cssText='color:var(--t2);text-align:center;padding:20px 0';
+    empty.textContent='Geen kliënte pas by jou soektog nie.';
+    ct.appendChild(empty);
+  }
 }
 
 // Pulls this month's ledger 'payment' entries for a client (manual entries
@@ -6766,6 +7260,57 @@ async function submitOO(){
   document.getElementById('oo-modal').remove();
 }
 
+// Cash a client hands over for a job done a few days ago — not tied to
+// anything on today's list, so it can't get silently absorbed into
+// today's invoice for that garden (which may not even be theirs, or may
+// already be a different amount). Logged as its own pending record;
+// Bestuur matches it to the real client and allocates it from there.
+// Deliberately just a free-text name/address field for the driver, not a
+// client picker — drivers aren't shown any balance/account information,
+// so there's nothing here for them to browse through anyway.
+function showLogIndependentCash(){
+  document.getElementById('indep-cash-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='indep-cash-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">💵 Log kontant vir vorige diens
+      <button class="mclose" onclick="document.getElementById('indep-cash-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Vir kontant wat 'n kliënt vir 'n vorige diens gegee het — nie vandag se werk nie. Bestuur ken dit later toe aan die regte kliënt se rekening.
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Bedrag / Amount (R) *</div>
+      <input class="inp" id="ic-amt" type="number" placeholder="0"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Kliënt naam / adres / Client name or address *</div>
+      <input class="inp" id="ic-client" placeholder="bv. Van Spillberg 13"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Nota (opsioneel) / Note</div>
+      <textarea class="inp" id="ic-note" rows="2" style="resize:none" placeholder="bv. was vir Dinsdag se werk"></textarea></div>
+    <button class="btn" onclick="submitIndependentCash()">Stoor / Save</button>
+    <button class="btn btn-sec" onclick="document.getElementById('indep-cash-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+async function submitIndependentCash(){
+  const amt=parseFloat(document.getElementById('ic-amt').value);
+  const clientText=document.getElementById('ic-client').value.trim();
+  const note=document.getElementById('ic-note').value.trim();
+  if(isNaN(amt)||amt<=0){ alert('Voer \'n geldige bedrag in'); return; }
+  if(!clientText){ alert('Voer die kliënt se naam of adres in'); return; }
+  const now=sastNow();
+  const entry={
+    id:'ic_'+Date.now(),
+    amount:amt, clientText, note,
+    driverId:S.driver, driverName:DRIVERS[S.driver].name,
+    dateKey:todayKey(), date:now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'}),
+    ts:Date.now(), resolved:false,
+  };
+  const list=await sGet('pending_cash', []);
+  const ok=await sSet('pending_cash', [...list, entry]);
+  if(!ok){ alert('⚠️ Kon nie stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
+  document.getElementById('indep-cash-modal')?.remove();
+  toast('✓ Kontant gelog — bestuur sal dit toeken aan die regte rekening');
+}
+
 // ══════════════════ PARENT: DRIVER SCHEDULE EDITOR ═════════════════════════════
 // Lets parents open a driver, pick week + day, and add/edit/remove recurring
 // clients from that day's list. Saved into SCHEDULE (shared, permanent) and,
@@ -6776,7 +7321,14 @@ let SCHED_ED={driverId:null,week:'week1',day:'Monday'};
 
 function openScheduleEditor(driverId){
   SCHED_ED={driverId, week:currentWeekKey(), day:(DAY_ORDER.includes(todayWeekday())?todayWeekday():'Monday')};
-  renderScheduleEditor();
+  // Refetch fresh here, every time — this used to just read whatever
+  // SCHEDULE already happened to be sitting in memory (or the hardcoded
+  // fallback list if nothing had loaded it yet this session), which meant
+  // an edit Jan saved from his own tablet would never show up in
+  // Bestuur's copy of this same editor until a full page reload. Drivers
+  // already avoided this exact problem (their own route load always
+  // refetches fresh); the editor just hadn't been doing the same.
+  refreshSchedule().then(()=>renderScheduleEditor());
 }
 function schedSetWeek(w){ SCHED_ED.week=w; renderScheduleEditor(); }
 function schedSetDay(d){ SCHED_ED.day=d; renderScheduleEditor(); }
@@ -6851,6 +7403,32 @@ async function renderScheduleEditor(forceScroll){
   const nextDate=nextOccurrenceDate(week,day);
   let skippedIds=[];
   try{ skippedIds=await getSkipList(driverId, nextDate); }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
+
+  // This used to be two separate things — a "👁️ Status" popup for
+  // today's live progress, and this editor for the recurring
+  // template — meaning seeing what's actually happened today and
+  // changing the list itself needed two different taps and two
+  // different screens. Whenever the day being viewed here IS today,
+  // this fetches that driver's real live progress and shows it inline
+  // on each client row, right next to the same edit/skip/remove
+  // controls — one screen for both.
+  const isToday = nextDate===todayKey();
+  let todayStatusBySchedId={};
+  let todayDoneCount=0, todaySkipCount=0;
+  if(isToday){
+    try{
+      const prog = await fetchDriverProgress(driverId) || CACHE.progress[driverId+'_'+todayKey()];
+      if(prog && prog.route){
+        prog.route.forEach(g=>{
+          if(!g.schedId) return;
+          todayStatusBySchedId[g.schedId] = g.completed ? 'done' : (g.skipReason ? 'skipped' : 'pending');
+        });
+        todayDoneCount = prog.route.filter(g=>g.completed).length;
+        todaySkipCount = prog.route.filter(g=>g.skipReason).length;
+      }
+    }catch(e){ console.error('Kon nie vandag se status laai nie:', e); }
+  }
+
   const bg=el('div','mbg'); bg.id='sched-modal';
   bg.innerHTML=`<div class="modal" style="height:97vh;max-height:97vh;padding:14px 14px 18px;gap:8px">
     <div class="mhdr" style="margin-bottom:0">${d.icon} ${d.name} se lys
@@ -6862,16 +7440,27 @@ async function renderScheduleEditor(forceScroll){
       ${DAY_ORDER.map(k=>`<button class="badge ${day===k?'bt':'bc'}" style="cursor:pointer;padding:5px 10px;font-size:.76rem;white-space:nowrap"
         onclick="schedSetDay('${k}')">${DAYS_AF[k].slice(0,2)}</button>`).join('')}
     </div>
-    <p style="font-size:.7rem;color:var(--t3);margin:0">Volgende: ${nextDate} · ${list.length} kliënte · R${list.reduce((s,c)=>s+(Number(c.cost)||0),0).toFixed(0)}</p>
+    <p style="font-size:.7rem;color:var(--t3);margin:0">Volgende: ${nextDate} · ${list.length} kliënte · R${list.reduce((s,c)=>s+(Number(c.cost)||0),0).toFixed(0)}
+      ${isToday?` · <span style="color:var(--g8);font-weight:700">📍 Vandag — ${todayDoneCount} klaar${todaySkipCount>0?', '+todaySkipCount+' geskip':''}</span>`:''}
+    </p>
     <div id="sched-client-list" style="flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px">
       ${list.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen kliënte op hierdie dag nie.</p>':''}
       ${list.map((c,idx)=>{
         const lastDone=getLastDoneDate(c.pastelCode, c.address);
         const isSkipped=skippedIds.includes(c.id);
+        const liveStatus=isToday?todayStatusBySchedId[c.id]:null;
+        const liveBadge = liveStatus==='done'
+          ? '<span style="background:var(--g1);color:var(--g8);font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">✅ Klaar</span>'
+          : liveStatus==='skipped'
+            ? '<span style="background:#FFE0B2;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">⏭️ Geskip vandag</span>'
+            : (isToday ? '<span style="background:var(--bg);color:var(--t2);font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">⏳ Wag</span>' : '');
         return `<div style="border:1px solid ${isSkipped?'#FFE0B2':'var(--brd)'};background:${isSkipped?'#FFF8E1':'transparent'};border-radius:8px;padding:6px 10px">
         <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
           <div style="min-width:0;flex:1">
-            <div style="font-weight:700;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.address}${isSkipped?` <span style="background:#FFE0B2;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">⏭️ ${nextDate}</span>`:''}</div>
+            <div style="font-weight:700;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.address}
+              ${isSkipped&&!isToday?` <span style="background:#FFE0B2;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">⏭️ ${nextDate}</span>`:''}
+              ${liveBadge?' '+liveBadge:''}
+            </div>
             <div style="font-size:.7rem;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.name?c.name+' · ':''}Laaste: ${lastDone||'nooit'}</div>
           </div>
           <div style="font-weight:700;font-size:.82rem;flex-shrink:0">R${c.cost||0}</div>
@@ -6967,7 +7556,7 @@ async function schedSubmitForm(clientId){
     newItem={id:driverId+'_new_'+Date.now(),pastelCode:'',...fields};
     arr.push(newItem);
   }
-  saveSchedule();
+  await saveSchedule();
   await schedPatchLiveIfToday(driverId,week,day,clientId,newItem,'upsert');
   document.getElementById('sched-form-modal')?.remove();
   renderScheduleEditor(SCHED_SCROLL_CAPTURE);
@@ -6999,7 +7588,7 @@ async function schedRemoveClient(clientId){
   const arr=SCHEDULE[driverId]?.[week]?.[day]||[];
   const idx=arr.findIndex(c=>c.id===clientId);
   if(idx>-1) arr.splice(idx,1);
-  saveSchedule();
+  await saveSchedule();
   await schedPatchLiveIfToday(driverId,week,day,clientId,null,'remove');
   renderScheduleEditor();
   toast('✓ Verwyder / Removed');
@@ -7022,7 +7611,7 @@ async function schedReorderClient(clientId, newPosRaw){
   to=Math.max(0, Math.min(arr.length-1, to));
   const [item]=arr.splice(from,1);
   arr.splice(to,0,item);
-  saveSchedule();
+  await saveSchedule();
   await schedReorderLiveIfToday(driverId, week, day, arr.map(c=>c.id));
   renderScheduleEditor();
   toast('✓ Volgorde opgedateer');
@@ -7158,30 +7747,35 @@ function buildQuotePDF(q){
     doc.text('Laat weet asseblief of u die kwotasie aanvaar. Dankie!',15,y); y+=12;
   }
 
-  if(q.tasks){
-    if(y>260){ doc.addPage(); y=20; }
-    doc.setFont('helvetica','bold'); doc.text('Werk voorgestel',15,y); y+=6;
-    doc.setFont('helvetica','normal');
-    doc.text(doc.splitTextToSize(q.tasks,180),15,y); y+=10;
-  }
+  // "Werk voorgestel" (tasks) and estimated duration are deliberately left
+  // off the client-facing PDF — Bestuur/Pierre/Jan still see both on
+  // screen (the quote card and detail popup), this just keeps them off
+  // the document itself.
   if(q.frequency){
     if(y>260){ doc.addPage(); y=20; }
     doc.setFont('helvetica','bold'); doc.text('Frekwensie',15,y); y+=6;
     doc.setFont('helvetica','normal');
     doc.text(q.frequency,15,y); y+=10;
   }
-  if(q.durationHrs||q.durationMin){
-    if(y>260){ doc.addPage(); y=20; }
-    doc.setFont('helvetica','bold'); doc.text('Beraamde tyd',15,y); y+=6;
-    doc.setFont('helvetica','normal');
-    doc.text(`${q.durationHrs?q.durationHrs+' uur ':''}${q.durationMin?q.durationMin+' minute':''}`.trim(),15,y); y+=10;
-  }
 
   if(y>250){ doc.addPage(); y=20; }
-  doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=10;
-  doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(20,20,20);
-  doc.text('Kwotasie bedrag',15,y); doc.text('R'+(q.quotedAmount||0).toFixed(2),195,y,{align:'right'});
-  y+=14;
+  // A single combined total only gets shown when there's no itemized
+  // breakdown above it — quotes here almost always cover several
+  // genuinely separate priced things (a first visit vs. an ongoing rate,
+  // different frequencies, etc.) that can't just be added together, and
+  // that itemization is exactly what customMessage already provides as
+  // its own bullets. Showing a lump total on top of that would imply
+  // those unrelated numbers should be summed, which is wrong. When there
+  // really is just one flat price for one thing (no customMessage), a
+  // single total is accurate and still shown.
+  if(!(q.customMessage && q.customMessage.trim())){
+    doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=10;
+    doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(20,20,20);
+    doc.text('Kwotasie bedrag',15,y); doc.text('R'+(q.quotedAmount||0).toFixed(2),195,y,{align:'right'});
+    y+=14;
+  } else {
+    doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=10;
+  }
 
   // Terms & conditions — standard on every quote, same reasoning as the
   // intro above: consistent wording, every time, regardless of who wrote
@@ -7551,7 +8145,7 @@ async function submitNewClient(){
   if(!SCHEDULE[driverId][week][day]) SCHEDULE[driverId][week][day]=[];
   const newItem={id:driverId+'_new_'+Date.now(),pastelCode:'',...fields};
   SCHEDULE[driverId][week][day].push(newItem);
-  saveSchedule();
+  await saveSchedule();
   await schedPatchLiveIfToday(driverId,week,day,null,newItem,'upsert');
   // Create/refresh their ledger account with contact info right away, even before their first invoice.
   const key=newItem.id;
