@@ -590,7 +590,53 @@ async function checkStorageHealth(){
 // keeps working untouched. Writes update CACHE immediately (instant local UI)
 // AND persist to shared storage in the background. A poll loop refreshes CACHE
 // from shared storage periodically so remote changes appear without a refresh.
-function todayKey(){ return new Date().toISOString().split('T')[0]; }
+// South Africa is a single fixed UTC+2 zone with no daylight saving — but
+// every "what day is today" decision in this app used to rely on each
+// device's OWN timezone setting (new Date()'s local getters). If one
+// tablet's timezone is set wrong — even by accident, e.g. left on a
+// default/wrong region after a factory reset — its calendar can already
+// read "tomorrow" hours before it does in South Africa, so that driver's
+// whole day of work gets filed under the wrong date for everyone. Passing
+// Africa/Johannesburg explicitly to Intl makes this correct regardless of
+// how any individual tablet is configured.
+function sastDateKey(){
+  return new Intl.DateTimeFormat('en-CA', {timeZone:'Africa/Johannesburg'}).format(new Date());
+}
+function sastWeekday(){
+  return new Intl.DateTimeFormat('en-US', {timeZone:'Africa/Johannesburg', weekday:'long'}).format(new Date());
+}
+// A Date anchored at noon on today's real SAST calendar date — safe to use
+// with ordinary date arithmetic (setDate(±1) for yesterday/tomorrow, day-
+// of-week checks, etc.) since the correct calendar day was already
+// resolved above; noon avoids any midnight-boundary edge cases.
+function sastNow(){
+  return new Date(sastDateKey()+'T12:00:00');
+}
+function todayKey(){ return sastDateKey(); }
+
+// Safe read-modify-write for shared KV docs. sSet() blindly overwrites a
+// doc with whatever's currently in local memory — fine for data only one
+// device ever writes (a driver's own progress), but wrong for docs several
+// devices append to over the course of a day (invoices, ledger). If
+// Bestuur's tablet has been open for a while and a driver finishes a job
+// in the meantime, Bestuur's in-memory copy is now stale; the next time
+// Bestuur's tablet does ANY save on that doc (mark an invoice paid, edit
+// one, etc.) it would silently overwrite Firestore with its stale copy —
+// erasing every invoice created since Bestuur's tablet last refreshed.
+// This is exactly why invoices were disappearing over the course of a day.
+// transactKV re-reads the doc inside a Firestore transaction immediately
+// before writing, so the mutation always applies to the latest data,
+// never a stale local snapshot — same guarantee createInvoice already had.
+async function transactKV(key, mutatorFn){
+  const result = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    const doc = await transaction.get(FS_KV.doc(key));
+    const current = doc.exists ? JSON.parse(doc.data().value) : undefined;
+    const next = mutatorFn(current);
+    transaction.set(FS_KV.doc(key), {value: JSON.stringify(next)});
+    return next;
+  }), 8000, 'transactKV:'+key);
+  return result;
+}
 
 const CACHE = {
   invoices: [], ledger: {}, invSeq: 1000, quotes: [], expenses: [], bankTxns: [], creditNotes: [],
@@ -855,15 +901,15 @@ function getWeekNum(d){
   const y = new Date(Date.UTC(dt.getUTCFullYear(),0,1));
   return Math.ceil((((dt-y)/86400000)+1)/7);
 }
-function currentWeekKey(){ return (getWeekNum(new Date())%2===1)?'week1':'week2'; }
-function todayWeekday(){ return new Date().toLocaleDateString('en-US',{weekday:'long'}); }
+function currentWeekKey(){ return (getWeekNum(sastNow())%2===1)?'week1':'week2'; }
+function todayWeekday(){ return sastWeekday(); }
 
 // Finds the next real calendar date matching a given week1/week2 + weekday
 // combo — so "skip once" can default to whenever that list next actually
 // happens, instead of always defaulting to today regardless of which day
 // she's editing.
 function nextOccurrenceDate(weekKey, dayName){
-  const d=new Date();
+  const d=sastNow();
   for(let i=0;i<14;i++){
     if(d.toLocaleDateString('en-US',{weekday:'long'})===dayName){
       const wk=(getWeekNum(d)%2===1)?'week1':'week2';
@@ -964,8 +1010,7 @@ async function ensureLedgerSeeded(){
 }
 // Finds a client's ledger entry either by pastel code or, failing that, by
 // matching name/address text — used where a job has no code on file.
-function findLedgerClient(pastelCode,address,name){
-  const led=getLedger();
+function findLedgerClientIn(led,pastelCode,address,name){
   if(pastelCode && led[pastelCode]) return {key:pastelCode, entry:led[pastelCode]};
   const needle=(name||address||'').trim().toUpperCase();
   if(needle){
@@ -974,6 +1019,9 @@ function findLedgerClient(pastelCode,address,name){
     }
   }
   return null;
+}
+function findLedgerClient(pastelCode,address,name){
+  return findLedgerClientIn(getLedger(),pastelCode,address,name);
 }
 
 // "Skip once" — removes a client from one specific date only, without
@@ -998,7 +1046,7 @@ async function setDateOverride(driverId, dateKey, schedId, fields){
   await sSet('override_'+driverId+'_'+dateKey, overrides);
 }
 
-function getTodayRoute(dId){ return getRouteForDate(dId, new Date()); }
+function getTodayRoute(dId){ return getRouteForDate(dId, sastNow()); }
 
 function getRouteForDate(dId, date){
   const day  = date.toLocaleDateString('en-US',{weekday:'long'});
@@ -1133,7 +1181,7 @@ document.getElementById('pin-go').onclick=()=>{
 // would, dated for yesterday — nothing distinguishes it from a live entry.
 async function switchToYesterdayList(){
   const id=S.driver;
-  const y=new Date(); y.setDate(y.getDate()-1);
+  const y=sastNow(); y.setDate(y.getDate()-1);
   const yk=y.toISOString().split('T')[0];
   S.workDate=yk;
   document.getElementById('d-content').innerHTML='<div class="loadmsg">Laai gister se lys… / Loading yesterday\'s list…</div>';
@@ -1244,7 +1292,7 @@ function applyRoleTabs(){
 }
 
 function formatToday(){
-  const n=new Date();
+  const n=sastNow();
   const day=n.toLocaleDateString('af-ZA',{weekday:'long'});
   const date=n.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
   return day+', '+date;
@@ -1260,7 +1308,7 @@ let PAY_OPEN_GROUP=null; // null = folder view; a group id = drilled into that b
 let PR_DEDUCTIONS={}; // { [employeeKey]: [{reason, amount}, ...] } — itemized "other" deductions per week
 
 function mondayOfWeek(offsetWeeks){
-  const d=new Date();
+  const d=sastNow();
   const day=d.getDay(); // 0=Sun..6=Sat
   const diffToMonday=(day===0?-6:1-day);
   d.setDate(d.getDate()+diffToMonday+offsetWeeks*7);
@@ -1338,7 +1386,7 @@ function dateInRange(d,from,to){
   return true;
 }
 function monthRange(offset){
-  const base=new Date();
+  const base=sastNow();
   base.setDate(1); // avoid month-length overflow when shifting months
   base.setMonth(base.getMonth()+offset);
   const from=base.getFullYear()+'-'+String(base.getMonth()+1).padStart(2,'0')+'-01';
@@ -1984,7 +2032,7 @@ function deleteExpense(id){
 async function getDieselSuggestions(){
   const done=new Set(await sGet('diesel_exp_done', []));
   const out=[];
-  const now=new Date();
+  const now=sastNow();
   for(let i=0;i<31;i++){
     const d=new Date(now); d.setDate(d.getDate()-i);
     const dk=d.toISOString().split('T')[0];
@@ -2759,7 +2807,7 @@ async function endDriverDay(){
 // with each other, which no amount of patching fully resolved, so this
 // removes the state entirely instead.
 function firstUpcomingBizDate(){
-  const d=new Date(); d.setDate(d.getDate()+1);
+  const d=sastNow(); d.setDate(d.getDate()+1);
   while(d.getDay()===0||d.getDay()===6) d.setDate(d.getDate()+1);
   return d.toISOString().split('T')[0];
 }
@@ -2812,7 +2860,7 @@ function renderRoute(ct){
     skipped=r.filter(g=>g.skipReason).length,
     left=r.length-done-skipped,
     pct=r.length?Math.round(done/r.length*100):0;
-  const now=S.workDate ? new Date(S.workDate+'T00:00:00') : new Date();
+  const now=S.workDate ? new Date(S.workDate+'T00:00:00') : sastNow();
   const dayEn=now.toLocaleDateString('en-US',{weekday:'long'});
   const dayAf=DAYS_AF[dayEn]||dayEn;
   const d=DRIVERS[S.driver];
@@ -2844,7 +2892,7 @@ function renderRoute(ct){
     backBtn.onclick=()=>{ S.workDate=null; loginDriver(S.driver); };
     ct.appendChild(backBtn);
   } else {
-    const y=new Date(); y.setDate(y.getDate()-1);
+    const y=sastNow(); y.setDate(y.getDate()-1);
     const yWeekday=y.getDay();
     if(yWeekday!==0 && yWeekday!==6){ // only offer this if yesterday was an actual work day
       const fillBtn=el('button','btn-sec btn');
@@ -2961,7 +3009,7 @@ function showQuoteRequestForm(){
   const bg=el('div','mbg'); bg.id='quote-req-modal';
   const driverOptions=Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,d])=>`<option value="${id}">${d.icon} ${d.name}</option>`).join('');
   bg.innerHTML=`<div class="modal">
-    <div class="mhdr">📍 Vra bestuurder om te gaan kyk
+    <div class="mhdr">📍 Stuur drywer vir kwotasie
       <button class="mclose" onclick="document.getElementById('quote-req-modal').remove()">✕</button>
     </div>
     <div><div class="flbl" style="margin-bottom:5px">Adres / Address *</div>
@@ -2995,7 +3043,7 @@ function submitQuoteRequest(){
     status:'assigned',
     createdBy: S.driver||(S.isOffice?'office':'bestuur'),
     createdByName: S.driver?DRIVERS[S.driver].name:(S.isOffice?'Jan':'Bestuur'),
-    dateStr: new Date().toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'}),
+    dateStr: sastNow().toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'}),
   };
   const qs=getQuotes().slice(); qs.push(q); saveQuotes(qs);
   document.getElementById('quote-req-modal')?.remove();
@@ -3137,6 +3185,35 @@ function finishGarden(id,e){
   });
 }
 
+// Removes an invoice and reverses its ledger entry, safely — both the
+// invoices doc and the ledger doc are re-read fresh inside a transaction
+// immediately before writing, so this can't collide with an invoice a
+// driver creates on another device at the same moment.
+async function deleteInvoiceAndReverseLedger(invId){
+  let removedInv=null;
+  const newInvoices = await transactKV('invoices', current=>{
+    const invs = current || getInvoices();
+    const inv = invs.find(i=>i.id===invId);
+    removedInv = inv || null;
+    if(!inv) return invs;
+    return invs.filter(i=>i.id!==invId);
+  });
+  CACHE.invoices = newInvoices;
+  if(removedInv){
+    const newLedger = await transactKV('ledger', current=>{
+      const led = current || getLedger();
+      const key = Object.keys(led).find(k=>invoiceMatchesClient(removedInv, led[k]));
+      if(key){
+        led[key].entries=(led[key].entries||[]).filter(e2=>e2.invId!==removedInv.id);
+        led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
+      }
+      return led;
+    });
+    CACHE.ledger = newLedger;
+  }
+  return removedInv;
+}
+
 // Lets a driver undo an accidental tap — Begin just reverts the start time;
 // Klaar also removes the invoice it created, but only if that invoice is
 // still pending (never sent). Once sent, undoing here would be confusing
@@ -3147,30 +3224,17 @@ function undoStart(id,e){
   toast('↩️ Begin ontdoen');
   refresh();
 }
-function undoFinish(id,e){
+async function undoFinish(id,e){
   if(e) e.stopPropagation();
   const g=S.route.find(r=>r.id===id);
   if(!g) return;
   if(g.invId){
-    const invs=getInvoices();
-    const inv=invs.find(i=>i.id===g.invId);
+    const inv=getInvoices().find(i=>i.id===g.invId);
     if(inv && inv.status==='sent'){
       alert('Hierdie faktuur is reeds gestuur — kan nie sommer ontdoen word nie. Gebruik eerder \'n Krediet Nota.\n\nThis invoice has already been sent — use a Credit Note instead.');
       return;
     }
-    if(inv){
-      const idx=invs.indexOf(inv);
-      invs.splice(idx,1);
-      saveInvoices(invs);
-      // Reverse the ledger entry this invoice created
-      const led=getLedger();
-      const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
-      if(key){
-        led[key].entries=(led[key].entries||[]).filter(e2=>e2.invId!==inv.id);
-        led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
-        saveLedger(led);
-      }
-    }
+    await deleteInvoiceAndReverseLedger(g.invId);
   }
   upd(id,gg=>({...gg,completed:false,timeOut:'',durationMin:0,invoiced:false,invId:null}));
   toast('↩️ Klaar ontdoen — faktuur verwyder');
@@ -3201,7 +3265,7 @@ function refresh(){
   }
 }
 function nowTime(){
-  return new Date().toLocaleTimeString('af-ZA',{hour:'2-digit',minute:'2-digit'});
+  return new Intl.DateTimeFormat('af-ZA', {timeZone:'Africa/Johannesburg', hour:'2-digit', minute:'2-digit'}).format(new Date());
 }
 function calcDur(a,b){
   try{const [h1,m1]=a.split(':').map(Number),[h2,m2]=b.split(':').map(Number);
@@ -3212,7 +3276,7 @@ function calcDur(a,b){
 async function createInvoice(garden, overrideDriverId, overrideDateKey){
   const useDriverId=overrideDriverId||S.driver;
   const useDateKey=overrideDateKey||S.workDate;
-  const now=useDateKey ? new Date(useDateKey+'T12:00:00') : new Date();
+  const now=useDateKey ? new Date(useDateKey+'T12:00:00') : sastNow();
   const dateStr=now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
   const dateKey=useDateKey || now.toISOString().split('T')[0];
   const driver=DRIVERS[useDriverId];
@@ -3264,47 +3328,53 @@ async function createInvoice(garden, overrideDriverId, overrideDateKey){
   CACHE.invSeq=(CACHE.invSeq||1000)+1;
   const invs=getInvoices().slice(); invs.push(inv); CACHE.invoices=invs;
   // Update client ledger
-  addLedgerEntry(inv);
+  await addLedgerEntry(inv);
   return inv;
 }
 
 // ══════════════════ LEDGER ════════════════════════════════════════════════════
-function addLedgerEntry(inv){
-  const led=getLedger();
-  const found=findLedgerClient(inv.pastelCode,inv.address,inv.name);
-  const key=found?found.key:(inv.pastelCode||inv.address);
-  if(!led[key]) led[key]={
-    code:inv.pastelCode, name:inv.name||inv.address,
-    address:inv.address, balance:0, entries:[]
-  };
-  led[key].entries.push({
-    date:inv.dateKey, dateStr:inv.date, type:'invoice',
-    desc:'Tuindiens – '+inv.address,
-    debit:inv.amount, credit:0, invId:inv.id
-  });
-  led[key].balance+=inv.amount;
-  if(inv.cashPaid>0){
+async function addLedgerEntry(inv){
+  const newLedger = await transactKV('ledger', current=>{
+    const led = current || getLedger();
+    const found=findLedgerClientIn(led,inv.pastelCode,inv.address,inv.name);
+    const key=found?found.key:(inv.pastelCode||inv.address);
+    if(!led[key]) led[key]={
+      code:inv.pastelCode, name:inv.name||inv.address,
+      address:inv.address, balance:0, entries:[]
+    };
     led[key].entries.push({
-      date:inv.dateKey, dateStr:inv.date, type:'payment',
-      desc:'Kontant betaling ontvang', debit:0, credit:inv.cashPaid
+      date:inv.dateKey, dateStr:inv.date, type:'invoice',
+      desc:'Tuindiens – '+inv.address,
+      debit:inv.amount, credit:0, invId:inv.id
     });
-    led[key].balance-=inv.cashPaid;
-  }
-  saveLedger(led);
+    led[key].balance+=inv.amount;
+    if(inv.cashPaid>0){
+      led[key].entries.push({
+        date:inv.dateKey, dateStr:inv.date, type:'payment',
+        desc:'Kontant betaling ontvang', debit:0, credit:inv.cashPaid
+      });
+      led[key].balance-=inv.cashPaid;
+    }
+    return led;
+  });
+  CACHE.ledger=newLedger;
 }
 
-function addPayment(clientKey,amount,date,method,driverId){
-  const led=getLedger();
-  if(!led[clientKey]) return;
+async function addPayment(clientKey,amount,date,method,driverId){
   const dateStr=new Date(date).toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  led[clientKey].entries.push({
-    date, dateStr, type:'payment',
-    desc:'Betaling ontvang ('+method+')',
-    debit:0, credit:amount,
-    driverId:driverId||'',
+  const newLedger = await transactKV('ledger', current=>{
+    const led = current || getLedger();
+    if(!led[clientKey]) return led;
+    led[clientKey].entries.push({
+      date, dateStr, type:'payment',
+      desc:'Betaling ontvang ('+method+')',
+      debit:0, credit:amount,
+      driverId:driverId||'',
+    });
+    led[clientKey].balance-=amount;
+    return led;
   });
-  led[clientKey].balance-=amount;
-  saveLedger(led);
+  CACHE.ledger=newLedger;
 }
 
 // ══════════════════ WORKERS TAB ════════════════════════════════════════════════
@@ -3656,7 +3726,7 @@ async function renderParentTab(tab){
 
 // ══════════════════ PARENT: OVERVIEW ══════════════════════════════════════════
 async function renderOverview(ct){
-  const now=new Date();
+  const now=sastNow();
   const dayEn=now.toLocaleDateString('en-US',{weekday:'long'});
   const weekN=getWeekNum(now);
   const week=(weekN%2===1)?'week1':'week2';
@@ -3716,7 +3786,7 @@ async function populateDayReports(){
   const box=document.getElementById('day-reports-list');
   if(!box) return;
   const found=[];
-  const now=new Date();
+  const now=sastNow();
   for(let i=0;i<3;i++){
     const d=new Date(now); d.setDate(d.getDate()-i);
     const dk=d.toISOString().split('T')[0];
@@ -4015,7 +4085,7 @@ async function submitCreditNote(invId){
   if(items.length===0){alert('Kies ten minste een item om te krediteer');return;}
   const total=items.reduce((s,i)=>s+i.amount,0);
   const reason=document.getElementById('cn-reason').value.trim();
-  const now=new Date();
+  const now=sastNow();
   const cn={
     id: nextCreditNoteNum(),
     originalInvoiceId: inv.id,
@@ -4388,13 +4458,19 @@ async function shareInvoicePDF(id){
 }
 
 
-function markSent(id){
-  const invs=getInvoices().map(i=>i.id===id?{...i,status:'sent'}:i);
-  saveInvoices(invs);
+async function markSent(id){
+  const newInvoices = await transactKV('invoices', current=>{
+    const invs = current || getInvoices();
+    return invs.map(i=>i.id===id?{...i,status:'sent'}:i);
+  });
+  CACHE.invoices=newInvoices;
 }
-function markPending(id){
-  const invs=getInvoices().map(i=>i.id===id?{...i,status:'pending'}:i);
-  saveInvoices(invs);
+async function markPending(id){
+  const newInvoices = await transactKV('invoices', current=>{
+    const invs = current || getInvoices();
+    return invs.map(i=>i.id===id?{...i,status:'pending'}:i);
+  });
+  CACHE.invoices=newInvoices;
   renderParentTab('invoices');
 }
 
@@ -4435,35 +4511,44 @@ function showEditInvoiceModal(invId){
     });
   });
 }
-function submitEditInvoice(invId){
-  const invs=getInvoices();
-  const inv=invs.find(i=>i.id===invId);
-  if(!inv) return;
+async function submitEditInvoice(invId){
   const base=parseFloat(document.getElementById('ei-base').value)||0;
   const extraAmt=parseFloat(document.getElementById('ei-extraamt').value)||0;
+  const extraDesc=document.getElementById('ei-extradesc').value.trim();
+  const cashPaid=parseFloat(document.getElementById('ei-cash').value)||0;
   const newAmount=base+extraAmt;
-  inv.baseAmount=base;
-  inv.extraWork=document.getElementById('ei-extradesc').value.trim();
-  inv.extraWorkAmount=extraAmt;
-  inv.cashPaid=parseFloat(document.getElementById('ei-cash').value)||0;
-  inv.amount=newAmount;
-  saveInvoices(invs);
+
+  let editedInv=null;
+  const newInvoices = await transactKV('invoices', current=>{
+    const invs = current || getInvoices();
+    return invs.map(i=>{
+      if(i.id!==invId) return i;
+      editedInv={...i, baseAmount:base, extraWork:extraDesc, extraWorkAmount:extraAmt, cashPaid, amount:newAmount};
+      return editedInv;
+    });
+  });
+  CACHE.invoices=newInvoices;
+  if(!editedInv){ toast('Kon nie faktuur vind nie'); return; }
 
   // Match the client the exact same way statements do (pastelCode, else
   // address) — using a different match here than elsewhere was the bug:
   // the balance could get updated on the wrong client record (or none at
   // all) for invoices without a Pastel code, like once-off jobs, even
   // though the invoice's own amount was saved correctly.
-  const led=getLedger();
-  const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
-  if(key){
-    const entry=(led[key].entries||[]).find(e=>e.invId===inv.id);
-    if(entry) entry.debit=newAmount;
-    // Recompute from every entry rather than nudging by a delta — self
-    // correcting, so it can't drift out of sync after repeated edits.
-    led[key].balance=(led[key].entries||[]).reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
-    saveLedger(led);
-  }
+  const newLedger = await transactKV('ledger', current=>{
+    const led = current || getLedger();
+    const key=Object.keys(led).find(k=>invoiceMatchesClient(editedInv, led[k]));
+    if(key){
+      const entry=(led[key].entries||[]).find(e=>e.invId===editedInv.id);
+      if(entry) entry.debit=newAmount;
+      // Recompute from every entry rather than nudging by a delta — self
+      // correcting, so it can't drift out of sync after repeated edits.
+      led[key].balance=(led[key].entries||[]).reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
+    }
+    return led;
+  });
+  CACHE.ledger=newLedger;
+
   document.getElementById('edit-inv-modal')?.remove();
   toast('✓ Faktuur bygewerk');
   renderParentTab('invoices');
@@ -4649,22 +4734,28 @@ async function submitEditTime(gardenId){
   g.cost=newCost; g.extraWorkAmount=newExtra;
 
   if(amountChanged && g.invId){
-    const invs=getInvoices();
-    const inv=invs.find(i=>i.id===g.invId);
-    if(inv){
-      const oldAmount=inv.amount||0;
-      inv.baseAmount=newCost; inv.extraWorkAmount=newExtra; inv.amount=newCost+newExtra;
-      inv.timeIn=timeIn; inv.timeOut=timeOut; inv.durationMin=mins;
-      saveInvoices(invs);
-      const delta=inv.amount-oldAmount;
-      const led=getLedger();
-      const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
-      if(key){
-        const entry=(led[key].entries||[]).find(e2=>e2.invId===inv.id);
-        if(entry) entry.debit=inv.amount;
-        led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
-        saveLedger(led);
-      }
+    let editedInv=null;
+    const newInvoices = await transactKV('invoices', current=>{
+      const invs = current || getInvoices();
+      return invs.map(i=>{
+        if(i.id!==g.invId) return i;
+        editedInv={...i, baseAmount:newCost, extraWorkAmount:newExtra, amount:newCost+newExtra, timeIn, timeOut, durationMin:mins};
+        return editedInv;
+      });
+    });
+    CACHE.invoices=newInvoices;
+    if(editedInv){
+      const newLedger = await transactKV('ledger', current=>{
+        const led = current || getLedger();
+        const key=Object.keys(led).find(k=>invoiceMatchesClient(editedInv, led[k]));
+        if(key){
+          const entry=(led[key].entries||[]).find(e2=>e2.invId===editedInv.id);
+          if(entry) entry.debit=editedInv.amount;
+          led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
+        }
+        return led;
+      });
+      CACHE.ledger=newLedger;
     }
   }
 
@@ -4678,24 +4769,12 @@ async function historyDeleteInvoice(gardenId){
   const g=(HIST.data?.route||[]).find(x=>x.id===gardenId);
   if(!g || !g.invId) return;
   if(!confirm('Skrap hierdie faktuur? Dit sal ook van die kliënt se rekening verwyder word.')) return;
-  const invs=getInvoices();
-  const inv=invs.find(i=>i.id===g.invId);
-  if(inv){
-    if(inv.status==='sent'){
-      alert('Hierdie faktuur is reeds gestuur — kan nie sommer geskrap word nie. Gebruik eerder \'n Krediet Nota.\n\nThis invoice has already been sent — use a Credit Note instead.');
-      return;
-    }
-    const idx=invs.indexOf(inv);
-    invs.splice(idx,1);
-    saveInvoices(invs);
-    const led=getLedger();
-    const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
-    if(key){
-      led[key].entries=(led[key].entries||[]).filter(e2=>e2.invId!==inv.id);
-      led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
-      saveLedger(led);
-    }
+  const inv=getInvoices().find(i=>i.id===g.invId);
+  if(inv && inv.status==='sent'){
+    alert('Hierdie faktuur is reeds gestuur — kan nie sommer geskrap word nie. Gebruik eerder \'n Krediet Nota.\n\nThis invoice has already been sent — use a Credit Note instead.');
+    return;
   }
+  await deleteInvoiceAndReverseLedger(g.invId);
   g.completed=false; g.timeOut=''; g.durationMin=0; g.invoiced=false; g.invId=null;
   await sSet('progress_'+HIST.driverId+'_'+HIST.date, HIST.data);
   document.getElementById('edit-time-modal')?.remove();
@@ -4860,7 +4939,7 @@ function submitLedgerCorrection(key){
   const led=getLedger();
   const c=led[key];
   if(!c) return;
-  const now=new Date();
+  const now=sastNow();
   const dateKey=now.toISOString().split('T')[0];
   const dateStr=now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
   c.entries=c.entries||[];
@@ -4937,7 +5016,7 @@ async function renderStatements(ct){
   // The moment anyone opens this tab in a new month, this month's statements
   // are already prepared from live invoice/ledger data — no one has to
   // remember to "generate" anything, it's just ready and flagged once.
-  const nowMonthKey=new Date().getFullYear()+'-'+String(new Date().getMonth()+1).padStart(2,'0');
+  const nowMonthKey=sastDateKey().slice(0,7);
   const lastSeenMonth=await sGet('stmt_month_marker', null);
   const isNewMonth=lastSeenMonth!==nowMonthKey && STMT_MONTH_OFFSET===0;
   if(isNewMonth) sSet('stmt_month_marker', nowMonthKey);
@@ -5040,7 +5119,7 @@ function getMonthPayments(c, monthKey){
 
 function buildStatementText(c,monthInvs,bal,monthPays){
   monthPays=monthPays||[];
-  var now=new Date();
+  var now=sastNow();
   var month=MONTHS_AF[now.getMonth()]+' '+now.getFullYear();
   var L=[];
   L.push('MAANDSTAAT / MONTHLY STATEMENT');
@@ -5077,7 +5156,7 @@ function buildStatementText(c,monthInvs,bal,monthPays){
 
 function drawStatementIntoDoc(doc,c,monthInvs,bal,monthPays){
   monthPays=monthPays||[];
-  const now=new Date();
+  const now=sastNow();
   const month=MONTHS_AF[now.getMonth()]+' '+now.getFullYear();
   let y=pdfLetterhead(doc,18);
   doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(20,20,20);
@@ -5793,23 +5872,39 @@ function quoteCardHtml(q,canFinalize,hidePrice){
   </div>`;
 }
 function renderQuotesDriver(ct){
+  if(S.driver==='pierre'){ renderPierreQuotesView(ct); return; }
   const mine=getQuotes().filter(q=>q.createdBy===S.driver || q.assignedDriver===S.driver);
   ct.innerHTML=`
     <button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>
-    ${S.driver==='pierre'?'<button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Vra bestuurder om te gaan kyk</button>':''}
     ${mine.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:30px 0">Geen kwotasies opgeneem nie.</p>':
       mine.map(q=>quoteCardHtml(q,false,q.createdBy!==S.driver)).join('')}`;
+}
+// Pierre can send any driver out for a quote and track what's happening
+// with all of them, but — like Jan — never sets or sees the price. Only
+// Bestuur turns a driver's assessment into an actual priced quote.
+function renderPierreQuotesView(ct){
+  const all=getQuotes();
+  const assigned=all.filter(q=>q.status==='assigned');
+  const pending=all.filter(q=>q.status==='pending');
+  const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned');
+  ct.innerHTML=`
+    <button class="btn btn-sec" onclick="showQuoteRequestForm()">📍 Stuur drywer vir kwotasie</button>
+    <div class="divlbl">WAG VIR BESOEK (${assigned.length}) <span style="font-weight:400;color:var(--t3)">· bestuurder moet nog gaan kyk</span></div>
+    ${assigned.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen versoeke wat wag nie.</p>':assigned.map(q=>quoteCardHtml(q,false,true)).join('')}
+    <div class="divlbl">WAG OP BESLUIT (${pending.length})</div>
+    ${pending.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen kwotasies wat wag nie.</p>':pending.map(q=>quoteCardHtml(q,false,true)).join('')}
+    ${rest.length?`<div class="divlbl">VERLEDE</div>${rest.map(q=>quoteCardHtml(q,false,true)).join('')}`:''}`;
 }
 function renderQuotesParent(ct){
   const all=getQuotes();
   const assigned=all.filter(q=>q.status==='assigned');
   const pending=all.filter(q=>q.status==='pending');
   const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned');
-  const canFinalize=!S.isOffice; // only Bestuur decides/prices — Jan reviews only
-  const hidePrice=!!S.isOffice;  // Jan never sees quote pricing, only daily totals elsewhere
+  const canFinalize=!S.isOffice; // only Bestuur prices/decides — Jan can send drivers for quotes but not price them
+  const hidePrice=!!S.isOffice;
   ct.innerHTML=`
     ${canFinalize?'<button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>':''}
-    <button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Vra bestuurder om te gaan kyk</button>
+    <button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Stuur drywer vir kwotasie</button>
     <div class="divlbl">WAG VIR BESOEK (${assigned.length}) <span style="font-weight:400;color:var(--t3)">· bestuurder moet nog gaan kyk</span></div>
     ${assigned.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen versoeke wat wag nie.</p>':assigned.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
     <div class="divlbl">WAG OP BESLUIT (${pending.length})</div>
@@ -5876,7 +5971,7 @@ function submitQuote(editId){
     renderParentTab(S.parentTab);
     return;
   }
-  const now=new Date();
+  const now=sastNow();
   const q={
     id:'q_'+Date.now(),
     address:addr,
@@ -5898,11 +5993,15 @@ function submitQuote(editId){
   else renderQuotesParent(document.getElementById('p-content'));
   toast('✓ Kwotasie gestoor / Quote saved');
 }
+function refreshQuotesScreen(){
+  if(S.screen==='driver') renderQuotesDriver(document.getElementById('d-content'));
+  else renderQuotesParent(document.getElementById('p-content'));
+}
 function declineQuote(id){
   if(!confirm('Merk hierdie kwotasie as verwerp?'))return;
   const qs=getQuotes().map(q=>q.id===id?{...q,status:'declined'}:q);
   saveQuotes(qs);
-  renderQuotesParent(document.getElementById('p-content'));
+  refreshQuotesScreen();
 }
 
 // ══════════════════ NEW CLIENT (parents) — links schedule + ledger ════════════
@@ -5994,7 +6093,8 @@ async function submitNewClient(){
     saveQuotes(qs);
   }
   document.getElementById('newclient-modal')?.remove();
-  if(S.parentTab==='quotes') renderQuotesParent(document.getElementById('p-content'));
+  if(S.screen==='driver') renderQuotesDriver(document.getElementById('d-content'));
+  else if(S.parentTab==='quotes') renderQuotesParent(document.getElementById('p-content'));
   else if(S.parentTab==='ledger') renderLedger(document.getElementById('p-content'));
   toast('✓ Kliënt bygevoeg by '+DRIVERS[driverId].name+' · '+DAYS_AF[day]);
 }
