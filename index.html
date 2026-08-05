@@ -97,8 +97,10 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
 /* ── CONTENT ── */
 .content{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
 .content>*{flex-shrink:0}
-.content::-webkit-scrollbar{width:3px}
-.content::-webkit-scrollbar-thumb{background:var(--brd);border-radius:2px}
+.content::-webkit-scrollbar{width:12px}
+.content::-webkit-scrollbar-track{background:transparent}
+.content::-webkit-scrollbar-thumb{background:var(--brd);border-radius:100px;border:3px solid var(--bg);background-clip:padding-box}
+.content{scrollbar-width:auto;scrollbar-color:var(--brd) transparent}
 
 /* ── DAY HEADER ── */
 .dayhdr{background:linear-gradient(135deg,var(--g8),var(--g7));
@@ -922,7 +924,7 @@ function saveExpenses(list){ CACHE.expenses=list; sSet('expenses', list); }
 const CATEGORY_ICONS={
   'Diesel/Petrol':'⛽','Olie':'🛢️','Gif/Chemikalieë':'🧪','Tuintoerusting':'🔧',
   'Voertuig Onderhoud':'🚗','Trackers':'📡','Selfone':'📱','Kantoor Toerusting':'🖥️',
-  'Salarisse (ekstra)':'💵','Verlof Uitbetaling':'🏖️','Jaareinde Bonusse':'🎁','Ander':'📦',
+  'Salarisse (ekstra)':'','Verlof Uitbetaling':'🏖️','Jaareinde Bonusse':'🎁','Ander':'📦',
 };
 
 // Small, dependency-free SVG bar chart — takes [{label, value, color?}], no
@@ -1010,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-10'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-14'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1255,6 +1257,23 @@ function safeLedgerKey(raw){
 }
 function findLedgerClientIn(led,pastelCode,address,name){
   if(pastelCode && led[pastelCode]) return {key:pastelCode, entry:led[pastelCode]};
+  // Match on the property's address first. Many different gardens in this
+  // schedule end up sharing the exact same free-text "name" — a generic
+  // scheduling note like "sy sal vra" or "net 2 keer n maand" copy-pasted
+  // across several unrelated properties, or simply the same owner with
+  // two different addresses. Matching on name alone was silently merging
+  // those unrelated properties into a single ledger account: the second
+  // address's invoices piled onto whichever client with that name was
+  // created first, instead of getting their own card — which is exactly
+  // why an address like "Stephan 18" could look like it had vanished.
+  // Address uniquely identifies which garden is actually being invoiced,
+  // so it's checked before falling back to name.
+  const addrNeedle=(address||'').trim().toUpperCase();
+  if(addrNeedle){
+    for(const [key,entry] of Object.entries(led)){
+      if((entry.address||'').trim().toUpperCase()===addrNeedle) return {key,entry};
+    }
+  }
   const needle=(name||address||'').trim().toUpperCase();
   if(needle){
     for(const [key,entry] of Object.entries(led)){
@@ -3033,6 +3052,17 @@ function downloadPDF(blob, filename){
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url),4000);
 }
+// Opens a PDF blob in a new browser tab so it can be looked at without
+// downloading or sending it — a lightweight "check it first" action,
+// distinct from Share (which sends it) and Download (which saves it).
+// Doesn't revoke the blob URL right away since the new tab needs it to
+// stay valid while the PDF is actually open there; cleans up later so a
+// long session of viewing many PDFs doesn't leak blob URLs forever.
+function viewPDFBlob(blob){
+  const url=URL.createObjectURL(blob);
+  window.open(url, '_blank');
+  setTimeout(()=>URL.revokeObjectURL(url), 5*60*1000);
+}
 
 async function shareHistoryDayPDF(){
   const d=DRIVERS[HIST.driverId];
@@ -3041,6 +3071,12 @@ async function shareHistoryDayPDF(){
   const blob=buildDayReportPDF(d.name, HIST.date, data.route||[], data.vehicle, data.workers);
   downloadPDF(blob, `Dagverslag_${d.name}_${HIST.date}.pdf`);
   toast('📄 Dagverslag afgelaai');
+}
+function viewHistoryDayPDF(){
+  const d=DRIVERS[HIST.driverId];
+  const data=HIST.data;
+  if(!data){ toast('Geen rekord vir hierdie dag nie'); return; }
+  viewPDFBlob(buildDayReportPDF(d.name, HIST.date, data.route||[], data.vehicle, data.workers));
 }
 
 async function endDriverDay(){
@@ -3324,7 +3360,7 @@ function makeGardenCard(g,idx){
     badges+=`<span class="badge bt">⏱ ${g.timeIn}→${g.timeOut} · ${g.durationMin}min</span>`;
   else if(g.timeIn)
     badges+=`<span class="badge bt">⏱ ${g.timeIn}…</span>`;
-  if(g.cash)      badges+=`<span class="badge bca">💵 R${g.cashAmount}</span>`;
+  if(g.cash)      badges+=`<span class="badge bca">R${g.cashAmount}</span>`;
   if(g.belangrik) badges+=`<span class="badge bw">⚠️</span>`;
   if(g._fallback) badges+=`<span class="badge bo">Ander dag</span>`;
   if(g.isOnceOff) badges+=`<span class="badge bo">Eenmalig</span>`;
@@ -3380,7 +3416,7 @@ function makeBody(g){
       <button class="chk${g.bet?' on':''}" onclick="tog('${g.id}','bet')">💰 Bet</button>
     </div></div>`);
   rows.push(`<div class="cashrow">
-    <span style="font-weight:700;color:#795548">💵 Kontant:</span>
+    <span style="font-weight:700;color:#795548">Kontant:</span>
     <button class="cashtog${g.cash?' on':''}" onclick="tog('${g.id}','cash')">${g.cash?'Ja ✓':'Nee'}</button>
     ${g.cash?`<div style="flex:1"><input class="inp" type="number" placeholder="R bedrag"
       value="${g.cashAmount||''}" onchange="setf('${g.id}','cashAmount',this.value)"
@@ -3831,11 +3867,18 @@ async function renderWorkers(ct){
   const casualNames=Object.keys(S.workers).filter(n=>S.workers[n]?.casual&&!roster.includes(n)&&n!==d.name);
   const allNames=[d.name, ...roster, ...casualNames];
   const total=Object.values(S.workers).reduce((s,w)=>s+(parseFloat(w.loan)||0),0);
+  // Previously this was two separate add flows in two separate cards (one
+  // for "today's casual workers", one for "my permanent team") — same
+  // list, same underlying roster, just presented as if they were two
+  // different things. Now it's one list and one add control with a single
+  // Permanent/Los-vandag choice, matching how Pierre's Spanne tab already
+  // works.
   wc.innerHTML=`<div class="vtitle">👷 Werkers / Workers</div>
     ${allNames.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:6px 0">Geen werkers bygevoeg vir vandag nie.</p>':''}
     ${allNames.map(w=>{
       const ws=S.workers[w]||{present:true,loan:''};
       const isCasual=casualNames.includes(w);
+      const isPermanent=roster.includes(w);
       return `<div class="wrow">
         <div class="wname">${w}${isCasual?' <span style="font-size:.68rem;color:var(--t2);font-weight:400">(los werker)</span>':''}</div>
         <button class="wtog ${ws.present?'wp':'wa'}" onclick="togWorker('${w}')">
@@ -3844,11 +3887,16 @@ async function renderWorkers(ct){
           value="${ws.loan||''}" oninput="setLoan('${w}',this.value)"
           style="padding:8px 10px;font-size:.82rem"></div>
         ${isCasual?`<button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="removeCasualWorker('${w}')">✕</button>`:''}
+        ${isPermanent?`<button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="driverRemovePermanentWorker('${w.replace(/'/g,"\\'")}')">✕</button>`:''}
       </div>`;
     }).join('')}
-    <div style="display:flex;gap:8px;padding-top:8px">
-      <input class="inp" id="casual-name-in" placeholder="Naam van los werker vandag…" style="flex:1;min-width:0;padding:9px 10px">
-      <button class="btn" style="width:auto;flex-shrink:0;padding:9px 14px" onclick="addCasualWorker()">＋ Voeg by</button>
+    <div style="display:flex;gap:8px;padding-top:8px;flex-wrap:wrap">
+      <input class="inp" id="worker-name-in" placeholder="Naam van werker…" style="flex:1;min-width:140px;padding:9px 10px">
+      <select class="inp" id="worker-type-in" style="flex:0 0 130px;padding:9px 10px">
+        <option value="permanent">Permanent</option>
+        <option value="casual">Los (vandag)</option>
+      </select>
+      <button class="btn" style="width:auto;flex-shrink:0;padding:9px 14px" onclick="addWorkerUnified()">＋ Voeg by</button>
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center;
                 padding-top:8px;border-top:1px solid var(--brd)">
@@ -3857,26 +3905,6 @@ async function renderWorkers(ct){
         R${total.toFixed(2)}</span>
     </div>`;
   ct.appendChild(wc);
-
-  // Every driver — Pierre included, since he now runs his own route too —
-  // can manage their OWN permanent team here. This edits the shared
-  // roster, so it's visible in Pierre's Spanne tab and to Bestuur too,
-  // not just today's list.
-  {
-    const rc=el('div','vcard');
-    rc.innerHTML=`<div class="vtitle">📌 My permanente span</div>
-      <p style="font-size:.78rem;color:var(--t2);margin:0 0 8px">Werkers hier bly permanent op jou bakkie totdat jy hulle verwyder — anders as 'n los werker vandag.</p>
-      ${roster.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:2px 0">Geen permanente werkers nie.</p>':
-        roster.map(w=>`<div class="wrow" style="grid-template-columns:1fr auto">
-          <div class="wname">${w}</div>
-          <button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="driverRemovePermanentWorker('${w}')">✕ Verwyder permanent</button>
-        </div>`).join('')}
-      <div style="display:flex;gap:8px;padding-top:8px">
-        <input class="inp" id="perm-name-in" placeholder="Naam vir permanente span…" style="flex:1;min-width:0;padding:9px 10px">
-        <button class="btn" style="width:auto;flex-shrink:0;padding:9px 14px" onclick="driverAddPermanentWorker()">＋ Voeg permanent by</button>
-      </div>`;
-    ct.appendChild(rc);
-  }
 }
 
 // Pierre's dedicated tab for managing every bakkie's team — moved off his
@@ -4008,10 +4036,7 @@ async function pierreRemoveWorker(name, driverId, isTemp){
   renderDriverTab('workers');
 }
 
-async function driverAddPermanentWorker(){
-  const inp=document.getElementById('perm-name-in');
-  const name=inp.value.trim();
-  if(!name){ inp.focus(); return; }
+async function driverAddPermanentWorker(name){
   const id=S.driver;
   await ensureWorkerRosterSeeded();
   if(!CACHE.workerRoster[id]) CACHE.workerRoster[id]=[];
@@ -4034,10 +4059,24 @@ async function driverRemovePermanentWorker(name){
   renderDriverTab('workers');
 }
 
-function addCasualWorker(){
-  const inp=document.getElementById('casual-name-in');
+// Single entry point for the one add-worker control on the driver's
+// Werkers tab — reads the chosen Permanent/Los-vandag type and delegates
+// to the matching storage path, so there's only ever one button and one
+// name field on screen instead of two parallel add flows.
+function addWorkerUnified(){
+  const inp=document.getElementById('worker-name-in');
+  const type=document.getElementById('worker-type-in').value;
   const name=inp.value.trim();
   if(!name){ inp.focus(); return; }
+  if(type==='permanent') driverAddPermanentWorker(name);
+  else addCasualWorker(name);
+}
+function addCasualWorker(name){
+  if(!name){
+    const inp=document.getElementById('casual-name-in');
+    name=inp?inp.value.trim():'';
+    if(!name){ inp&&inp.focus(); return; }
+  }
   if(!S.workers[name]) S.workers[name]={present:true,loan:'',casual:true};
   else S.workers[name].casual=true;
   saveProgress();
@@ -4105,7 +4144,7 @@ function renderSummary(ct){
       <div style="font-size:.92rem;font-weight:700">${g.address}</div>
       <div style="font-size:.78rem;color:var(--t2);margin-top:3px">
         ${g.timeIn} → ${g.timeOut} · <strong>${g.durationMin} min</strong>
-        ${g.cash?` · 💵 R${g.cashAmount}`:''}
+        ${g.cash?` · R${g.cashAmount}`:''}
       </div>
     </div>`).join('')}`:''}
     ${skipped.length?`
@@ -4239,13 +4278,24 @@ async function populateDayReports(){
     }
     await Promise.all(lookups); // all 15 lookups run at once instead of one after another
     found.sort((a,b)=> (b.prog.dayEndedAt||0)-(a.prog.dayEndedAt||0));
+    // Only the latest day-ended report per driver belongs in this list —
+    // scanning 3 days back is just to make sure we don't miss one, not to
+    // show a driver's history here (that's what Geskiedenis is for). Kept
+    // showing every match in the window used to mean a driver who ended
+    // their day on back-to-back days appeared twice in a row.
+    const seenDrivers=new Set();
+    const deduped=found.filter(f=>{
+      if(seenDrivers.has(f.driverId)) return false;
+      seenDrivers.add(f.driverId);
+      return true;
+    });
     if(!box.isConnected) return; // tab may have changed while this was loading
 
     let html;
-    if(found.length===0){
+    if(deduped.length===0){
       html='<p style="color:var(--t2);font-size:.82rem;padding:6px 0">Geen dagverslae die afgelope 3 dae nie.</p>';
     } else {
-      html=found.map(f=>{
+      html=deduped.map(f=>{
         const d=DRIVERS[f.driverId];
         const route=f.prog.route||[];
         const done=route.filter(g=>g.completed).length;
@@ -4253,13 +4303,17 @@ async function populateDayReports(){
         const doneRoute=route.filter(g=>g.completed);
         const total=doneRoute.reduce((s,g)=>s+(g.cost||0)+(parseFloat(g.extraWorkAmount)||0),0);
         const cashTotal=doneRoute.filter(g=>g.cash&&g.cashAmount).reduce((s,g)=>s+(parseFloat(g.cashAmount)||0),0);
-        return `<div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;cursor:pointer"
-            onclick="shareDayReportFor('${f.driverId}','${f.dateKey}')">
+        return `<div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
           <div>
             <div style="font-weight:700">${d.icon} ${d.name} · ${f.dateKey}</div>
-            <div style="font-size:.78rem;color:var(--t2)">${done}/${route.length} tuine klaar${skipped>0?' · '+skipped+' geskip':''} · R${total.toFixed(0)}${cashTotal>0?` · <span style="color:var(--red);font-weight:700">💵 R${cashTotal.toFixed(0)}</span>`:''}</div>
+            <div style="font-size:.78rem;color:var(--t2)">${done}/${route.length} tuine klaar${skipped>0?' · '+skipped+' geskip':''} · R${total.toFixed(0)}${cashTotal>0?` · <span style="color:var(--red);font-weight:700">R${cashTotal.toFixed(0)}</span>`:''}</div>
           </div>
-          <div style="color:var(--g8);font-weight:700;font-size:.82rem">⬇️ Laai af</div>
+          <div style="display:flex;gap:6px;flex-shrink:0">
+            <button onclick="viewDayReportFor('${f.driverId}','${f.dateKey}')" style="background:var(--bg);border:2px solid var(--brd);
+                    border-radius:100px;padding:7px 10px;font-size:.78rem;font-weight:700;color:var(--t2)">👁</button>
+            <button onclick="shareDayReportFor('${f.driverId}','${f.dateKey}')" style="background:var(--bg);border:2px solid var(--brd);
+                    border-radius:100px;padding:7px 10px;font-size:.78rem;font-weight:700;color:var(--g8)">⬇️</button>
+          </div>
         </div>`;
       }).join('');
     }
@@ -4270,12 +4324,21 @@ async function populateDayReports(){
     DAY_REPORTS_BUSY=false;
   }
 }
-async function shareDayReportFor(driverId, dateKey){
+async function getDayReportBlobFor(driverId, dateKey){
   const prog=await sGet('progress_'+driverId+'_'+dateKey, null);
-  if(!prog){ toast('Geen rekord gevind nie'); return; }
+  if(!prog) return null;
   const d=DRIVERS[driverId];
-  const blob=buildDayReportPDF(d.name, dateKey, prog.route||[], prog.vehicle, prog.workers);
-  downloadPDF(blob, `Dagverslag_${d.name}_${dateKey}.pdf`);
+  return {d, blob:buildDayReportPDF(d.name, dateKey, prog.route||[], prog.vehicle, prog.workers)};
+}
+async function viewDayReportFor(driverId, dateKey){
+  const r=await getDayReportBlobFor(driverId, dateKey);
+  if(!r){ toast('Geen rekord gevind nie'); return; }
+  viewPDFBlob(r.blob);
+}
+async function shareDayReportFor(driverId, dateKey){
+  const r=await getDayReportBlobFor(driverId, dateKey);
+  if(!r){ toast('Geen rekord gevind nie'); return; }
+  downloadPDF(r.blob, `Dagverslag_${r.d.name}_${dateKey}.pdf`);
   toast('📄 Dagverslag afgelaai');
 }
 
@@ -4448,6 +4511,51 @@ function renderInvoices(ct){
     ct.appendChild(lbl);
     sent.slice(0,10).forEach(inv=>ct.appendChild(makeInvCard(inv,true)));
   }
+
+  // Credit notes previously had nowhere to live after the moment they were
+  // created — this list is the first place they can actually be found,
+  // re-viewed, re-downloaded, or re-sent later. They already reduce the
+  // client's ledger balance and now also show up as their own line on
+  // that client's statement (see getMonthPayments).
+  const creditNotes=getCreditNotes();
+  if(creditNotes.length){
+    const lbl=el('div','divlbl');
+    lbl.style.marginTop='8px';
+    lbl.textContent=`🧾 KREDIET NOTAS (${creditNotes.length})`;
+    ct.appendChild(lbl);
+    creditNotes.forEach(cn=>{
+      const card=el('div','inv-item');
+      card.innerHTML=`
+        <div class="inv-hdr">
+          <div>
+            <div class="inv-addr">${cn.address}</div>
+            <div class="inv-meta">
+              ${cn.name?cn.name+' · ':''}${cn.date}<br>
+              <span class="inv-driver">Vir faktuur: ${cn.originalInvoiceId}</span>
+              ${cn.reason?' · '+cn.reason:''}
+            </div>
+          </div>
+          <div>
+            <div class="inv-amount" style="color:var(--red)">-R${cn.total.toFixed(2)}</div>
+            <div class="inv-driver">${cn.id}</div>
+          </div>
+        </div>
+        <div class="inv-actions">
+          <button class="inv-wa" onclick="shareCreditNotePDF('${cn.id}')" style="background:#C62828;flex:1">
+            📄 Stuur Krediet Nota (PDF)
+          </button>
+          <button onclick="viewCreditNotePDF('${cn.id}')" style="background:var(--bg);border:2px solid var(--brd);
+                  border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+            👁
+          </button>
+          <button onclick="downloadCreditNotePDF('${cn.id}')" style="background:var(--bg);border:2px solid var(--brd);
+                  border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+            ⬇️
+          </button>
+        </div>`;
+      ct.appendChild(card);
+    });
+  }
 }
 
 // ══════════════════ CREDIT NOTES ═══════════════════════════════════════════════
@@ -4618,6 +4726,16 @@ async function shareCreditNotePDF(cnId){
     `Krediet Nota ${cn.id}`, `Vir faktuur ${cn.originalInvoiceId} — R${cn.total.toFixed(2)}`);
   toast('📄 Krediet Nota PDF gereed');
 }
+function viewCreditNotePDF(cnId){
+  const cn=getCreditNotes().find(c=>c.id===cnId);
+  if(!cn) return;
+  viewPDFBlob(buildCreditNotePDF(cn));
+}
+function downloadCreditNotePDF(cnId){
+  const cn=getCreditNotes().find(c=>c.id===cnId);
+  if(!cn) return;
+  downloadPDF(buildCreditNotePDF(cn), `KredietNota_${cn.id}.pdf`);
+}
 
 function makeInvCard(inv,isSent=false){
   const card=el('div','inv-item'+(isSent?' sent':''));
@@ -4640,7 +4758,7 @@ function makeInvCard(inv,isSent=false){
         ${inv.extraWork?`<div style="font-size:.75rem;color:var(--blue);margin-top:3px">
           ➕ Ekstra: ${inv.extraWork}${inv.extraWorkAmount?' (R'+inv.extraWorkAmount+')':''}</div>`:''}
         ${inv.cashPaid>0?`<div style="font-size:.75rem;color:var(--g8);margin-top:2px">
-          💵 Kontant ontvang: R${inv.cashPaid.toFixed(2)}</div>`:''}
+          Kontant ontvang: R${inv.cashPaid.toFixed(2)}</div>`:''}
       </div>
       <div>
         <div class="inv-amount">R${total}</div>
@@ -4652,9 +4770,13 @@ function makeInvCard(inv,isSent=false){
       <button class="inv-wa" onclick="shareInvoicePDF('${inv.id}')" style="background:var(--g8);flex:1">
         📄 Stuur Faktuur (PDF)
       </button>
-      <button onclick="previewInv('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
+      <button onclick="viewInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
               border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
         👁 Bekyk
+      </button>
+      <button onclick="downloadInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+        ⬇️
       </button>
       <button onclick="showEditInvoiceModal('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
               border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
@@ -4662,10 +4784,20 @@ function makeInvCard(inv,isSent=false){
       </button>
     </div>
     `:`<div class="inv-sent">✓ Gestuur – tik om terug te plaas</div>
-    <button onclick="event.stopPropagation();showEditInvoiceModal('${inv.id}')" style="width:100%;margin-top:6px;background:var(--bg);border:2px solid var(--brd);
-            border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-      ✏️ Wysig faktuur
-    </button>`}`;
+    <div class="inv-actions" style="margin-top:6px">
+      <button onclick="event.stopPropagation();viewInvoicePDF('${inv.id}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+        👁 Bekyk
+      </button>
+      <button onclick="event.stopPropagation();downloadInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+        ⬇️
+      </button>
+      <button onclick="event.stopPropagation();showEditInvoiceModal('${inv.id}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+        ✏️ Wysig
+      </button>
+    </div>`}`;
 
   if(isSent){
     card.querySelector('.inv-sent').onclick=()=>markPending(inv.id);
@@ -4798,7 +4930,7 @@ function buildDayReportPDF(driverName, dateLbl, route, vehicle, workers){
     y+=5;
     if(g.cash&&g.cashAmount){
       doc.setTextColor(198,40,40);
-      doc.text(`  💵 Kontant ontvang: R${parseFloat(g.cashAmount).toFixed(2)}`,15,y);
+      doc.text(`  Kontant ontvang: R${parseFloat(g.cashAmount).toFixed(2)}`,15,y);
       doc.setTextColor(20,20,20);
       y+=5.5;
     }
@@ -4933,6 +5065,19 @@ async function shareInvoicePDF(id){
   await shareOrDownloadPDF(blob, `Faktuur_${inv.id}.pdf`,
     `Faktuur ${inv.id}`, `Faktuur vir ${inv.address} — R${inv.amount.toFixed(2)}`);
   toast('📄 Faktuur PDF gereed');
+}
+// View/Download deliberately don't call markSent — only actually Sharing
+// (sending) an invoice should flip it to "sent"; just looking at or
+// saving a copy of it shouldn't.
+function viewInvoicePDF(id){
+  const inv=getInvoices().find(i=>i.id===id);
+  if(!inv) return;
+  viewPDFBlob(buildInvoicePDF(inv));
+}
+function downloadInvoicePDF(id){
+  const inv=getInvoices().find(i=>i.id===id);
+  if(!inv) return;
+  downloadPDF(buildInvoicePDF(inv), `Faktuur_${inv.id}.pdf`);
 }
 
 
@@ -5123,7 +5268,10 @@ function drawHistory(ct){
       <div class="ovc"><div class="v" style="color:var(--ora)">${skipped}</div><div class="l">Geskip</div></div>
       <div class="ovc"><div class="v">R${route.filter(g=>g.completed).reduce((s,g)=>s+(g.cost||0)+(parseFloat(g.extraWorkAmount)||0),0).toFixed(0)}</div><div class="l">Waarde gedoen</div></div>
     </div>
-    <button class="btn-sec btn" style="width:100%;margin:8px 0" onclick="shareHistoryDayPDF()">⬇️ Laai Dagverslag af (PDF)</button>
+    <div style="display:flex;gap:8px;margin:8px 0">
+      <button class="btn-sec btn" style="flex:1" onclick="viewHistoryDayPDF()">👁 Bekyk</button>
+      <button class="btn-sec btn" style="flex:1" onclick="shareHistoryDayPDF()">⬇️ Laai af</button>
+    </div>
     ${(()=>{
       const v=data.vehicle||{};
       const kmNum=(v.kmStart&&v.kmEnd)?(parseFloat(v.kmEnd)-parseFloat(v.kmStart)):null;
@@ -5148,7 +5296,7 @@ function drawHistory(ct){
               ${g.completed?` <button onclick="showEditTimeModal('${g.id}')" style="background:none;border:none;color:var(--g8);font-weight:700;cursor:pointer;padding:0;margin-left:4px">✏️ Wysig</button>`:''}
             </div>
             ${g.driverNotes?`<div style="font-size:.78rem;color:var(--t2);margin-top:2px">📝 ${g.driverNotes}</div>`:''}
-            ${g.cash&&g.cashAmount?`<div style="font-size:.78rem;color:var(--red);margin-top:2px;font-weight:700">💵 Kontant ontvang: R${parseFloat(g.cashAmount).toFixed(2)}</div>`:''}
+            ${g.cash&&g.cashAmount?`<div style="font-size:.78rem;color:var(--red);margin-top:2px;font-weight:700">Kontant ontvang: R${parseFloat(g.cashAmount).toFixed(2)}</div>`:''}
           </div>
           <div style="font-weight:700;flex-shrink:0">R${g.cost||0}</div>
         </div>
@@ -5664,10 +5812,15 @@ async function renderStatements(ct){
         <button class="inv-wa" style="background:var(--g8);flex:1" onclick="shareStatementPDF('${key}',${STMT_MONTH_OFFSET})">
           📄 Stuur Staat (PDF)
         </button>
-        <button onclick="previewStmt('${key}',${STMT_MONTH_OFFSET})"
+        <button onclick="viewStatementPDF('${key}',${STMT_MONTH_OFFSET})"
                 style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;
                        padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">
           👁
+        </button>
+        <button onclick="downloadStatementPDF('${key}',${STMT_MONTH_OFFSET})"
+                style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;
+                       padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">
+          ⬇️
         </button>
       </div>`;
     ct.appendChild(card);
@@ -5679,7 +5832,12 @@ async function renderStatements(ct){
 // same addPayment() path) so statements show payments as line items, not
 // just a reduced balance.
 function getMonthPayments(c, monthKey){
-  return (c.entries||[]).filter(e=>(e.type==='payment'||e.type==='adjustment') && (e.date||'').startsWith(monthKey));
+  // Credit notes were missing from here even though they already reduce
+  // c.balance correctly (see submitCreditNote) — the balance total was
+  // right, but the credit note itself never showed up as its own line on
+  // the statement, so it looked like the balance had just quietly dropped
+  // for no visible reason.
+  return (c.entries||[]).filter(e=>(e.type==='payment'||e.type==='adjustment'||e.type==='credit_note') && (e.date||'').startsWith(monthKey));
 }
 
 function buildStatementText(c,monthInvs,bal,monthPays){
@@ -5792,21 +5950,39 @@ function buildStatementPDF(c,monthInvs,bal,monthPays){
   return doc.output('blob');
 }
 
-async function shareStatementPDF(key, monthOffset){
+// Shared by Share/View/Download so all three always build the exact same
+// PDF from the exact same data, instead of three separate builds that
+// could quietly drift apart from each other over time.
+function getStatementBlobFor(key, monthOffset){
   const led=getLedger();
   const c=led[key];
-  if(!c) return;
+  if(!c) return null;
   const invs=getInvoices();
   const mr=monthRange(monthOffset||0);
   const monthKey=mr.from.slice(0,7);
   const monthInvs=invs.filter(i=>invoiceMatchesClient(i,c)&&dateInRange(i.dateKey,mr.from,mr.to));
   const monthPays=getMonthPayments(c, monthKey);
-  const blob=buildStatementPDF(c,monthInvs,c.balance||0,monthPays);
+  return {c, monthKey, blob:buildStatementPDF(c,monthInvs,c.balance||0,monthPays)};
+}
+async function shareStatementPDF(key, monthOffset){
+  const r=getStatementBlobFor(key, monthOffset);
+  if(!r) return;
+  const {c, monthKey, blob}=r;
   await shareOrDownloadPDF(blob, `Staat_${(c.code||c.address).replace(/[^a-z0-9]+/gi,'_')}_${monthKey}.pdf`,
     `Maandstaat – ${c.address}`, `Uitstaande saldo: R${Math.max(0,c.balance||0).toFixed(2)}`);
   await markStatementSent(monthKey, key);
   toast('📄 Staat PDF gereed');
   if(S.parentTab==='statements' && !document.getElementById('stmt-queue-modal')) renderParentTab('statements');
+}
+function viewStatementPDF(key, monthOffset){
+  const r=getStatementBlobFor(key, monthOffset);
+  if(!r) return;
+  viewPDFBlob(r.blob);
+}
+function downloadStatementPDF(key, monthOffset){
+  const r=getStatementBlobFor(key, monthOffset);
+  if(!r) return;
+  downloadPDF(r.blob, `Staat_${(r.c.code||r.c.address).replace(/[^a-z0-9]+/gi,'_')}_${r.monthKey}.pdf`);
 }
 
 // One combined PDF with every outstanding client's statement, each starting
@@ -6405,6 +6581,16 @@ async function shareQuotePDF(id){
     `Kwotasie – ${q.address}`, `Kwotasie bedrag: R${(q.quotedAmount||0).toFixed(2)}`);
   toast('📄 Kwotasie PDF gereed');
 }
+function viewQuotePDF(id){
+  const q=getQuotes().find(x=>x.id===id);
+  if(!q) return;
+  viewPDFBlob(buildQuotePDF(q));
+}
+function downloadQuotePDF(id){
+  const q=getQuotes().find(x=>x.id===id);
+  if(!q) return;
+  downloadPDF(buildQuotePDF(q), `Kwotasie_${q.address.replace(/[^a-z0-9]+/gi,'_')}.pdf`);
+}
 function _quoteHidePriceForViewer(q){
   if(S.screen==='parent') return !!S.isOffice;      // Bestuur sees price, Jan doesn't
   if(S.driver==='pierre') return true;               // Pierre never sees pricing
@@ -6440,7 +6626,11 @@ function showQuoteDetail(id){
     ${row('Wys op lys vanaf', q.scheduledDate)}
     ${row('Geskep deur', q.createdByName+' · '+q.dateStr)}
     ${!hidePrice?row('Kwotasie bedrag', priceKnown?('R'+(q.quotedAmount||0)):'Nog nie geprys nie'):''}
-    ${priceKnown&&!hidePrice?`<button class="btn-sec btn" style="width:100%;margin-top:10px" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>`:''}
+    ${priceKnown&&!hidePrice?`<div style="display:flex;gap:8px;margin-top:10px">
+      <button class="btn-sec btn" style="flex:1;padding:8px;font-size:.8rem" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>
+      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="viewQuotePDF('${q.id}')">👁</button>
+      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
+    </div>`:''}
     <button class="btn btn-sec" style="margin-top:8px" onclick="document.getElementById('quote-detail-modal').remove()">Sluit</button>
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
@@ -6469,7 +6659,8 @@ function quoteCardHtml(q,canFinalize,hidePrice){
     </div>
     ${priceKnown&&!hidePrice?`<div style="display:flex;gap:8px;margin-top:10px">
       <button class="btn-sec btn" style="flex:1;padding:8px;font-size:.8rem" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>
-      ${canFinalize?`<button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig</button>`:''}
+      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="viewQuotePDF('${q.id}')">👁</button>
+      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
     </div>`:''}
     ${canFinalize&&(q.status==='pending')?`<div style="display:flex;gap:8px;margin-top:8px">
       <button class="btn btn-blue" style="flex:1;padding:9px;font-size:.85rem;white-space:nowrap" onclick="showQuoteForm('${q.id}')">${priceKnown?'✏️ Wysig prys':'💰 Formaliseer prys'}</button>
