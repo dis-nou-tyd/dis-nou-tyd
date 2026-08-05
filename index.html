@@ -709,11 +709,19 @@ async function ensureCollectionMigrated(oldKey, collName, isKeyed){
     if(entries.length===0){ await sSet(flagKey, true); return; } // nothing to migrate
     const existingSnap = await withTimeout(collRef(collName).get(), 10000, 'migrateExisting:'+collName);
     const existingIds = new Set(existingSnap.docs.map(d=>d.id));
-    const missing = entries.filter(([id])=>id && !existingIds.has(String(id)));
+    // Old blob keys can contain characters (like "/") that are invalid in a
+    // Firestore document ID — sanitize here too, same as safeLedgerKey,
+    // so a historical client address with a slash in it (which used to
+    // make this migration fail every single load) actually migrates
+    // instead of permanently erroring out.
+    const missing = entries
+      .filter(([id])=>id)
+      .map(([id, data])=>[safeLedgerKey(id), data])
+      .filter(([id])=>!existingIds.has(id));
     for(let i=0; i<missing.length; i+=450){
       const chunk = missing.slice(i, i+450);
       const batch = FS_DB.batch();
-      chunk.forEach(([id, data])=>{ batch.set(collRef(collName).doc(String(id)), data); });
+      chunk.forEach(([id, data])=>{ batch.set(collRef(collName).doc(id), data); });
       await withTimeout(batch.commit(), 10000, 'migrateBatch:'+collName+':'+i);
     }
     await sSet(flagKey, true);
@@ -1002,7 +1010,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-9'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-10'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1231,6 +1239,20 @@ async function ensureLedgerSeeded(){
 }
 // Finds a client's ledger entry either by pastel code or, failing that, by
 // matching name/address text — used where a job has no code on file.
+// Firestore document IDs cannot contain a literal "/" — it's read as a
+// path separator, so e.g. a client whose address is "Vygie 2 / Hibiscus 2"
+// would otherwise produce an invalid document reference the moment a new
+// ledger key is minted for them (their very first invoice, quote, or
+// credit note). This has nothing to do with matching or display — every
+// lookup elsewhere in the app matches clients by their stored .code/
+// .address/.name fields, never by re-deriving this key from raw text — so
+// sanitizing only at the point a brand-new key is minted is enough to
+// keep every subsequent doc(key) reference valid, with zero effect on how
+// clients are found or shown.
+function safeLedgerKey(raw){
+  const s=String(raw||'').replace(/\//g,' - ').trim();
+  return s || 'client';
+}
 function findLedgerClientIn(led,pastelCode,address,name){
   if(pastelCode && led[pastelCode]) return {key:pastelCode, entry:led[pastelCode]};
   const needle=(name||address||'').trim().toUpperCase();
@@ -3717,7 +3739,7 @@ async function createInvoice(garden, overrideDriverId, overrideDateKey){
 // ══════════════════ LEDGER ════════════════════════════════════════════════════
 async function addLedgerEntry(inv){
   const found=findLedgerClientIn(getLedger(),inv.pastelCode,inv.address,inv.name);
-  const key=found?found.key:(inv.pastelCode||inv.address);
+  const key=found?found.key:safeLedgerKey(inv.pastelCode||inv.address);
   const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
     const ref=FS_DB.collection('ledger').doc(key);
     const doc=await transaction.get(ref);
@@ -4536,7 +4558,7 @@ async function submitCreditNote(invId){
 
   // Reduce the client's ledger balance, same mechanism as a payment.
   const found=findLedgerClient(inv.pastelCode, inv.address, inv.name);
-  const key=found?found.key:(inv.pastelCode||inv.address);
+  const key=found?found.key:safeLedgerKey(inv.pastelCode||inv.address);
   const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
     const ref=FS_DB.collection('ledger').doc(key);
     const doc=await transaction.get(ref);
