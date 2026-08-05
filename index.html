@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-23'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-24'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1034,6 +1034,7 @@ async function checkForNewVersion(){
   }catch(e){ /* stay silent, retry next tick */ }
 }
 
+let PARENT_DATA_SIG=''; // last-seen signature of invoices/ledger/quotes, used to skip no-op re-renders during polling
 let PIERRE_SPANNE_SIG=''; // last-seen signature of Spanne tab data, used to skip no-op re-renders during polling
 function startPolling(){
   stopPolling();
@@ -1047,10 +1048,19 @@ function startPolling(){
           collGetAllKeyed('ledger').catch(()=>CACHE.ledger),
           collGetAll('quotes').catch(()=>CACHE.quotes),
         ]);
+        // Only treat this as "changed" (and worth a re-render) if the data
+        // actually differs from last time — this used to re-render
+        // unconditionally every ~6 seconds regardless of whether anything
+        // had changed, which is exactly what made tabs like State feel
+        // like they were "constantly refreshing" even while just sitting
+        // there looking at them.
+        const newSig=JSON.stringify({invoices, ledger, quotes});
+        const dataChanged = newSig!==PARENT_DATA_SIG;
+        PARENT_DATA_SIG=newSig;
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
         await Promise.all(Object.keys(DRIVERS).map(fetchDriverProgress));
         const NO_AUTOREFRESH_TABS=['payroll','map','history'];
-        if(S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
+        if(dataChanged && S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
           // Preserve scroll position across this background refresh — a
           // full re-render was resetting scroll to the top every ~6
           // seconds on tabs not in the exclusion list above (confirmed on
@@ -3587,6 +3597,14 @@ async function deleteInvoiceAndReverseLedger(invId){
       return c;
     }), 8000, 'deleteInvoice-ledger-transaction');
     if(client) CACHE.ledger={...CACHE.ledger, [key]:client};
+  } else {
+    // This used to fail completely silently — the invoice would be gone
+    // from Fakture, but its debit stayed on the client's ledger/statement
+    // forever with no error anywhere, since nothing here noticed the
+    // client couldn't be matched. Logged now so a stuck balance like this
+    // is at least traceable; the "Herstel rekening" button on a client's
+    // ledger detail cleans up any leftovers from this happening in the past.
+    console.error('Kon nie kliënt kry vir geskrapte faktuur nie — saldo dalk nie bygewerk nie:', removedInv.id, removedInv.address);
   }
   return removedInv;
 }
@@ -5734,6 +5752,7 @@ function showClientLedger(key,c){
       <div style="display:flex;flex-direction:column;gap:6px">
         ${bal>0?`<button class="pay-btn" onclick="showPaymentForm('${key}')">+ Betaling</button>`:''}
         <button class="btn-sec btn" style="padding:6px 12px;font-size:.78rem" onclick="showLedgerCorrection('${key}')">✏️ Regstelling / Correction</button>
+        <button class="btn-sec btn" style="padding:6px 12px;font-size:.78rem" onclick="reconcileClientLedger('${key}')">🔧 Herstel rekening</button>
       </div>
     </div>
     <div class="divlbl">TRANSAKSIES / TRANSACTIONS</div>
@@ -5748,10 +5767,18 @@ function showClientLedger(key,c){
       ${entries.length?(() => {
         let running=bal;
         return entries.map(e=>{
+          // If this entry references an invoice that still exists, its
+          // number is shown and can be tapped to open that exact invoice's
+          // own PDF in a new tab — a quick way to check what a line on a
+          // statement actually was without hunting through Fakture for it.
+          const invStillExists = e.invId && getInvoices().some(i=>i.id===e.invId);
+          const descHtml = invStillExists
+            ? `${e.desc} · <span onclick="event.stopPropagation();viewInvoicePDF('${e.invId}')" style="color:var(--blue);font-weight:700;text-decoration:underline;cursor:pointer">${e.invId}</span>`
+            : e.desc;
           const row=`<div style="display:grid;grid-template-columns:70px 1fr 80px 70px;
             padding:9px 12px;border-bottom:1px solid var(--brd);font-size:.8rem;align-items:center">
             <span style="color:var(--t2)">${e.date}</span>
-            <span style="padding:0 8px;color:var(--text)">${e.desc}${e.type==='adjustment'?' <span style="background:#FFF3CD;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">Regstelling</span>':''}</span>
+            <span style="padding:0 8px;color:var(--text)">${descHtml}${e.type==='adjustment'?' <span style="background:#FFF3CD;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">Regstelling</span>':''}</span>
             <span style="text-align:right;font-weight:700;color:${e.debit>0?'var(--red)':'var(--g8)'}">
               ${e.debit>0?'-R'+e.debit.toFixed(2):'+ R'+e.credit.toFixed(2)}
             </span>
@@ -5770,6 +5797,37 @@ function showClientLedger(key,c){
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
   document.body.appendChild(bg);
+}
+// One-off repair for a client's ledger: removes any entry that still
+// references an invoice which no longer exists (e.g. left behind by a
+// delete that happened before invoice deletion reliably matched every
+// client to their ledger record), then recomputes the balance from
+// what's left. Never touches entries that aren't tied to an invoice
+// (payments, corrections, credit notes) or whose invoice is still real.
+async function reconcileClientLedger(key){
+  if(!confirm('Dit verwyder enige rekening-inskrywings wat na fakture verwys wat nie meer bestaan nie (bv. reeds geskrap), en herbereken die saldo. Ander inskrywings (betalings, regstellings, krediet notas) word nie geraak nie. Voortgaan?')) return;
+  const liveInvIds=new Set(getInvoices().map(i=>i.id));
+  let client;
+  try{
+    client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+      const ref=FS_DB.collection('ledger').doc(key);
+      const doc=await transaction.get(ref);
+      if(!doc.exists) return null;
+      const c=doc.data();
+      c.entries=(c.entries||[]).filter(e=>!e.invId || liveInvIds.has(e.invId));
+      c.balance=c.entries.reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
+      transaction.set(ref, c);
+      return c;
+    }), 8000, 'reconcileLedger-transaction');
+  }catch(e){
+    console.error('Herstel rekening het misluk:', e);
+    alert('Kon nie die rekening herstel nie — probeer asseblief weer.');
+    return;
+  }
+  if(!client){ alert('Kon nie hierdie kliënt se rekening kry nie.'); return; }
+  CACHE.ledger={...CACHE.ledger, [key]:client};
+  toast('✓ Rekening herstel');
+  showClientLedger(key,client);
 }
 
 // Lets Bestuur correct a wrong amount (e.g. a bad opening balance from an
@@ -5886,6 +5944,7 @@ function submitPayment(key){
 
 // ══════════════════ PARENT: STATEMENTS ════════════════════════════════════════
 let STMT_MONTH_OFFSET=0;
+let STMT_SEARCH='';
 async function renderStatements(ct){
   const led=getLedger();
   const invs=getInvoices();
@@ -5950,20 +6009,38 @@ async function renderStatements(ct){
 
   const sorted=inPeriod.sort((a,b)=>a[1].address.localeCompare(b[1].address));
   const sentSet=await getSentStatements(monthKey);
-  const lbl=el('div','divlbl');
-  lbl.style.marginTop='4px';
-  lbl.textContent=`KLIËNTE HIERDIE TYDPERK (${sorted.length})`;
-  ct.appendChild(lbl);
 
-  if(sorted.length===0){
-    const empty=el('p');
-    empty.style.cssText='color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0';
-    empty.textContent='Geen kliënte gefaktureer in hierdie tydperk nie.';
-    ct.appendChild(empty);
-    return;
-  }
+  const srch=el('input','inp');
+  srch.placeholder='Soek kliënt / Search client…';
+  srch.style.marginBottom='10px';
+  srch.value=STMT_SEARCH;
+  srch.oninput=()=>{ STMT_SEARCH=srch.value; renderStatementList(); };
+  ct.appendChild(srch);
 
-  sorted.forEach(([key,c])=>{
+  const listWrap=el('div'); listWrap.id='stmt-list';
+  ct.appendChild(listWrap);
+
+  function renderStatementList(){
+    const q=STMT_SEARCH.toLowerCase();
+    const filtered=q?sorted.filter(([,c])=>
+      c.address.toLowerCase().includes(q)||
+      (c.name||'').toLowerCase().includes(q)||
+      (c.code||'').toLowerCase().includes(q)):sorted;
+    listWrap.innerHTML='';
+    const lbl=el('div','divlbl');
+    lbl.style.marginTop='0';
+    lbl.textContent=q?`${filtered.length} / ${sorted.length} KLIËNTE`:`KLIËNTE HIERDIE TYDPERK (${sorted.length})`;
+    listWrap.appendChild(lbl);
+
+    if(filtered.length===0){
+      const empty=el('p');
+      empty.style.cssText='color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0';
+      empty.textContent=q?'Geen kliënte pas by jou soektog nie.':'Geen kliënte gefaktureer in hierdie tydperk nie.';
+      listWrap.appendChild(empty);
+      return;
+    }
+
+    filtered.forEach(([key,c])=>{
     const bal=c.balance||0;
     const monthInvs=invs.filter(i=>invoiceMatchesClient(i,c)&&dateInRange(i.dateKey,mr.from,mr.to));
     const alreadySent=sentSet.has(key);
@@ -5996,8 +6073,10 @@ async function renderStatements(ct){
           ⬇️
         </button>
       </div>`;
-    ct.appendChild(card);
-  });
+    listWrap.appendChild(card);
+    });
+  }
+  renderStatementList();
 }
 
 // Pulls this month's ledger 'payment' entries for a client (manual entries
@@ -6029,7 +6108,7 @@ function buildStatementText(c,monthInvs,bal,monthPays){
   L.push('TRANSAKSIES HIERDIE MAAND:');
   L.push('');
   monthInvs.forEach(function(inv){
-    L.push(inv.dateKey+'  R'+inv.amount.toFixed(2)+'  '+inv.address.substring(0,30));
+    L.push(inv.dateKey+'  R'+inv.amount.toFixed(2)+'  '+inv.address.substring(0,30)+'  ['+inv.id+']');
     if(inv.cashPaid>0) L.push('  Kontant: -R'+inv.cashPaid.toFixed(2));
   });
   monthPays.forEach(function(p){
@@ -6067,7 +6146,7 @@ function drawStatementIntoDoc(doc,c,monthInvs,bal,monthPays){
 
   doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=8;
   doc.setFont('helvetica','bold'); doc.setFontSize(10);
-  doc.text('Datum',15,y); doc.text('Beskrywing',55,y); doc.text('Bedrag',195,y,{align:'right'}); y+=6;
+  doc.text('Datum',15,y); doc.text('Beskrywing',38,y); doc.text('Faktuur #',140,y); doc.text('Bedrag',195,y,{align:'right'}); y+=6;
   doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=6;
   doc.setFont('helvetica','normal');
   if(monthInvs.length===0){
@@ -6078,12 +6157,15 @@ function drawStatementIntoDoc(doc,c,monthInvs,bal,monthPays){
   monthInvs.forEach(inv=>{
     if(y>270){ doc.addPage(); y=20; }
     doc.text(inv.dateKey,15,y);
-    doc.text(doc.splitTextToSize(inv.address,120),55,y);
+    doc.text(doc.splitTextToSize(inv.address,95),38,y);
+    doc.setFont('helvetica','bold'); doc.setTextColor(21,101,192);
+    doc.text(inv.id||'',140,y);
+    doc.setFont('helvetica','normal'); doc.setTextColor(20,20,20);
     doc.text('R'+inv.amount.toFixed(2),195,y,{align:'right'});
     y+=6;
     if(inv.cashPaid>0){
       doc.setTextColor(46,125,50);
-      doc.text('Kontant ontvang',55,y); doc.text('-R'+inv.cashPaid.toFixed(2),195,y,{align:'right'});
+      doc.text('Kontant ontvang',38,y); doc.text('-R'+inv.cashPaid.toFixed(2),195,y,{align:'right'});
       doc.setTextColor(20,20,20);
       y+=6;
     }
@@ -6093,7 +6175,7 @@ function drawStatementIntoDoc(doc,c,monthInvs,bal,monthPays){
     const isCredit=(p.credit||0)>0;
     doc.setTextColor(isCredit?46:198, isCredit?125:40, isCredit?50:40);
     doc.text(p.date,15,y);
-    doc.text(doc.splitTextToSize(p.desc||'Betaling ontvang',120),55,y);
+    doc.text(doc.splitTextToSize(p.desc||'Betaling ontvang',95),38,y);
     doc.text((isCredit?'-R':'R')+(isCredit?(p.credit||0):(p.debit||0)).toFixed(2),195,y,{align:'right'});
     doc.setTextColor(20,20,20);
     y+=6;
