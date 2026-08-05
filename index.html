@@ -1052,7 +1052,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-43'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-44'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1144,17 +1144,6 @@ function startPolling(){
         PARENT_DATA_SIG=newSig;
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
         await Promise.all(Object.keys(DRIVERS).map(fetchDriverProgress));
-        // A driver tapping "Dag Klaar" only ever touches their own
-        // progress doc — never invoices/ledger/quotes — so the
-        // dataChanged check above could never detect it, and this list
-        // would then silently never refresh again until Bestuur happened
-        // to navigate away from Oorsig and back (or a genuinely unrelated
-        // invoice/ledger change happened to also trigger a re-render).
-        // That's exactly why one driver's end-of-day would show up while
-        // everyone else's — who finished later, with nothing else
-        // triggering a refresh in between — wouldn't. Refreshed on its
-        // own here, independent of that gate.
-        if(S.parentTab==='overview') await populateDayReports(true);
         const NO_AUTOREFRESH_TABS=['payroll','map','history'];
         if(dataChanged && S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
           // Preserve scroll position across this background refresh — a
@@ -4637,8 +4626,6 @@ async function renderOverview(ct){
       <div class="ovc"><div class="v">${Object.keys(getLedger()).length}</div><div class="l">Kliënte totaal</div></div>
     </div>
     <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showTransferModal()">🔀 Transfer</button>
-    <div class="divlbl">📋 DAGVERSLAE <span style="font-weight:400;color:var(--t3)">· bestuurders wat hul dag klaargemaak het</span></div>
-    <div id="day-reports-list"><p style="color:var(--t2);font-size:.82rem;padding:6px 0">Laai...</p></div>
     <div class="divlbl">BESTUURDER STATUS <span style="font-weight:400;color:var(--t3)">· tik op 'n bestuurder om sy lys te wysig</span></div>
     ${Object.entries(DRIVERS).map(([id,d])=>{
       const dayCount=((SCHEDULE||ALL_ROUTES)[id]?.[week]?.[dayEn]||[]).length;
@@ -4666,119 +4653,6 @@ async function renderOverview(ct){
     <button class="btn btn-blue" onclick="showOnceOff()">
       ＋ Voeg eenmalige werk by / Add Once-Off
     </button>`;
-  await populateDayReports();
-}
-
-let DAY_REPORTS_BUSY=false;
-let DAY_REPORTS_LAST_FETCH=0;
-let DAY_REPORTS_LAST_HTML=null;
-let DAY_REPORTS_KNOWN={}; // driverId -> {driverId, dateKey, prog} — latest known day-ended entry per driver, carried across both full and quick scans so a quick scan can never make a real entry disappear
-// Scans the last 3 days across every driver for a "day ended" flag, so
-// Bestuur sees exactly what would otherwise only "pop up in the morning" —
-// each one opens the same PDF report the driver generated, regenerated
-// on-demand from the stored data (nothing extra to store separately).
-//
-// quickCheck=true only looks at TODAY (5 reads) instead of the full 3-day
-// window (15 reads) — used by the periodic poll refresh, since a driver
-// who ended their day yesterday was already caught by the full scan when
-// this tab was first opened; the only thing that can newly change on a
-// later tick is someone finishing TODAY. The full 3-day scan still runs
-// once whenever this tab is actually opened/navigated to, so nothing from
-// the last few days is ever missed — this just avoids re-doing that full
-// scan on every single poll tick indefinitely while sitting on the tab.
-async function populateDayReports(quickCheck){
-  const box=document.getElementById('day-reports-list');
-  if(!box) return;
-  const now=Date.now();
-  // Reuse the last result for a short while instead of re-fetching (and
-  // re-flashing "Laai...") on every single poll tick — day-end
-  // reports only change when a driver finishes their whole day, a rare,
-  // discrete event, not something that needs live-second refreshing.
-  if(DAY_REPORTS_LAST_HTML!==null && now-DAY_REPORTS_LAST_FETCH<20000){
-    box.innerHTML=DAY_REPORTS_LAST_HTML;
-    return;
-  }
-  // Without this, a slow connection could still have the PREVIOUS scan's
-  // lookups in flight when the next poll tick starts a second scan —
-  // both would end up appending rows into the same box at once, which is
-  // exactly how the same driver/date was showing up twice.
-  if(DAY_REPORTS_BUSY) return;
-  DAY_REPORTS_BUSY=true;
-  try{
-    const baseKey=sastDateKey();
-    const daysToScan = quickCheck ? [baseKey] : [baseKey, shiftDateKey(baseKey,-1), shiftDateKey(baseKey,-2)];
-    const lookups=[];
-    for(const dk of daysToScan){
-      for(const driverId of Object.keys(DRIVERS)){
-        lookups.push(
-          sGet('progress_'+driverId+'_'+dk, null).then(prog=>{
-            if(!(prog && prog.dayEnded)) return;
-            const existing=DAY_REPORTS_KNOWN[driverId];
-            if(!existing || (prog.dayEndedAt||0)>=(existing.prog.dayEndedAt||0)){
-              DAY_REPORTS_KNOWN[driverId]={driverId, dateKey:dk, prog};
-            }
-          })
-        );
-      }
-    }
-    await Promise.all(lookups); // every lookup in this scan runs at once instead of one after another
-    // Only the latest day-ended report per driver belongs in this list —
-    // DAY_REPORTS_KNOWN already only ever keeps one (the most recent) per
-    // driver, carried over from whichever scan (full or quick) last saw it.
-    const found=Object.values(DAY_REPORTS_KNOWN);
-    found.sort((a,b)=> (b.prog.dayEndedAt||0)-(a.prog.dayEndedAt||0));
-    const deduped=found;
-    if(!box.isConnected) return; // tab may have changed while this was loading
-
-    let html;
-    if(deduped.length===0){
-      html='<p style="color:var(--t2);font-size:.82rem;padding:6px 0">Geen dagverslae die afgelope 3 dae nie.</p>';
-    } else {
-      html=deduped.map(f=>{
-        const d=DRIVERS[f.driverId];
-        const route=f.prog.route||[];
-        const done=route.filter(g=>g.completed).length;
-        const skipped=route.filter(g=>g.skipReason).length;
-        const doneRoute=route.filter(g=>g.completed);
-        const total=doneRoute.reduce((s,g)=>s+(g.cost||0)+(parseFloat(g.extraWorkAmount)||0),0);
-        const cashTotal=doneRoute.filter(g=>g.cash&&g.cashAmount).reduce((s,g)=>s+(parseFloat(g.cashAmount)||0),0);
-        return `<div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
-          <div>
-            <div style="font-weight:700">${d.icon} ${d.name} · ${f.dateKey}</div>
-            <div style="font-size:.78rem;color:var(--t2)">${done}/${route.length} tuine klaar${skipped>0?' · '+skipped+' geskip':''} · R${total.toFixed(0)}${cashTotal>0?` · <span style="color:var(--red);font-weight:700">R${cashTotal.toFixed(0)}</span>`:''}</div>
-          </div>
-          <div style="display:flex;gap:6px;flex-shrink:0">
-            <button onclick="viewDayReportFor('${f.driverId}','${f.dateKey}')" style="background:var(--bg);border:2px solid var(--brd);
-                    border-radius:100px;padding:7px 10px;font-size:.78rem;font-weight:700;color:var(--t2)">👁</button>
-            <button onclick="shareDayReportFor('${f.driverId}','${f.dateKey}')" style="background:var(--bg);border:2px solid var(--brd);
-                    border-radius:100px;padding:7px 10px;font-size:.78rem;font-weight:700;color:var(--g8)">⬇️</button>
-          </div>
-        </div>`;
-      }).join('');
-    }
-    box.innerHTML=html;
-    DAY_REPORTS_LAST_HTML=html;
-    DAY_REPORTS_LAST_FETCH=Date.now();
-  } finally {
-    DAY_REPORTS_BUSY=false;
-  }
-}
-async function getDayReportBlobFor(driverId, dateKey){
-  const prog=await sGet('progress_'+driverId+'_'+dateKey, null);
-  if(!prog) return null;
-  const d=DRIVERS[driverId];
-  return {d, blob:buildDayReportPDF(d.name, dateKey, prog.route||[], prog.vehicle, prog.workers)};
-}
-async function viewDayReportFor(driverId, dateKey){
-  const r=await getDayReportBlobFor(driverId, dateKey);
-  if(!r){ toast('Geen rekord gevind nie'); return; }
-  viewPDFBlob(r.blob);
-}
-async function shareDayReportFor(driverId, dateKey){
-  const r=await getDayReportBlobFor(driverId, dateKey);
-  if(!r){ toast('Geen rekord gevind nie'); return; }
-  downloadPDF(r.blob, `Dagverslag_${r.d.name}_${dateKey}.pdf`);
-  toast('📄 Dagverslag afgelaai');
 }
 
 // Simplified overview for Jan (Kantoor): daily budget per list only —
@@ -5106,10 +4980,38 @@ async function scanForMissingInvoices(){
   const currentInvs = (await collGetAllCritical('invoices')) || getInvoices();
   CACHE.invoices = currentInvs; // this scan just re-synced the real list — keep the rest of the app in step with it
   const missingByDriver={};
+  const failedDrivers=[];
   let totalMissing=0, totalValue=0;
 
-  for(const driverId of Object.keys(DRIVERS)){
-    const prog=await sGet('progress_'+driverId+'_'+dateKey, null);
+  // sGet silently returns null on a failed read (that's the right default
+  // everywhere else — a missing key legitimately means "nothing saved
+  // yet"), but here that's indistinguishable from "this driver genuinely
+  // has nothing missing," which is exactly how a scan could look like it
+  // only found something for one driver: everyone else's read simply
+  // failed and got treated the same as a clean result. Retrying each
+  // driver's read a couple of times, and reporting failures explicitly
+  // instead of silently skipping them, closes that gap.
+  async function fetchProgressWithRetry(driverId, retries=2){
+    for(let attempt=0; attempt<=retries; attempt++){
+      try{
+        const doc = await withTimeout(FS_KV.doc('progress_'+driverId+'_'+dateKey).get(), STORAGE_TIMEOUT_MS, 'scanProgress:'+driverId);
+        if(!doc.exists) return {ok:true, prog:null};
+        const d=doc.data();
+        return {ok:true, prog: d && d.value!==undefined ? JSON.parse(d.value) : null};
+      }catch(e){
+        if(attempt<retries){ await new Promise(r=>setTimeout(r, 400*(attempt+1))); continue; }
+        return {ok:false, prog:null};
+      }
+    }
+  }
+
+  const scanResults = await Promise.all(Object.keys(DRIVERS).map(async driverId=>{
+    const r = await fetchProgressWithRetry(driverId);
+    return {driverId, ...r};
+  }));
+
+  for(const {driverId, ok, prog} of scanResults){
+    if(!ok){ failedDrivers.push(driverId); continue; }
     if(!prog||!prog.route) continue;
     const completed=prog.route.filter(g=>g.completed);
     const missing=completed.filter(g=>{
@@ -5124,12 +5026,17 @@ async function scanForMissingInvoices(){
     }
   }
 
+  const failedWarning = failedDrivers.length
+    ? `<div style="background:var(--redp);border:1px solid var(--red);border-radius:10px;padding:10px 12px;margin:10px 0;font-size:.82rem;color:var(--red)">
+        ⚠️ Kon nie ${failedDrivers.map(id=>DRIVERS[id].name).join(', ')} se rekord laai nie (netwerk probleem) — hulle is NIE nagegaan nie. Probeer die soektog weer.
+      </div>` : '';
+
   if(totalMissing===0){
-    results.innerHTML='<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ Geen ontbrekende fakture gevind vir hierdie datum nie.</p>';
+    results.innerHTML=failedWarning+'<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ Geen ontbrekende fakture gevind vir hierdie datum nie (onder die bestuurders wat suksesvol nagegaan is).</p>';
     return;
   }
 
-  results.innerHTML=`
+  results.innerHTML=failedWarning+`
     <div style="background:#FFF3CD;border:1px solid #FFE082;border-radius:10px;padding:12px;margin:10px 0">
       <div style="font-weight:800;font-size:1.05rem">${totalMissing} faktu(u)r(e) ontbreek — R${totalValue.toFixed(2)}</div>
       ${Object.entries(missingByDriver).map(([id,items])=>
@@ -5152,6 +5059,14 @@ async function recoverInvoices(dateKey, missingByDriver){
   }
   results.innerHTML=`<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${recovered} faktu(u)r(e) herstel${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
   toast(`✓ ${recovered} faktuur/fakture herstel`);
+  // The recovery above genuinely works — createInvoice already updates
+  // CACHE.invoices — but the Fakture list rendered behind this modal was
+  // never told to rebuild, so it kept showing whatever it looked like
+  // before the scan. That's exactly why this could look like nothing had
+  // happened even though the invoices were really created.
+  if(recovered>0 && S.screen==='parent' && S.parentTab==='invoices'){
+    renderInvoices(document.getElementById('p-content'));
+  }
 }
 
 // Finds the opposite problem from the recovery tool above: a garden
