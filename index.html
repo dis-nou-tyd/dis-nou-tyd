@@ -423,6 +423,7 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
     <button class="tab on" data-tab="route">🗺️ Route</button>
     <button class="tab" data-tab="quotes">💬 Kwotasies</button>
     <button class="tab" data-tab="workers">📋 Dagstaat</button>
+    <button class="tab pierre-only" data-tab="vordering" style="display:none">📊 Vordering</button>
     <button class="tab pierre-only" data-tab="spanne" style="display:none">👷 Spanne</button>
     <button class="tab pierre-only" data-tab="inspeksies" style="display:none">🔍 Inspeksies</button>
     <button class="tab pierre-only" data-tab="masjiene" style="display:none">🔧 Masjiene</button>
@@ -1012,7 +1013,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-27'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-30'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -3106,6 +3107,7 @@ function renderDriverTab(tab){
   if(tab==='route')       renderRoute(c);
   if(tab==='quotes')      renderQuotesDriver(c);
   if(tab==='workers')     renderWorkers(c);
+  if(tab==='vordering')   renderVorderingTab(c);
   if(tab==='spanne')      renderSpanneTab(c);
   if(tab==='inspeksies')  renderPlaceholderTab(c,'🔍 Inspeksies','Kom binnekort.');
   if(tab==='masjiene')    renderPlaceholderTab(c,'🔧 Masjiene','Kom binnekort.');
@@ -4056,6 +4058,41 @@ async function renderSpanneTab(ct){
   await renderPierreTeamAdmin(ct);
 }
 
+// Pierre's view of every driver's daily progress — same bars Jan and
+// Bestuur see, but with absolutely no pricing anywhere on this tab,
+// including inside the per-client status view it links to.
+function renderVorderingTab(ct){
+  const rows=Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,d])=>{
+    const prog=CACHE.progress[id+'_'+todayKey()];
+    const hasRealProgress = prog && prog.route && prog.route.length>0;
+    const route=hasRealProgress? prog.route : getTodayRoute(id);
+    const doneToday=hasRealProgress? prog.route.filter(g=>g.completed).length : 0;
+    const skippedToday=hasRealProgress? prog.route.filter(g=>g.skipReason).length : 0;
+    const totalCount=route.length;
+    const started=hasRealProgress;
+    return `<div class="dsc" style="position:relative">
+      <div style="display:flex;gap:10px;align-items:center;flex:1">
+        <div class="dsav" style="background:${d.color}">${d.icon}</div>
+        <div class="dsi">
+          <h3>${d.name}</h3>
+          <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+          <div class="dsprog">
+            <div class="dspf" style="background:${d.color};width:${totalCount>0?Math.round(100*doneToday/totalCount):0}%"></div>
+            <div class="dspf" style="background:var(--ora);width:${totalCount>0?Math.round(100*skippedToday/totalCount):0}%"></div>
+          </div>
+        </div>
+      </div>
+      <button class="btn-sec btn" style="position:absolute;top:8px;right:8px;padding:4px 8px;font-size:.7rem" onclick="showDriverDayStatus('${id}', true)">👁️ Status</button>
+    </div>`;
+  }).join('');
+  ct.innerHTML=`
+    <div class="ovhdr">
+      <h2>📊 Vordering vandag</h2>
+      <p>${formatToday()}</p>
+    </div>
+    ${rows}`;
+}
+
 // Equipment/machine fuel — Pierre's responsibility alone, and moved off
 // his Dagstaat too, same reasoning as Spanne: his Dagstaat should be a
 // plain match for every other driver's, not carry extra admin fields.
@@ -4091,16 +4128,16 @@ async function renderPierreTeamAdmin(ct){
         ${(activeList.length===0&&driverCasuals.length===0)?'<p style="color:var(--t2);font-size:.8rem;margin:4px 0">Geen werkers nie.</p>':''}
         ${activeList.map(n=>{
           const isTemp=b.addedTemp.includes(n);
-          return `<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
-            <span style="flex:1">${n}${isTemp?' <span style="color:var(--ora);font-size:.68rem">(net vandag)</span>':''}</span>
-            <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem" onclick="pierreStartMove('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
-            <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveWorker('${n.replace(/'/g,"\\'")}','${id}',${isTemp})">✕</button>
+          return `<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:4px 0">
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${n}${isTemp?' <span style="color:var(--ora);font-size:.68rem">(net vandag)</span>':''}</span>
+            <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:4px 10px;font-size:.7rem;border-radius:8px" onclick="pierreStartMove('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
+            <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:4px 9px;font-size:.7rem;border-radius:8px;color:var(--red)" onclick="pierreRemoveWorker('${n.replace(/'/g,"\\'")}','${id}',${isTemp})">✕</button>
           </div>`;
         }).join('')}
-        ${driverCasuals.map(n=>`<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
-          <span style="flex:1">${n}</span>
-          <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem" onclick="pierreStartMoveCasual('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
-          <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveDriverCasual('${n.replace(/'/g,"\\'")}','${id}')">✕</button>
+        ${driverCasuals.map(n=>`<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:4px 0">
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${n}</span>
+          <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:4px 10px;font-size:.7rem;border-radius:8px" onclick="pierreStartMoveCasual('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
+          <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:4px 9px;font-size:.7rem;border-radius:8px;color:var(--red)" onclick="pierreRemoveDriverCasual('${n.replace(/'/g,"\\'")}','${id}')">✕</button>
         </div>`).join('')}
       </div>`;
     }).join('')}
@@ -4414,7 +4451,7 @@ async function renderOverview(ct){
       <div class="ovc"><div class="v">R${todayCash.toFixed(0)}</div><div class="l">Kontant vandag</div></div>
       <div class="ovc"><div class="v">${Object.keys(getLedger()).length}</div><div class="l">Kliënte totaal</div></div>
     </div>
-    <button class="btn-sec btn" style="width:100%;margin:8px 0;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Skuif hele dag na ander bestuurder</button>
+    <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Transfer list</button>
     <div class="divlbl">📋 DAGVERSLAE <span style="font-weight:400;color:var(--t3)">· bestuurders wat hul dag klaargemaak het</span></div>
     <div id="day-reports-list"><p style="color:var(--t2);font-size:.82rem;padding:6px 0">Laai...</p></div>
     <div class="divlbl">BESTUURDER STATUS <span style="font-weight:400;color:var(--t3)">· tik op 'n bestuurder om sy lys te wysig</span></div>
@@ -4427,16 +4464,19 @@ async function renderOverview(ct){
       const totalToday=hasRealProgress? prog.route.length : dayCount;
       const pct=totalToday>0? Math.round(100*(doneToday+skippedToday)/totalToday):0;
       const started=hasRealProgress;
-      return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
-        <div class="dsav" style="background:${d.color}">${d.icon}</div>
-        <div class="dsi">
-          <h3>${d.name}</h3>
-          <p>${started? doneToday+' / '+totalToday+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
-          <div class="dsprog">
-            <div class="dspf" style="background:${d.color};width:${totalToday>0?Math.round(100*doneToday/totalToday):0}%"></div>
-            <div class="dspf" style="background:var(--ora);width:${totalToday>0?Math.round(100*skippedToday/totalToday):0}%"></div>
+      return `<div class="dsc" style="position:relative">
+        <div onclick="openScheduleEditor('${id}')" style="cursor:pointer;display:flex;gap:10px;align-items:center;flex:1">
+          <div class="dsav" style="background:${d.color}">${d.icon}</div>
+          <div class="dsi">
+            <h3>${d.name}</h3>
+            <p>${started? doneToday+' / '+totalToday+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+            <div class="dsprog">
+              <div class="dspf" style="background:${d.color};width:${totalToday>0?Math.round(100*doneToday/totalToday):0}%"></div>
+              <div class="dspf" style="background:var(--ora);width:${totalToday>0?Math.round(100*skippedToday/totalToday):0}%"></div>
+            </div>
           </div>
         </div>
+        <button class="btn-sec btn" style="position:absolute;top:8px;right:8px;padding:4px 8px;font-size:.7rem" onclick="event.stopPropagation();showDriverDayStatus('${id}', false)">👁️ Status</button>
       </div>`;
     }).join('')}
     <button class="btn btn-blue" onclick="showOnceOff()">
@@ -4565,17 +4605,20 @@ function renderOfficeOverview(ct,now,dayEn,week){
     const pct=totalCount>0? Math.round(100*(doneToday+skippedToday)/totalCount):0;
     const started=hasRealProgress;
     grandTotal+=total;
-    return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
-      <div class="dsav" style="background:${d.color}">${d.icon}</div>
-      <div class="dsi">
-        <h3>${d.name}</h3>
-        <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
-        <div class="dsprog">
-          <div class="dspf" style="background:${d.color};width:${totalCount>0?Math.round(100*doneToday/totalCount):0}%"></div>
-          <div class="dspf" style="background:var(--ora);width:${totalCount>0?Math.round(100*skippedToday/totalCount):0}%"></div>
+    return `<div class="dsc" style="position:relative">
+      <div onclick="openScheduleEditor('${id}')" style="cursor:pointer;display:flex;gap:10px;align-items:center;flex:1">
+        <div class="dsav" style="background:${d.color}">${d.icon}</div>
+        <div class="dsi">
+          <h3>${d.name}</h3>
+          <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
+          <div class="dsprog">
+            <div class="dspf" style="background:${d.color};width:${totalCount>0?Math.round(100*doneToday/totalCount):0}%"></div>
+            <div class="dspf" style="background:var(--ora);width:${totalCount>0?Math.round(100*skippedToday/totalCount):0}%"></div>
+          </div>
+          <p style="font-weight:800;font-size:1.05rem;color:${d.color};margin-top:4px">R${total.toFixed(0)}</p>
         </div>
-        <p style="font-weight:800;font-size:1.05rem;color:${d.color};margin-top:4px">R${total.toFixed(0)}</p>
       </div>
+      <button class="btn-sec btn" style="position:absolute;top:8px;right:8px;padding:4px 8px;font-size:.7rem" onclick="event.stopPropagation();showDriverDayStatus('${id}', true)">👁️ Status</button>
     </div>`;
   }).join('');
 
@@ -4587,7 +4630,7 @@ function renderOfficeOverview(ct,now,dayEn,week){
     <div class="ovgrid">
       <div class="ovc" style="grid-column:1 / -1"><div class="v">R${grandTotal.toFixed(0)}</div><div class="l">Totale begroting vandag / Total budget today</div></div>
     </div>
-    <button class="btn-sec btn" style="width:100%;margin:8px 0;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Skuif hele dag na ander bestuurder</button>
+    <button class="btn-sec btn" style="width:auto;padding:6px 12px;margin:6px 0;font-size:.76rem;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Transfer list</button>
     <div class="divlbl">LYSTE VANDAG / TODAY'S LISTS <span style="font-weight:400;color:var(--t3)">· tik op 'n lys om te wysig</span></div>
     ${rows}`;
 }
@@ -4704,7 +4747,51 @@ async function showFutureBudgetModal(){
     </div>`;
 }
 
-// Recovers invoices lost to the race-condition bug (fixed in v68) by
+// Shows exactly which clients are done/skipped/still-to-go for a driver's
+// TODAY — separate from the schedule editor, which is for editing the
+// recurring template (add/remove/reorder/skip future occurrences), not
+// for seeing today's actual live progress. Price is hidden for Jan and
+// Pierre, shown for Bestuur — same rule as everywhere else in the app.
+async function showDriverDayStatus(driverId, hidePrice){
+  document.getElementById('driver-status-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='driver-status-modal';
+  bg.innerHTML=`<div class="modal"><div id="driver-status-body"><div class="loadmsg">Laai... / Loading...</div></div></div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+
+  const d=DRIVERS[driverId];
+  let prog=CACHE.progress[driverId+'_'+todayKey()];
+  if(!prog) prog=await fetchDriverProgress(driverId).catch(()=>null);
+  const route=(prog&&prog.route&&prog.route.length)? prog.route : getTodayRoute(driverId);
+  const done=route.filter(g=>g.completed);
+  const skipped=route.filter(g=>g.skipReason);
+  const todo=route.filter(g=>!g.completed&&!g.skipReason);
+
+  const body=document.getElementById('driver-status-body');
+  if(!body) return;
+  const row=(g,icon,color)=>`<div style="display:flex;gap:8px;align-items:start;padding:6px 0;border-bottom:1px solid var(--brd)">
+    <span style="color:${color};flex-shrink:0">${icon}</span>
+    <div style="flex:1;min-width:0">
+      <div style="font-weight:700;font-size:.86rem">${g.address}${g.name?' · '+g.name:''}</div>
+      ${g.skipReason?`<div style="font-size:.76rem;color:var(--ora)">⚠️ ${g.skipReason}</div>`:''}
+      ${g.completed&&(g.timeIn||g.timeOut)?`<div style="font-size:.72rem;color:var(--t3)">${g.timeIn||'–'}→${g.timeOut||'–'}</div>`:''}
+    </div>
+    ${!hidePrice?`<div style="font-weight:700;font-size:.82rem;flex-shrink:0">R${g.cost||0}</div>`:''}
+  </div>`;
+  body.innerHTML=`
+    <div class="mhdr">${d.icon} ${d.name} — vandag se status
+      <button class="mclose" onclick="document.getElementById('driver-status-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">${done.length} klaar · ${skipped.length} geskip · ${todo.length} nog te doen</p>
+    <div style="max-height:65vh;overflow-y:auto">
+      ${done.length?`<div class="divlbl" style="margin-top:0">✓ KLAAR (${done.length})</div>${done.map(g=>row(g,'✓','var(--g8)')).join('')}`:''}
+      ${skipped.length?`<div class="divlbl">⚠️ GESKIP (${skipped.length})</div>${skipped.map(g=>row(g,'⚠️','var(--ora)')).join('')}`:''}
+      ${todo.length?`<div class="divlbl">⏳ NOG TE DOEN (${todo.length})</div>${todo.map(g=>row(g,'⏳','var(--t3)')).join('')}`:''}
+      ${route.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen tuine vandag nie.</p>':''}
+    </div>`;
+}
+
+
 // reading back from each driver's own daily progress record — which is
 // stored separately per driver, so it was never at risk from the shared-
 // list overwrite that wiped the invoices themselves. Matches by content
