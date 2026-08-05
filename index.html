@@ -598,6 +598,11 @@ async function sList(prefix){
     return {keys: snap.docs.map(d=>d.id)};
   }catch{ return {keys: []}; }
 }
+async function sDelete(key){
+  try{ await withTimeout(FS_KV.doc(key).delete(), STORAGE_TIMEOUT_MS, 'sDelete:'+key); STORAGE_OK=true; }
+  catch(e){ STORAGE_OK=false; console.error('Storage delete mislukt / delete failed:',e); }
+  finally { updateSyncBadge(); }
+}
 // One-time explicit round-trip test at boot so the badge is accurate even
 // before any real save happens (a person just staring at the screen).
 async function checkStorageHealth(){
@@ -682,11 +687,14 @@ function getRoster(driverId){
 }
 async function ensureWorkerRosterSeeded(){
   const existing=await sGet('worker_roster', null);
-  if(existing){ CACHE.workerRoster=existing; return; }
-  const seeded={};
-  Object.entries(DRIVERS).forEach(([id,d])=>{ if(id!=='pierre') seeded[id]=(d.workers||[]).slice(); });
-  CACHE.workerRoster=seeded;
-  await sSet('worker_roster', seeded);
+  const merged = existing ? {...existing} : {};
+  let changed = !existing;
+  Object.entries(DRIVERS).forEach(([id,d])=>{
+    if(id==='pierre') return;
+    if(merged[id]===undefined){ merged[id]=(d.workers||[]).slice(); changed=true; }
+  });
+  CACHE.workerRoster=merged;
+  if(changed) await sSet('worker_roster', merged);
 }
 async function saveRoster(){ await sSet('worker_roster', CACHE.workerRoster); }
 
@@ -3521,10 +3529,12 @@ async function renderWorkers(ct){
 }
 
 async function renderPierreTeamAdmin(ct){
+  await ensureWorkerRosterSeeded();
   const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
   const mc=el('div','vcard');
   mc.innerHTML=`<div class="vtitle">👷 Alle Spanne — Bestuur</div>
     <p style="font-size:.78rem;color:var(--t2);margin:0 0 10px">Skuif werkers tussen bakkies of voeg los werkers by. Kies "Permanent" om dit blywend te maak, of "Net vandag" vir 'n tydelike skuif.</p>
+    <button class="btn-sec btn" style="width:100%;margin-bottom:10px;color:var(--red)" onclick="resetWorkerRosterToDefaults()">🔄 Herstel alle spanne na oorspronklike lyste</button>
     ${Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,dd])=>{
       const roster=getRoster(id);
       const b=moves[id]||{addedPermanent:[],addedTemp:[],removed:[]};
@@ -3569,12 +3579,27 @@ function pierreStartMove(name, fromDriverId){
   document.getElementById('pierre-worker-name').scrollIntoView({behavior:'smooth',block:'center'});
 }
 
+// Safety net for the bug where an unhydrated CACHE.workerRoster could get
+// partially overwritten, wiping out real workers. Resets every driver's
+// roster back to the original built-in lists — use this if a team's list
+// looks wrong/incomplete after using the tools above.
+async function resetWorkerRosterToDefaults(){
+  if(!confirm('Dit stel ALLE bestuurders se permanente spanlyste terug na die oorspronklike lyste. Enige onlangse skuiwe/toevoegings sal verlore gaan. Voortgaan?')) return;
+  const seeded={};
+  Object.entries(DRIVERS).forEach(([id,d])=>{ if(id!=='pierre') seeded[id]=(d.workers||[]).slice(); });
+  CACHE.workerRoster=seeded;
+  await sSet('worker_roster', seeded);
+  toast('✓ Alle spanne herstel na oorspronklike lyste');
+  renderDriverTab('workers');
+}
+
 async function pierreAddWorker(){
   const name=document.getElementById('pierre-worker-name').value.trim();
   const target=document.getElementById('pierre-worker-driver').value;
   const type=document.getElementById('pierre-worker-type').value;
   const source=document.getElementById('pierre-worker-source').value;
   if(!name){ toast('Voer n naam in'); return; }
+  await ensureWorkerRosterSeeded();
 
   const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
   const tb=_moveBucket(moves,target);
@@ -3605,6 +3630,7 @@ async function pierreAddWorker(){
 }
 
 async function pierreRemoveWorker(name, driverId, isTemp){
+  await ensureWorkerRosterSeeded();
   const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
   const b=_moveBucket(moves,driverId);
   if(isTemp){
@@ -3624,6 +3650,7 @@ async function driverAddPermanentWorker(){
   const name=inp.value.trim();
   if(!name){ inp.focus(); return; }
   const id=S.driver;
+  await ensureWorkerRosterSeeded();
   if(!CACHE.workerRoster[id]) CACHE.workerRoster[id]=[];
   if(!CACHE.workerRoster[id].includes(name)) CACHE.workerRoster[id].push(name);
   await saveRoster();
@@ -3635,6 +3662,7 @@ async function driverAddPermanentWorker(){
 async function driverRemovePermanentWorker(name){
   const id=S.driver;
   if(!confirm('Verwyder "'+name+'" permanent van jou span?')) return;
+  await ensureWorkerRosterSeeded();
   if(CACHE.workerRoster[id]) CACHE.workerRoster[id]=CACHE.workerRoster[id].filter(n=>n!==name);
   await saveRoster();
   delete S.workers[name];
@@ -3783,11 +3811,12 @@ async function renderOverview(ct){
     ${Object.entries(DRIVERS).map(([id,d])=>{
       const dayCount=((SCHEDULE||ALL_ROUTES)[id]?.[week]?.[dayEn]||[]).length;
       const prog=CACHE.progress[id+'_'+todayKey()];
-      const doneToday=prog&&prog.route? prog.route.filter(g=>g.completed).length : 0;
-      const skippedToday=prog&&prog.route? prog.route.filter(g=>g.skipReason).length : 0;
-      const totalToday=prog&&prog.route? prog.route.length : dayCount;
+      const hasRealProgress = prog && prog.route && prog.route.length>0;
+      const doneToday=hasRealProgress? prog.route.filter(g=>g.completed).length : 0;
+      const skippedToday=hasRealProgress? prog.route.filter(g=>g.skipReason).length : 0;
+      const totalToday=hasRealProgress? prog.route.length : dayCount;
       const pct=totalToday>0? Math.round(100*(doneToday+skippedToday)/totalToday):0;
-      const started=!!prog;
+      const started=hasRealProgress;
       return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
         <div class="dsav" style="background:${d.color}">${d.icon}</div>
         <div class="dsi">
@@ -3863,13 +3892,14 @@ function renderOfficeOverview(ct,now,dayEn,week){
   let grandTotal=0;
   const rows=Object.entries(DRIVERS).map(([id,d])=>{
     const prog=CACHE.progress[id+'_'+todayKey()];
-    const route=(prog&&prog.route&&prog.route.length)? prog.route : getTodayRoute(id);
+    const hasRealProgress = prog && prog.route && prog.route.length>0;
+    const route=hasRealProgress? prog.route : getTodayRoute(id);
     const total=route.reduce((s,g)=>s+(Number(g.cost)||0)+(Number(g.extraWorkAmount)||0),0);
-    const doneToday=prog&&prog.route? prog.route.filter(g=>g.completed).length : 0;
-    const skippedToday=prog&&prog.route? prog.route.filter(g=>g.skipReason).length : 0;
+    const doneToday=hasRealProgress? prog.route.filter(g=>g.completed).length : 0;
+    const skippedToday=hasRealProgress? prog.route.filter(g=>g.skipReason).length : 0;
     const totalCount=route.length;
     const pct=totalCount>0? Math.round(100*(doneToday+skippedToday)/totalCount):0;
-    const started=!!prog;
+    const started=hasRealProgress;
     grandTotal+=total;
     return `<div class="dsc" onclick="openScheduleEditor('${id}')" style="cursor:pointer">
       <div class="dsav" style="background:${d.color}">${d.icon}</div>
@@ -4783,7 +4813,8 @@ async function submitMoveDay(){
   }
 
   await sSet('progress_'+driverId+'_'+target, src);
-  await sSet('progress_'+driverId+'_'+fromKey, {route:[], vehicle:{kmStart:'',kmEnd:'',diesel:''}, workers:{}, ts:Date.now()});
+  await sDelete('progress_'+driverId+'_'+fromKey);
+  if(CACHE.progress[driverId+'_'+fromKey]) delete CACHE.progress[driverId+'_'+fromKey];
 
   document.getElementById('move-day-modal')?.remove();
   toast('✓ Geskuif na '+target);
