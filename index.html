@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-21'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-23'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -5802,26 +5802,39 @@ async function submitLedgerCorrection(key){
   const reason=document.getElementById('corr-reason').value.trim();
   if(isNaN(amt) || amt===0){ alert('Voer n geldige bedrag in'); return; }
   if(!reason){ alert('Voer n rede in — dit is verpligtend'); return; }
-  if(!getLedger()[key]) return;
+  if(!getLedger()[key]){
+    alert('Kon nie hierdie kliënt kry nie — dalk het die bladsy se data verouder geraak. Maak asseblief die kliënt-lys toe, herlaai die bladsy, en probeer weer.');
+    return;
+  }
   const now=sastNow();
   const dateKey=sastDateKey();
   const dateStr=now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
-    const ref=FS_DB.collection('ledger').doc(key);
-    const doc=await transaction.get(ref);
-    if(!doc.exists) return null;
-    const c=doc.data();
-    c.entries=(c.entries||[]).slice();
-    c.entries.push({
-      date:dateKey, dateStr, type:'adjustment',
-      desc:'Regstelling: '+reason,
-      debit: amt>0?amt:0, credit: amt<0?-amt:0,
-    });
-    c.balance=(c.balance||0)+amt;
-    transaction.set(ref, c);
-    return c;
-  }), 8000, 'ledgerCorrection-transaction');
-  if(!client) return;
+  let client;
+  try{
+    client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+      const ref=FS_DB.collection('ledger').doc(key);
+      const doc=await transaction.get(ref);
+      if(!doc.exists) return null;
+      const c=doc.data();
+      c.entries=(c.entries||[]).slice();
+      c.entries.push({
+        date:dateKey, dateStr, type:'adjustment',
+        desc:'Regstelling: '+reason,
+        debit: amt>0?amt:0, credit: amt<0?-amt:0,
+      });
+      c.balance=(c.balance||0)+amt;
+      transaction.set(ref, c);
+      return c;
+    }), 8000, 'ledgerCorrection-transaction');
+  }catch(e){
+    console.error('Regstelling het misluk:', e);
+    alert('Die regstelling kon nie gestoor word nie — moontlik \'n stadige of onderbroke internetverbinding. Probeer asseblief weer.');
+    return;
+  }
+  if(!client){
+    alert('Kon nie hierdie kliënt se rekening kry nie — dalk het die bladsy se data verouder geraak. Maak asseblief die kliënt-lys toe, herlaai die bladsy, en probeer weer.');
+    return;
+  }
   CACHE.ledger={...CACHE.ledger, [key]:client};
   document.getElementById('correction-modal')?.remove();
   toast('✓ Regstelling gestoor');
@@ -6708,29 +6721,66 @@ function buildQuotePDF(q){
   if(q.phone){ doc.text('Tel: '+q.phone,15,y); y+=6; }
   y+=4;
 
+  // Standard greeting/intro — the same on every quote from here on, so
+  // every client gets the same clear explanation of what's being quoted
+  // and what to do next, regardless of who typed the quote up.
+  doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(20,20,20);
+  const introLines=doc.splitTextToSize(`Hi, hier is u kwotasie vir tuindienste by ${q.address}.`,180);
+  doc.text(introLines,15,y); y+=introLines.length*5.5+3;
+  doc.text('•  Eerste diens',18,y); y+=6;
+  doc.text('•  Daarna gereelde diens',18,y); y+=8;
+  doc.text('Laat weet asseblief of u die kwotasie aanvaar. Dankie!',15,y); y+=12;
+
   if(q.tasks){
+    if(y>260){ doc.addPage(); y=20; }
     doc.setFont('helvetica','bold'); doc.text('Werk voorgestel',15,y); y+=6;
     doc.setFont('helvetica','normal');
     doc.text(doc.splitTextToSize(q.tasks,180),15,y); y+=10;
   }
   if(q.frequency){
+    if(y>260){ doc.addPage(); y=20; }
     doc.setFont('helvetica','bold'); doc.text('Frekwensie',15,y); y+=6;
     doc.setFont('helvetica','normal');
     doc.text(q.frequency,15,y); y+=10;
   }
   if(q.durationHrs||q.durationMin){
+    if(y>260){ doc.addPage(); y=20; }
     doc.setFont('helvetica','bold'); doc.text('Beraamde tyd',15,y); y+=6;
     doc.setFont('helvetica','normal');
     doc.text(`${q.durationHrs?q.durationHrs+' uur ':''}${q.durationMin?q.durationMin+' minute':''}`.trim(),15,y); y+=10;
   }
 
+  if(y>250){ doc.addPage(); y=20; }
   doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=10;
-  doc.setFont('helvetica','bold'); doc.setFontSize(12);
+  doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(20,20,20);
   doc.text('Kwotasie bedrag',15,y); doc.text('R'+(q.quotedAmount||0).toFixed(2),195,y,{align:'right'});
   y+=14;
 
+  // Terms & conditions — standard on every quote, same reasoning as the
+  // intro above: consistent wording, every time, regardless of who wrote
+  // the quote. Wrapped and paginated the same way the statement builder
+  // handles long content, since this is enough text to occasionally spill
+  // onto a second page for a quote that already has a lot of detail above it.
+  if(y>240){ doc.addPage(); y=20; }
+  doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=8;
+  doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(80,80,80);
+  doc.text('Bepalings en voorwaardes / Terms & conditions',15,y); y+=6;
+  doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(100,100,100);
+  const terms=[
+    'Hierdie kwotasie is geldig vir 7 dae.',
+    'Kliënt moet verseker dat die werkarea veilig en vry van gevare is voordat die tuindiens begin. Dit sluit in om die diensverskaffer in te lig oor enige risiko\'s soos los mure, onstabiele strukture of ander gevare, wat bye en byeneste op perseel insluit.',
+    'Ons gebruik nette om te keer dat ruite breek terwyl ons ons pligte uitvoer, en sal daarom nie aanspreeklik gehou word vir enige ongelukke wat mag gebeur nie.',
+  ];
+  terms.forEach(t=>{
+    if(y>272){ doc.addPage(); y=20; }
+    const lines=doc.splitTextToSize('•  '+t,175);
+    doc.text(lines,17,y); y+=lines.length*4.4+3;
+  });
+
+  y+=5;
+  if(y>270){ doc.addPage(); y=20; }
   doc.setFont('helvetica','italic'); doc.setFontSize(9); doc.setTextColor(120,120,120);
-  doc.text('Hierdie kwotasie is geldig vir 30 dae. Dankie dat u Dis Nou Tyd oorweeg!',15,y);
+  doc.text('Dankie dat u Dis Nou Tyd oorweeg!',15,y);
   return doc.output('blob');
 }
 async function shareQuotePDF(id){
