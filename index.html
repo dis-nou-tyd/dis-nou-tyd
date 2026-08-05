@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-24'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-27'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1141,12 +1141,17 @@ function startPolling(){
           // the schedule editor used to only affect tomorrow onward; a job
           // skipped/edited for today now actually updates the live list.
           try{
-            const [skips, overrides, moves] = await Promise.all([getSkipList(S.driver, dk), getDateOverrides(S.driver, dk), getWorkerMovesForDate(dk)]);
+            const [skips, overrides, moves, extra] = await Promise.all([getSkipList(S.driver, dk), getDateOverrides(S.driver, dk), getWorkerMovesForDate(dk), getExtraForDate(S.driver, dk).catch(()=>[])]);
             let changed=false;
             if(skips.length){
               const before=S.route.length;
               S.route=S.route.filter(g=>g.completed || g.active || !skips.includes(g.schedId));
               if(S.route.length!==before) changed=true;
+            }
+            if(extra.length){
+              const haveIds=new Set(S.route.map(g=>g.schedId));
+              const toAdd=extra.filter(g=>!haveIds.has(g.schedId));
+              if(toAdd.length){ S.route=[...S.route, ...toAdd]; changed=true; }
             }
             if(Object.keys(overrides).length){
               S.route=S.route.map(g=>{
@@ -1205,6 +1210,15 @@ function nextOccurrenceDate(weekKey, dayName){
 let SCHEDULE = null;
 async function ensureSchedule(){
   if(SCHEDULE) return SCHEDULE;
+  const stored = await sGet('schedule', null);
+  SCHEDULE = stored || JSON.parse(JSON.stringify(ALL_ROUTES));
+  return SCHEDULE;
+}
+// Always refetches, bypassing the in-memory cache above — used anywhere a
+// stale SCHEDULE would actually mislead someone (like the tomorrow
+// preview), since a tablet left open across a schedule edit would
+// otherwise never see that edit until a full page reload.
+async function refreshSchedule(){
   const stored = await sGet('schedule', null);
   SCHEDULE = stored || JSON.parse(JSON.stringify(ALL_ROUTES));
   return SCHEDULE;
@@ -1363,6 +1377,15 @@ async function setDateOverride(driverId, dateKey, schedId, fields){
   await sSet('override_'+driverId+'_'+dateKey, overrides);
 }
 
+// Extra clients borrowed onto a driver's list for one specific date only —
+// used by "Skuif hele dag" (move a whole day between drivers). Separate
+// from the recurring schedule and from skip/override, which only ever
+// touch a driver's OWN normal template; this instead injects someone
+// else's clients for a single day, tagged so it's obvious on the list
+// where they came from.
+async function getExtraForDate(driverId, dateKey){ return await sGet('extra_'+driverId+'_'+dateKey, []); }
+async function setExtraForDate(driverId, dateKey, list){ await sSet('extra_'+driverId+'_'+dateKey, list); }
+
 function getTodayRoute(dId){ return getRouteForDate(dId, sastNow()); }
 
 function getRouteForDate(dId, date){
@@ -1508,11 +1531,13 @@ async function switchToYesterdayList(){
     S.workers=saved.workers||{};
   } else {
     S.route=getRouteForDate(id, y);
-    const [skips, overrides] = await Promise.all([
+    const [skips, overrides, extra] = await Promise.all([
       getSkipList(id, yk).catch(()=>[]),
       getDateOverrides(id, yk).catch(()=>({})),
+      getExtraForDate(id, yk).catch(()=>[]),
     ]);
     if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
+    if(extra.length) S.route=[...S.route, ...extra];
     if(Object.keys(overrides).length) S.route=S.route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
     S.vehicle={kmStart:'',kmEnd:'',diesel:''};
     await ensureWorkerRosterSeeded();
@@ -1547,11 +1572,13 @@ async function loginDriver(id){
     S.workers=saved.workers||{};
   } else {
     S.route=getTodayRoute(id);
-    const [skips, overrides] = await Promise.all([
+    const [skips, overrides, extra] = await Promise.all([
       getSkipList(id, todayKey()).catch(e=>{ console.error('Kon nie skip-lys laai nie:', e); return []; }),
       getDateOverrides(id, todayKey()).catch(e=>{ console.error('Kon nie oorskrywings laai nie:', e); return {}; }),
+      getExtraForDate(id, todayKey()).catch(()=>[]),
     ]);
     if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
+    if(extra.length) S.route=[...S.route, ...extra];
     if(Object.keys(overrides).length){
       S.route=S.route.map(g=>overrides[g.schedId]?{...g, ...overrides[g.schedId]}:g);
     }
@@ -3169,12 +3196,15 @@ async function showTomorrowList(){
   const target=new Date(dateKey+'T00:00:00');
   const dateLbl=target.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
 
+  await refreshSchedule();
   let route=getRouteForDate(S.driver, target);
-  const [skips, overrides] = await Promise.all([
+  const [skips, overrides, extra] = await Promise.all([
     getSkipList(S.driver, dateKey).catch(()=>[]),
     getDateOverrides(S.driver, dateKey).catch(()=>({})),
+    getExtraForDate(S.driver, dateKey).catch(()=>[]),
   ]);
   if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
+  if(extra.length) route=[...route, ...extra];
   if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
 
   const body=document.getElementById('tomorrow-body');
@@ -3434,6 +3464,7 @@ function makeGardenCard(g,idx){
   if(g.cash)      badges+=`<span class="badge bca">R${g.cashAmount}</span>`;
   if(g.belangrik) badges+=`<span class="badge bw">⚠️</span>`;
   if(g._fallback) badges+=`<span class="badge bo">Ander dag</span>`;
+  if(g.borrowedFrom) badges+=`<span class="badge bo">🔀 Van ${g.borrowedFrom}</span>`;
   if(g.isOnceOff) badges+=`<span class="badge bo">Eenmalig</span>`;
   if(g.invoiced)  badges+=`<span class="badge bc">🧾 Faktureer</span>`;
 
@@ -3654,14 +3685,10 @@ function showManualInvoiceForm(){
       <input class="inp" id="mi-pastel" placeholder="bv. VOOR012"></div>
     <div><div class="flbl" style="margin-bottom:5px">Datum / Date *</div>
       <input class="inp" id="mi-date" type="date" value="${todayKey()}"></div>
-    <div><div class="flbl" style="margin-bottom:5px">Beskrywing van werk / Work description</div>
-      <input class="inp" id="mi-desc" placeholder="bv. Tuinonderhoud"></div>
-    <div><div class="flbl" style="margin-bottom:5px">Basiese bedrag / Base amount (R) *</div>
-      <input class="inp" id="mi-base" type="number" placeholder="0"></div>
-    <div><div class="flbl" style="margin-bottom:5px">Ekstra werk beskrywing</div>
-      <input class="inp" id="mi-extradesc" placeholder="opsioneel"></div>
-    <div><div class="flbl" style="margin-bottom:5px">Ekstra werk bedrag (R)</div>
-      <input class="inp" id="mi-extraamt" type="number" placeholder="0"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Werk / Services</div>
+      <p style="font-size:.76rem;color:var(--t2);margin:0 0 6px">Voeg 'n reël by vir elke diens wat apart op die faktuur moet verskyn.</p>
+      <div id="mi-lines"></div>
+      <button class="btn-sec btn" style="width:100%;margin-top:4px" onclick="_addManualInvoiceLine()">＋ Voeg reël by / Add line</button></div>
     <div><div class="flbl" style="margin-bottom:5px">Kontant reeds ontvang (R)</div>
       <input class="inp" id="mi-cash" type="number" placeholder="0"></div>
     <div><div class="flbl" style="margin-bottom:5px">Toegeskryf aan bestuurder (opsioneel)</div>
@@ -3675,13 +3702,27 @@ function showManualInvoiceForm(){
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
   document.body.appendChild(bg);
-  ['mi-base','mi-extraamt'].forEach(id=>{
-    document.getElementById(id).addEventListener('input', ()=>{
-      const base=parseFloat(document.getElementById('mi-base').value)||0;
-      const extra=parseFloat(document.getElementById('mi-extraamt').value)||0;
-      document.getElementById('mi-total-preview').textContent='Totaal: R'+(base+extra).toFixed(2);
-    });
-  });
+  _addManualInvoiceLine();
+  _addManualInvoiceLine();
+}
+let MI_LINE_SEQ=0;
+function _addManualInvoiceLine(){
+  const container=document.getElementById('mi-lines');
+  if(!container) return;
+  const lineId='mi-line-'+(MI_LINE_SEQ++);
+  const row=el('div');
+  row.id=lineId;
+  row.style.cssText='display:flex;gap:6px;margin-bottom:6px';
+  row.innerHTML=`
+    <input class="inp mi-line-desc" placeholder="Diens beskrywing" style="flex:2">
+    <input class="inp mi-line-amt" type="number" placeholder="R" style="flex:1" oninput="_updateManualInvoiceTotal()">
+    <button class="btn-sec btn" style="padding:0 12px;flex-shrink:0;color:var(--red)" onclick="document.getElementById('${lineId}').remove();_updateManualInvoiceTotal()">✕</button>`;
+  container.appendChild(row);
+}
+function _updateManualInvoiceTotal(){
+  const total=Array.from(document.querySelectorAll('.mi-line-amt')).reduce((s,inp)=>s+(parseFloat(inp.value)||0),0);
+  const el2=document.getElementById('mi-total-preview');
+  if(el2) el2.textContent='Totaal: R'+total.toFixed(2);
 }
 function _fillManualInvoiceClient(key){
   if(!key) return;
@@ -3694,19 +3735,21 @@ function _fillManualInvoiceClient(key){
 async function submitManualInvoice(){
   const address=document.getElementById('mi-addr').value.trim();
   const dateKey=document.getElementById('mi-date').value;
-  const baseAmount=parseFloat(document.getElementById('mi-base').value)||0;
   if(!address){ alert('Voer n adres in'); return; }
   if(!dateKey){ alert('Kies n datum'); return; }
-  if(baseAmount<=0){ alert('Voer n basiese bedrag in'); return; }
+
+  const lineItems=Array.from(document.querySelectorAll('#mi-lines > div')).map(row=>({
+    desc: row.querySelector('.mi-line-desc').value.trim(),
+    amount: parseFloat(row.querySelector('.mi-line-amt').value)||0,
+  })).filter(l=>l.desc || l.amount>0);
+  if(lineItems.length===0){ alert('Voeg ten minste een diens-reël by'); return; }
+  if(lineItems.every(l=>l.amount<=0)){ alert('Voer ten minste een bedrag in'); return; }
 
   const fields={
     address, dateKey,
     name: document.getElementById('mi-name').value.trim(),
     pastelCode: document.getElementById('mi-pastel').value.trim(),
-    workDesc: document.getElementById('mi-desc').value.trim(),
-    baseAmount,
-    extraDesc: document.getElementById('mi-extradesc').value.trim(),
-    extraAmount: parseFloat(document.getElementById('mi-extraamt').value)||0,
+    lineItems,
     cashPaid: parseFloat(document.getElementById('mi-cash').value)||0,
     driverId: document.getElementById('mi-driver').value || null,
   };
@@ -3717,10 +3760,13 @@ async function submitManualInvoice(){
   if(confirm('Faktuur geskep. Wil jy nou die PDF genereer en stuur?')) await shareInvoicePDF(inv.id);
 }
 // Same safe single-document write as a normal job-triggered invoice, just
-// built from typed-in fields instead of a completed garden.
+// built from typed-in fields instead of a completed garden. Amount is the
+// sum of every line item, each of which prints as its own row on the PDF
+// so a client can see exactly what each service cost.
 async function createManualInvoice(fields){
   const dateStrToUse=new Date(fields.dateKey+'T12:00:00').toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  const amount=(fields.baseAmount||0)+(fields.extraAmount||0);
+  const lineItems=fields.lineItems||[];
+  const amount=lineItems.reduce((s,l)=>s+(l.amount||0),0);
   const inv=await withTimeout(FS_DB.runTransaction(async (transaction)=>{
     const seqDoc=await transaction.get(FS_KV.doc('inv_seq'));
     const n=(seqDoc.exists?JSON.parse(seqDoc.data().value):1000)||1000;
@@ -3731,16 +3777,15 @@ async function createManualInvoice(fields){
       address:fields.address,
       name:fields.name||'',
       amount,
-      extraWork:fields.extraDesc||'',
-      extraWorkAmount:fields.extraAmount||0,
-      baseAmount:fields.baseAmount||0,
+      lineItems,
+      baseAmount:amount, extraWork:'', extraWorkAmount:0, // kept for anything that still reads the old fields (statements, income totals)
       cashPaid:fields.cashPaid||0,
       durationMin:0, timeIn:'', timeOut:'',
       driver: fields.driverId?DRIVERS[fields.driverId].name:'Kantoor',
       driverId: fields.driverId||null,
       isOnceOff:true, isManual:true,
       status:'pending',
-      services: fields.workDesc || 'Tuinonderhoud',
+      services: lineItems.map(l=>l.desc).filter(Boolean).join(', ') || 'Tuinonderhoud',
     };
     transaction.set(FS_KV.doc('inv_seq'), {value: JSON.stringify(n+1)});
     transaction.set(FS_DB.collection('invoices').doc(newInv.id), newInv);
@@ -4053,12 +4098,14 @@ async function renderPierreTeamAdmin(ct){
           </div>`;
         }).join('')}
         ${driverCasuals.map(n=>`<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
-          <span style="flex:1">${n} <span style="color:var(--blue);font-size:.68rem">(los — deur bestuurder self)</span></span>
+          <span style="flex:1">${n}</span>
+          <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem" onclick="pierreStartMoveCasual('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
           <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveDriverCasual('${n.replace(/'/g,"\\'")}','${id}')">✕</button>
         </div>`).join('')}
       </div>`;
     }).join('')}
     <input type="hidden" id="pierre-worker-source" value="">
+    <input type="hidden" id="pierre-worker-source-casual" value="">
     <p id="pierre-move-note" style="font-size:.76rem;color:var(--blue);display:none;margin:0 0 6px"></p>
     <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;border-top:1px solid var(--brd);padding-top:10px">
       <input class="inp" id="pierre-worker-name" placeholder="Naam van werker…">
@@ -4096,6 +4143,20 @@ async function pierreRemoveDriverCasual(name, driverId){
 function pierreStartMove(name, fromDriverId){
   document.getElementById('pierre-worker-name').value=name;
   document.getElementById('pierre-worker-source').value=fromDriverId;
+  document.getElementById('pierre-worker-source-casual').value='';
+  const note=document.getElementById('pierre-move-note');
+  note.style.display='block';
+  note.textContent=`Skuif "${name}" van ${DRIVERS[fromDriverId].name} — kies die nuwe bakkie en of dit permanent of net vandag is, dan tik "Voeg by / Skuif".`;
+  document.getElementById('pierre-worker-name').scrollIntoView({behavior:'smooth',block:'center'});
+}
+// Same as above, but for a worker a driver added themselves for the day
+// (lives in that driver's own progress record, not the shared
+// roster/moves system) — pierreAddWorker checks the extra flag below to
+// remove it from the right place.
+function pierreStartMoveCasual(name, fromDriverId){
+  document.getElementById('pierre-worker-name').value=name;
+  document.getElementById('pierre-worker-source').value=fromDriverId;
+  document.getElementById('pierre-worker-source-casual').value='1';
   const note=document.getElementById('pierre-move-note');
   note.style.display='block';
   note.textContent=`Skuif "${name}" van ${DRIVERS[fromDriverId].name} — kies die nuwe bakkie en of dit permanent of net vandag is, dan tik "Voeg by / Skuif".`;
@@ -4121,6 +4182,7 @@ async function pierreAddWorker(){
   const target=document.getElementById('pierre-worker-driver').value;
   const type=document.getElementById('pierre-worker-type').value;
   const source=document.getElementById('pierre-worker-source').value;
+  const sourceIsCasual=document.getElementById('pierre-worker-source-casual').value==='1';
   if(!name){ toast('Voer n naam in'); return; }
   await ensureWorkerRosterSeeded();
 
@@ -4130,7 +4192,7 @@ async function pierreAddWorker(){
   if(type==='permanent'){
     if(!CACHE.workerRoster[target]) CACHE.workerRoster[target]=[];
     if(!CACHE.workerRoster[target].includes(name)) CACHE.workerRoster[target].push(name);
-    if(source && source!==target && CACHE.workerRoster[source]){
+    if(source && source!==target && !sourceIsCasual && CACHE.workerRoster[source]){
       CACHE.workerRoster[source]=CACHE.workerRoster[source].filter(n=>n!==name);
     }
     await saveRoster();
@@ -4139,14 +4201,27 @@ async function pierreAddWorker(){
     if(!tb.addedTemp.includes(name)) tb.addedTemp.push(name);
   }
   if(source && source!==target){
-    const sb=_moveBucket(moves,source);
-    if(!sb.removed.includes(name)) sb.removed.push(name);
-    sb.addedTemp=sb.addedTemp.filter(n=>n!==name);
+    if(sourceIsCasual){
+      const key='progress_'+source+'_'+todayKey();
+      const prog=await sGet(key, null);
+      if(prog && prog.workers && (name in prog.workers)){
+        const workers={...prog.workers};
+        delete workers[name];
+        const updated={...prog, workers};
+        await sSet(key, updated);
+        CACHE.progress[source+'_'+todayKey()]=updated;
+      }
+    } else {
+      const sb=_moveBucket(moves,source);
+      if(!sb.removed.includes(name)) sb.removed.push(name);
+      sb.addedTemp=sb.addedTemp.filter(n=>n!==name);
+    }
   }
   await saveWorkerMovesForDate(todayKey(), moves);
 
   document.getElementById('pierre-worker-name').value='';
   document.getElementById('pierre-worker-source').value='';
+  document.getElementById('pierre-worker-source-casual').value='';
   document.getElementById('pierre-move-note').style.display='none';
   toast('✓ '+name+' bygewerk');
   renderDriverTab('workers');
@@ -4339,6 +4414,7 @@ async function renderOverview(ct){
       <div class="ovc"><div class="v">R${todayCash.toFixed(0)}</div><div class="l">Kontant vandag</div></div>
       <div class="ovc"><div class="v">${Object.keys(getLedger()).length}</div><div class="l">Kliënte totaal</div></div>
     </div>
+    <button class="btn-sec btn" style="width:100%;margin:8px 0;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Skuif hele dag na ander bestuurder</button>
     <div class="divlbl">📋 DAGVERSLAE <span style="font-weight:400;color:var(--t3)">· bestuurders wat hul dag klaargemaak het</span></div>
     <div id="day-reports-list"><p style="color:var(--t2);font-size:.82rem;padding:6px 0">Laai...</p></div>
     <div class="divlbl">BESTUURDER STATUS <span style="font-weight:400;color:var(--t3)">· tik op 'n bestuurder om sy lys te wysig</span></div>
@@ -4511,11 +4587,123 @@ function renderOfficeOverview(ct,now,dayEn,week){
     <div class="ovgrid">
       <div class="ovc" style="grid-column:1 / -1"><div class="v">R${grandTotal.toFixed(0)}</div><div class="l">Totale begroting vandag / Total budget today</div></div>
     </div>
+    <button class="btn-sec btn" style="width:100%;margin:8px 0;color:var(--blue)" onclick="showMoveDayBetweenDriversModal()">🔀 Skuif hele dag na ander bestuurder</button>
     <div class="divlbl">LYSTE VANDAG / TODAY'S LISTS <span style="font-weight:400;color:var(--t3)">· tik op 'n lys om te wysig</span></div>
     ${rows}`;
 }
 
-// ══════════════════ PARENT: INVOICES ══════════════════════════════════════════
+// Moves one driver's ENTIRE list for one specific date onto another
+// driver — e.g. Pierre covering Jasper's Friday route for a week Jasper's
+// off. One-time only: doesn't touch the recurring schedule, so both
+// drivers' normal weeks are unaffected going forward. Reuses the existing
+// skip mechanism to remove the day from the source driver, and the new
+// "extra clients" mechanism to add it onto the destination driver — both
+// already wired into every place a route gets built (login, tomorrow
+// preview, live sync), so this shows up correctly everywhere immediately.
+function showMoveDayBetweenDriversModal(){
+  document.getElementById('move-wholeday-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='move-wholeday-modal';
+  const driverOptions=Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}">${d.icon} ${d.name}</option>`).join('');
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">🔀 Skuif hele dag na ander bestuurder
+      <button class="mclose" onclick="document.getElementById('move-wholeday-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Skuif een bestuurder se hele lys vir 'n spesifieke datum na 'n ander bestuurder. Dit is eenmalig — raak nie enige toekomstige weke of die gewone skedule nie.
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Van bestuurder / From driver *</div>
+      <select class="inp" id="mwd-from">${driverOptions}</select></div>
+    <div><div class="flbl" style="margin-bottom:5px">Datum / Date *</div>
+      <input class="inp" id="mwd-date" type="date" value="${todayKey()}"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Na bestuurder / To driver *</div>
+      <select class="inp" id="mwd-to">${driverOptions}</select></div>
+    <button class="btn" onclick="submitMoveDayBetweenDrivers()">🔀 Skuif / Move</button>
+    <button class="btn btn-sec" onclick="document.getElementById('move-wholeday-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+async function submitMoveDayBetweenDrivers(){
+  const fromId=document.getElementById('mwd-from').value;
+  const toId=document.getElementById('mwd-to').value;
+  const dateKey=document.getElementById('mwd-date').value;
+  if(!dateKey){ alert('Kies n datum'); return; }
+  if(fromId===toId){ alert('Kies twee verskillende bestuurders'); return; }
+
+  await refreshSchedule();
+  const dateObj=new Date(dateKey+'T12:00:00');
+  let route=getRouteForDate(fromId, dateObj);
+  const [skips, overrides] = await Promise.all([
+    getSkipList(fromId, dateKey).catch(()=>[]),
+    getDateOverrides(fromId, dateKey).catch(()=>({})),
+  ]);
+  if(skips.length) route=route.filter(g=>!skips.includes(g.schedId));
+  if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
+
+  if(route.length===0){ alert('Geen tuine gevind vir '+DRIVERS[fromId].name+' op '+dateKey+' nie.'); return; }
+  if(!confirm(`Skuif ${route.length} tuine van ${DRIVERS[fromId].name} na ${DRIVERS[toId].name} vir ${dateKey}?`)) return;
+
+  // Remove from source (same "skip once" mechanism the schedule editor uses)
+  for(const g of route){
+    await addSkipForDate(fromId, g.schedId, dateKey);
+  }
+  // Add onto destination, tagged so it's clear on their list where these came from
+  const tagged=route.map(g=>({...g, borrowedFrom:DRIVERS[fromId].name}));
+  const existingExtra=await getExtraForDate(toId, dateKey).catch(()=>[]);
+  await setExtraForDate(toId, dateKey, [...existingExtra, ...tagged]);
+
+  document.getElementById('move-wholeday-modal')?.remove();
+  toast(`✓ ${route.length} tuine geskuif na ${DRIVERS[toId].name}`);
+}
+
+// Shows budgeted totals (from the schedule, not actual completed work)
+// for the next 7 days across every driver — Jan already saw today's
+// total on Kantoor Oorsig; this extends that same view forward so
+// upcoming days aren't a blind spot for either Jan or Bestuur.
+async function showFutureBudgetModal(){
+  document.getElementById('future-budget-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='future-budget-modal';
+  bg.innerHTML=`<div class="modal"><div id="future-budget-body"><div class="loadmsg">Laai... / Loading...</div></div></div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+
+  await refreshSchedule();
+  const days=[];
+  for(let i=1;i<=7;i++){
+    const d=sastNow(); d.setDate(d.getDate()+i);
+    const dateKey=dateKeyOf(d);
+    const dateLbl=d.toLocaleDateString('af-ZA',{weekday:'long',day:'numeric',month:'long'});
+    let dayTotal=0;
+    const perDriver=Object.entries(DRIVERS).map(([id,dd])=>{
+      const route=getRouteForDate(id,d);
+      const total=route.reduce((s,g)=>s+(Number(g.cost)||0),0);
+      dayTotal+=total;
+      return {name:dd.name, icon:dd.icon, total, count:route.length};
+    }).filter(r=>r.count>0);
+    days.push({dateKey, dateLbl, dayTotal, perDriver});
+  }
+
+  const body=document.getElementById('future-budget-body');
+  if(!body) return;
+  body.innerHTML=`
+    <div class="mhdr">📅 Begroting vir toekomstige dae
+      <button class="mclose" onclick="document.getElementById('future-budget-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.78rem;color:var(--t2);margin:-4px 0 8px">Gebaseer op die skedule — nie werklike voltooide werk nie, aangesien hierdie dae nog nie gebeur het nie.</p>
+    <div style="max-height:65vh;overflow-y:auto">
+      ${days.map(day=>`
+        <div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+            <div style="font-weight:700">${day.dateLbl}</div>
+            <div style="font-weight:800;color:var(--g8)">R${day.dayTotal.toFixed(0)}</div>
+          </div>
+          ${day.perDriver.map(r=>`<div style="display:flex;justify-content:space-between;font-size:.8rem;color:var(--t2);padding:2px 0">
+            <span>${r.icon} ${r.name} · ${r.count} tuine</span><span>R${r.total.toFixed(0)}</span>
+          </div>`).join('')}
+        </div>`).join('')}
+    </div>`;
+}
+
 // Recovers invoices lost to the race-condition bug (fixed in v68) by
 // reading back from each driver's own daily progress record — which is
 // stored separately per driver, so it was never at risk from the shared-
@@ -5197,13 +5385,26 @@ function buildInvoicePDF(inv){
   doc.setFont('helvetica','normal');
   doc.text(inv.address+(inv.name?' ('+inv.name+')':''),15,y); y+=8;
 
-  doc.setFont('helvetica','bold'); doc.text('Diens',15,y); y+=6;
-  doc.setFont('helvetica','normal');
-  doc.text(doc.splitTextToSize(inv.services||'Tuinonderhoud',180),15,y); y+=8;
-  if(inv.extraWork){
-    doc.setFont('helvetica','bold'); doc.text('Ekstra werk',15,y); y+=6;
+  if(inv.lineItems && inv.lineItems.length>0){
+    doc.setFont('helvetica','bold'); doc.text('Diens',15,y); y+=6;
     doc.setFont('helvetica','normal');
-    doc.text(doc.splitTextToSize(inv.extraWork,180),15,y); y+=8;
+    inv.lineItems.forEach(li=>{
+      if(y>270){ doc.addPage(); y=20; }
+      const lines=doc.splitTextToSize(li.desc||'—',150);
+      doc.text(lines,15,y);
+      doc.text('R'+(li.amount||0).toFixed(2),195,y,{align:'right'});
+      y+=lines.length*5.5+2;
+    });
+    y+=6;
+  } else {
+    doc.setFont('helvetica','bold'); doc.text('Diens',15,y); y+=6;
+    doc.setFont('helvetica','normal');
+    doc.text(doc.splitTextToSize(inv.services||'Tuinonderhoud',180),15,y); y+=8;
+    if(inv.extraWork){
+      doc.setFont('helvetica','bold'); doc.text('Ekstra werk',15,y); y+=6;
+      doc.setFont('helvetica','normal');
+      doc.text(doc.splitTextToSize(inv.extraWork,180),15,y); y+=8;
+    }
   }
   y+=4; doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=10;
 
@@ -5364,7 +5565,7 @@ function previewInv(id){
       <div class="ip-row"><span class="k">Kliënt / Client</span><span class="v">${inv.address}</span></div>
       ${inv.name?`<div class="ip-row"><span class="k">Naam</span><span class="v">${inv.name}</span></div>`:''}
       ${inv.pastelCode?`<div class="ip-row"><span class="k">Kode / Code</span><span class="v">${inv.pastelCode}</span></div>`:''}
-      <div class="ip-row"><span class="k">Diens / Service</span><span class="v">${inv.services||'Tuinonderhoud'}</span></div>
+      ${inv.lineItems&&inv.lineItems.length>0?inv.lineItems.map(li=>`<div class="ip-row"><span class="k">${li.desc||'—'}</span><span class="v">R${(li.amount||0).toFixed(2)}</span></div>`).join(''):`<div class="ip-row"><span class="k">Diens / Service</span><span class="v">${inv.services||'Tuinonderhoud'}</span></div>`}
       <div class="ip-row"><span class="k">Bestuurder / Driver</span><span class="v">${inv.driver}</span></div>
       ${inv.durationMin?`<div class="ip-row"><span class="k">Tyd geneem / Time taken</span><span class="v">${inv.durationMin} min (${inv.timeIn}–${inv.timeOut})</span></div>`:''}
       ${inv.extraWork?`<div class="ip-row"><span class="k">Ekstra werk</span><span class="v">${inv.extraWork}</span></div>`:''}
@@ -5821,7 +6022,7 @@ async function reconcileClientLedger(key){
     }), 8000, 'reconcileLedger-transaction');
   }catch(e){
     console.error('Herstel rekening het misluk:', e);
-    alert('Kon nie die rekening herstel nie — probeer asseblief weer.');
+    alert('Kon nie die rekening herstel nie.\n\nRede / Reason: '+(e&&e.message?e.message:e)+'\n\nStuur asb hierdie boodskap aan — dit help om die probleem reg te maak.');
     return;
   }
   if(!client){ alert('Kon nie hierdie kliënt se rekening kry nie.'); return; }
@@ -5886,7 +6087,7 @@ async function submitLedgerCorrection(key){
     }), 8000, 'ledgerCorrection-transaction');
   }catch(e){
     console.error('Regstelling het misluk:', e);
-    alert('Die regstelling kon nie gestoor word nie — moontlik \'n stadige of onderbroke internetverbinding. Probeer asseblief weer.');
+    alert('Die regstelling kon nie gestoor word nie.\n\nRede / Reason: '+(e&&e.message?e.message:e)+'\n\nStuur asb hierdie boodskap aan — dit help om die probleem reg te maak.');
     return;
   }
   if(!client){
@@ -6574,10 +6775,10 @@ async function renderScheduleEditor(forceScroll){
       ${DAY_ORDER.map(k=>`<button class="badge ${day===k?'bt':'bc'}" style="cursor:pointer;padding:5px 10px;font-size:.76rem;white-space:nowrap"
         onclick="schedSetDay('${k}')">${DAYS_AF[k].slice(0,2)}</button>`).join('')}
     </div>
-    <p style="font-size:.7rem;color:var(--t3);margin:0">Volgende: ${nextDate} · ${list.length} kliënte</p>
+    <p style="font-size:.7rem;color:var(--t3);margin:0">Volgende: ${nextDate} · ${list.length} kliënte · R${list.reduce((s,c)=>s+(Number(c.cost)||0),0).toFixed(0)}</p>
     <div id="sched-client-list" style="flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px">
       ${list.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen kliënte op hierdie dag nie.</p>':''}
-      ${list.map(c=>{
+      ${list.map((c,idx)=>{
         const lastDone=getLastDoneDate(c.pastelCode, c.address);
         const isSkipped=skippedIds.includes(c.id);
         return `<div style="border:1px solid ${isSkipped?'#FFE0B2':'var(--brd)'};background:${isSkipped?'#FFF8E1':'transparent'};border-radius:8px;padding:6px 10px">
@@ -6587,13 +6788,20 @@ async function renderScheduleEditor(forceScroll){
             <div style="font-size:.7rem;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.name?c.name+' · ':''}Laaste: ${lastDone||'nooit'}</div>
           </div>
           <div style="font-weight:700;font-size:.82rem;flex-shrink:0">R${c.cost||0}</div>
-          <div style="display:flex;gap:4px;flex-shrink:0">
+          <div style="display:flex;gap:4px;flex-shrink:0;align-items:center">
+            <input type="number" class="inp" min="1" value="${idx+1}" title="Volgorde / Order"
+                   style="width:42px;padding:4px 2px;font-size:.74rem;text-align:center"
+                   onchange="schedReorderClient('${c.id}', this.value)">
             <button class="btn btn-sec" style="padding:4px 8px;font-size:.76rem" onclick="schedEditClient('${c.id}')">✏️</button>
             <button class="btn btn-sec" style="padding:4px 8px;font-size:.76rem" onclick="schedSkipOnceModal('${c.id}','${c.address.replace(/'/g,"\\'")}')">⏭️</button>
             <button class="btn btn-sec" style="padding:4px 8px;font-size:.76rem;color:var(--red)" onclick="schedRemoveClient('${c.id}')">✕</button>
           </div>
         </div>
       </div>`;}).join('')}
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 4px;border-top:1px solid var(--brd);flex-shrink:0">
+      <span style="font-size:.82rem;font-weight:700;color:var(--t2)">Totaal begroot vir hierdie lys</span>
+      <span style="font-size:1rem;font-weight:800;color:var(--g8)">R${list.reduce((s,c)=>s+(Number(c.cost)||0),0).toFixed(0)}</span>
     </div>
     <div style="display:flex;gap:8px;flex-shrink:0">
       <button class="btn btn-blue" style="flex:1;padding:11px;font-size:.85rem" onclick="schedShowForm(null)">＋ Voeg kliënt</button>
@@ -6710,6 +6918,44 @@ async function schedRemoveClient(clientId){
   toast('✓ Verwyder / Removed');
 }
 
+// Reorders a client within their day's list — updates the recurring
+// schedule (so future weeks keep the new order), and also reorders an
+// already-generated live list for today if this happens to be today's
+// day/week, so Bestuur/Jan don't have to wait for the next occurrence to
+// see a route that actually matches how the driver should work through it.
+async function schedReorderClient(clientId, newPosRaw){
+  const {driverId,week,day}=SCHED_ED;
+  await ensureSchedule();
+  const arr=SCHEDULE[driverId]?.[week]?.[day];
+  if(!arr) return;
+  const from=arr.findIndex(c=>c.id===clientId);
+  if(from===-1) return;
+  let to=Math.round(parseFloat(newPosRaw))-1;
+  if(isNaN(to)) to=from;
+  to=Math.max(0, Math.min(arr.length-1, to));
+  const [item]=arr.splice(from,1);
+  arr.splice(to,0,item);
+  saveSchedule();
+  await schedReorderLiveIfToday(driverId, week, day, arr.map(c=>c.id));
+  renderScheduleEditor();
+  toast('✓ Volgorde opgedateer');
+}
+async function schedReorderLiveIfToday(driverId, week, day, orderedSchedIds){
+  if(week!==currentWeekKey()||day!==todayWeekday()) return;
+  const dk=todayKey(), ck=driverId+'_'+dk;
+  let prog=CACHE.progress[ck]||await fetchDriverProgress(driverId);
+  if(!prog||!prog.route) return; // driver hasn't started today yet — next login pulls the new order anyway
+  const byId={};
+  prog.route.forEach(g=>{ byId[g.schedId]=g; });
+  const reordered=[];
+  orderedSchedIds.forEach(id=>{ if(byId[id]){ reordered.push(byId[id]); delete byId[id]; } });
+  Object.values(byId).forEach(g=>reordered.push(g)); // anything not in the new order (e.g. a live-only addition) stays, appended at the end
+  const payload={...prog,route:reordered,ts:Date.now()};
+  CACHE.progress[ck]=payload;
+  await sSet('progress_'+driverId+'_'+dk,payload);
+  if(S.screen==='driver'&&S.driver===driverId&&S.driverTab==='route') refresh();
+}
+
 let SCHED_SCROLL_CAPTURE=0;
 function schedSkipOnceModal(clientId, address){
   document.getElementById('sched-skip-modal')?.remove();
@@ -6803,15 +7049,27 @@ function buildQuotePDF(q){
   if(q.phone){ doc.text('Tel: '+q.phone,15,y); y+=6; }
   y+=4;
 
-  // Standard greeting/intro — the same on every quote from here on, so
-  // every client gets the same clear explanation of what's being quoted
-  // and what to do next, regardless of who typed the quote up.
+  // Standard greeting/intro — the same on every quote by default. If
+  // Bestuur wrote a personalized message for this specific quote (e.g.
+  // multiple pricing options for different frequencies), that replaces
+  // this block entirely — each line becomes its own bullet point, so
+  // multi-option pricing reads clearly instead of as one dense paragraph.
   doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(20,20,20);
-  const introLines=doc.splitTextToSize(`Hi, hier is u kwotasie vir tuindienste by ${q.address}.`,180);
-  doc.text(introLines,15,y); y+=introLines.length*5.5+3;
-  doc.text('•  Eerste diens',18,y); y+=6;
-  doc.text('•  Daarna gereelde diens',18,y); y+=8;
-  doc.text('Laat weet asseblief of u die kwotasie aanvaar. Dankie!',15,y); y+=12;
+  if(q.customMessage && q.customMessage.trim()){
+    const msgLines=q.customMessage.trim().split('\n').filter(l=>l.trim());
+    msgLines.forEach((line,i)=>{
+      if(y>265){ doc.addPage(); y=20; }
+      const wrapped=doc.splitTextToSize((i===0?'':'•  ')+line.trim(),175);
+      doc.text(wrapped,i===0?15:18,y); y+=wrapped.length*5.5+2;
+    });
+    y+=6;
+  } else {
+    const introLines=doc.splitTextToSize(`Hi, hier is u kwotasie vir tuindienste by ${q.address}.`,180);
+    doc.text(introLines,15,y); y+=introLines.length*5.5+3;
+    doc.text('•  Eerste diens',18,y); y+=6;
+    doc.text('•  Daarna gereelde diens',18,y); y+=8;
+    doc.text('Laat weet asseblief of u die kwotasie aanvaar. Dankie!',15,y); y+=12;
+  }
 
   if(q.tasks){
     if(y>260){ doc.addPage(); y=20; }
@@ -7047,6 +7305,12 @@ function showQuoteForm(editId){
       </select></div>
     <div><div class="flbl" style="margin-bottom:5px">Werk benodig / Work needed</div>
       <textarea class="inp" id="q-tasks" rows="2" style="resize:none" placeholder="bv. Gras sny, beddings skoonmaak…">${q?.tasks||''}</textarea></div>
+    <div><div class="flbl" style="margin-bottom:5px">Persoonlike boodskap (opsioneel) / Personalized message</div>
+      <p style="font-size:.76rem;color:var(--t2);margin:0 0 5px">Elke reël verskyn as sy eie punt op die kwotasie. Los leeg om die standaard boodskap te gebruik. Bepalings & voorwaardes onderaan bly dieselfde op elke kwotasie.</p>
+      <textarea class="inp" id="q-custommsg" rows="6" style="resize:vertical;font-family:monospace;font-size:.82rem" placeholder="bv.
+Eerste diens: Gras sny, beddings skoonmaak - R500 eenmalig
+Daarna gereelde diens 1 keer n maand - R300
+Of elke 2e week - R220 per diens">${q?.customMessage||''}</textarea></div>
     <button class="btn" onclick="submitQuote('${editId||''}')">${q?'Stoor wysigings / Save changes':'Stoor kwotasie / Save quote'}</button>
     <button class="btn btn-sec" onclick="document.getElementById('quote-modal').remove()">Kanselleer</button>
   </div>`;
@@ -7069,6 +7333,7 @@ async function submitQuote(editId){
         durationHrs, durationMin,
         frequency:document.getElementById('q-freq').value,
         tasks:document.getElementById('q-tasks').value.trim(),
+        customMessage:document.getElementById('q-custommsg').value.trim(),
       };
       await collUpdate('quotes', editId, patch);
       CACHE.quotes=getQuotes().map(x=>x.id===editId?{...x,...patch}:x);
@@ -7088,6 +7353,7 @@ async function submitQuote(editId){
     durationHrs, durationMin,
     frequency:document.getElementById('q-freq').value,
     tasks:document.getElementById('q-tasks').value.trim(),
+    customMessage:document.getElementById('q-custommsg').value.trim(),
     status:'pending',
     createdBy: S.driver||'bestuur',
     createdByName: S.driver?DRIVERS[S.driver].name:'Bestuur',
