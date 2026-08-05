@@ -854,11 +854,45 @@ async function nextInvNum(){
 // ══════════════════ LIVE POLLING ═══════════════════════════════════════════════
 // Keeps parent + driver screens in sync with what's happening on other devices.
 let POLL_TIMER=null;
+// South Africa is a single fixed UTC+2 zone with no daylight saving — but
+// device timezone bugs are one story. Separately: this is a single-page
+// app on GitHub Pages, reopened directly by drivers rather than reloaded
+// each time it's updated. Once loaded, a tablet keeps running that exact
+// JS in memory — closing/reopening the app tab picks up whatever is
+// hosted right now, but simply leaving it open across days (very normal
+// for field work) means a device can silently keep running old, already-
+// fixed-elsewhere code indefinitely. This periodically re-fetches this
+// same page (bypassing cache) and compares its own version string against
+// what's actually published, surfacing a reload prompt instead of the
+// person having no way to know they're behind.
+const APP_VERSION = '2026-08-05-2'; // bump this string every time the file is updated/re-uploaded
+let LAST_VERSION_CHECK=0;
+let VERSION_BANNER_SHOWN=false;
+async function checkForNewVersion(){
+  const now=Date.now();
+  if(VERSION_BANNER_SHOWN || now-LAST_VERSION_CHECK<5*60*1000) return; // check at most every 5 min — this fetches the whole page
+  LAST_VERSION_CHECK=now;
+  try{
+    const res=await fetch(location.href, {cache:'no-store'});
+    const html=await res.text();
+    const m=html.match(/const APP_VERSION\s*=\s*'([^']+)'/);
+    if(m && m[1] && m[1]!==APP_VERSION){
+      VERSION_BANNER_SHOWN=true;
+      const bar=document.createElement('div');
+      bar.style.cssText='position:fixed;left:0;right:0;bottom:0;z-index:99999;background:#1565C0;color:#fff;padding:12px 16px;text-align:center;font-weight:700;font-size:.9rem;cursor:pointer;box-shadow:0 -2px 8px rgba(0,0,0,.2)';
+      bar.innerHTML='🔄 \'n Nuwe weergawe is beskikbaar — tik hier om te herlaai / A new version is available — tap to reload';
+      bar.onclick=()=>location.reload(true);
+      document.body.appendChild(bar);
+    }
+  }catch(e){ /* stay silent, retry next tick */ }
+}
+
 function startPolling(){
   stopPolling();
   POLL_TIMER=setInterval(async ()=>{
     try{
       await checkStorageHealth();
+      checkForNewVersion();
       if(S.screen==='parent'){
         const [invoices, ledger, quotes] = await Promise.all([sGet('invoices',CACHE.invoices), sGet('ledger',CACHE.ledger), sGet('quotes',CACHE.quotes)]);
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
@@ -3221,7 +3255,15 @@ function finishGarden(id,e){
   S.expanded=null;
   refresh();
   const g=S.route.find(r=>r.id===id);
-  toast('✓ Klaar! '+( g?g.durationMin+' min':'')+'  · Faktuur gegenereer');
+  // The "Faktuur gegenereer" confirmation used to fire unconditionally
+  // right here, before the invoice had actually been created — so if
+  // createInvoice() failed for any reason (a dropped connection at the
+  // wrong moment, or the shared invoices record hitting Firestore's 1MB
+  // per-document size ceiling), the driver still saw a success message
+  // and the job still showed as done+invoiced, with no invoice ever
+  // existing and no error anywhere pointing at why. The confirmation now
+  // only fires after creation actually succeeds, and a real failure marks
+  // the job clearly instead of silently pretending it worked.
   // Create the invoice asynchronously, against a freshly-fetched copy of
   // the shared invoice list — not CACHE.invoices, which could be hours
   // stale if this driver logged in at the start of the day and never got
@@ -3232,7 +3274,18 @@ function finishGarden(id,e){
   // could still collide), but shrinks the window from "hours" to
   // "a fraction of a second," which is the realistic, safe fix here.
   if(g) createInvoice(g).then(inv=>{
-    if(inv) upd(id, gg=>({...gg, invId:inv.id}));
+    if(inv){
+      upd(id, gg=>({...gg, invId:inv.id}));
+      toast('✓ Klaar! '+(g.durationMin||0)+' min · Faktuur gegenereer');
+    }
+  }).catch(err=>{
+    console.error('Faktuur kon nie geskep word nie:', err);
+    // Mark the job clearly as needing attention rather than pretending it
+    // succeeded — "Herstel ontbrekende fakture" in the Fakture tab will
+    // pick this up and create the real invoice once storage is reachable.
+    upd(id, gg=>({...gg, invoiced:false}));
+    if(S.driverTab==='route') refresh();
+    alert('⚠️ Die tuin is gemerk klaar, maar die faktuur kon nie gestoor word nie (netwerk probleem). Bestuur kan dit herstel via "Herstel ontbrekende fakture" in die Fakture-oortjie.\n\nThe garden is marked done, but the invoice could not be saved (network issue). Bestuur can recover it via "Recover missing invoices" in the Invoices tab.');
   });
 }
 
@@ -3551,7 +3604,7 @@ async function renderPierreTeamAdmin(ct){
   mc.innerHTML=`<div class="vtitle">👷 Alle Spanne — Bestuur</div>
     <p style="font-size:.78rem;color:var(--t2);margin:0 0 10px">Skuif werkers tussen bakkies of voeg los werkers by. Kies "Permanent" om dit blywend te maak, of "Net vandag" vir 'n tydelike skuif.</p>
     <button class="btn-sec btn" style="width:100%;margin-bottom:10px;color:var(--red)" onclick="resetWorkerRosterToDefaults()">🔄 Herstel alle spanne na oorspronklike lyste</button>
-    ${Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,dd])=>{
+    ${Object.entries(DRIVERS).map(([id,dd])=>{
       const roster=getRoster(id);
       const b=moves[id]||{addedPermanent:[],addedTemp:[],removed:[]};
       const activeList=[...roster.filter(n=>!b.removed.includes(n)), ...b.addedTemp.filter(n=>!b.removed.includes(n))];
@@ -3574,7 +3627,7 @@ async function renderPierreTeamAdmin(ct){
       <input class="inp" id="pierre-worker-name" placeholder="Naam van werker…">
       <div style="display:flex;gap:6px">
         <select class="inp" id="pierre-worker-driver" style="flex:1">
-          ${Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,dd])=>`<option value="${id}">${dd.name}</option>`).join('')}
+          ${Object.entries(DRIVERS).map(([id,dd])=>`<option value="${id}">${dd.name}</option>`).join('')}
         </select>
         <select class="inp" id="pierre-worker-type" style="flex:1">
           <option value="permanent">Permanent</option>
@@ -4167,24 +4220,27 @@ async function submitCreditNote(invId){
     address: inv.address, name: inv.name, pastelCode: inv.pastelCode,
     items, total, reason,
     date: now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'}),
-    dateKey: now.toISOString().split('T')[0],
+    dateKey: sastDateKey(),
     driverId: inv.driverId,
   };
   const cns=getCreditNotes(); cns.unshift(cn); saveCreditNotes(cns);
 
   // Reduce the client's ledger balance, same mechanism as a payment.
-  const led=getLedger();
   const found=findLedgerClient(inv.pastelCode, inv.address, inv.name);
   const key=found?found.key:(inv.pastelCode||inv.address);
-  if(led[key]){
-    led[key].entries.push({
-      date:cn.dateKey, dateStr:cn.date, type:'credit_note',
-      desc:'Krediet Nota '+cn.id+' (vir '+inv.id+')'+(reason?' — '+reason:''),
-      debit:0, credit:total, cnId:cn.id
-    });
-    led[key].balance-=total;
-    saveLedger(led);
-  }
+  const newLedger = await transactKV('ledger', current=>{
+    const led = current || getLedger();
+    if(led[key]){
+      led[key].entries.push({
+        date:cn.dateKey, dateStr:cn.date, type:'credit_note',
+        desc:'Krediet Nota '+cn.id+' (vir '+inv.id+')'+(reason?' — '+reason:''),
+        debit:0, credit:total, cnId:cn.id
+      });
+      led[key].balance-=total;
+    }
+    return led;
+  });
+  CACHE.ledger=newLedger;
   document.getElementById('cn-form-modal')?.remove();
   toast('✓ Krediet Nota geskep');
   await shareCreditNotePDF(cn.id);
@@ -5993,12 +6049,52 @@ async function shareQuotePDF(id){
     `Kwotasie – ${q.address}`, `Kwotasie bedrag: R${(q.quotedAmount||0).toFixed(2)}`);
   toast('📄 Kwotasie PDF gereed');
 }
+function _quoteHidePriceForViewer(q){
+  if(S.screen==='parent') return !!S.isOffice;      // Bestuur sees price, Jan doesn't
+  if(S.driver==='pierre') return true;               // Pierre never sees pricing
+  if(S.driver) return q.createdBy!==S.driver;         // a regular driver only sees their own self-priced quotes
+  return true;
+}
+function showQuoteDetail(id){
+  const q=getQuotes().find(x=>x.id===id);
+  if(!q) return;
+  document.getElementById('quote-detail-modal')?.remove();
+  const hidePrice=_quoteHidePriceForViewer(q);
+  const priceKnown = q.status!=='assigned' && (q.quotedAmount||0)>0;
+  const durTxt = (q.durationHrs||q.durationMin) ?
+    `${q.durationHrs?q.durationHrs+'u ':''}${q.durationMin?q.durationMin+'min':''}`.trim() : '';
+  const row=(label,val)=> val?`<div style="padding:8px 0;border-bottom:1px solid var(--brd)">
+      <div style="font-size:.7rem;color:var(--t3);text-transform:uppercase;letter-spacing:.03em">${label}</div>
+      <div style="font-size:.92rem;margin-top:2px">${val}</div>
+    </div>`:'';
+  const bg=el('div','mbg'); bg.id='quote-detail-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">💬 Kwotasie besonderhede
+      <button class="mclose" onclick="document.getElementById('quote-detail-modal').remove()">✕</button>
+    </div>
+    <div style="margin-bottom:6px">${quoteStatusBadge(q)}</div>
+    ${row('Adres', q.address)}
+    ${row('Kliënt naam', q.name)}
+    ${row('Selfoon', q.phone)}
+    ${row('Notas by versoek', q.requestNote)}
+    ${row('Werk benodig', q.tasks)}
+    ${row('Beraamde tyd', durTxt)}
+    ${row('Bestuurder se notas', q.driverNotes)}
+    ${row('Toegewys aan', q.assignedDriver?DRIVERS[q.assignedDriver].name:'')}
+    ${row('Geskep deur', q.createdByName+' · '+q.dateStr)}
+    ${!hidePrice?row('Kwotasie bedrag', priceKnown?('R'+(q.quotedAmount||0)):'Nog nie geprys nie'):''}
+    ${priceKnown&&!hidePrice?`<button class="btn-sec btn" style="width:100%;margin-top:10px" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>`:''}
+    <button class="btn btn-sec" style="margin-top:8px" onclick="document.getElementById('quote-detail-modal').remove()">Sluit</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
 function quoteCardHtml(q,canFinalize,hidePrice){
   const durTxt = (q.durationHrs||q.durationMin) ?
     `${q.durationHrs?q.durationHrs+'u ':''}${q.durationMin?q.durationMin+'min':''}`.trim() : '';
   const priceKnown = q.status!=='assigned' && (q.quotedAmount||0)>0;
   return `<div class="gc" style="padding:12px 14px;${q.status==='declined'?'opacity:.6':''}">
-    <div style="display:flex;justify-content:space-between;gap:8px;align-items:start">
+    <div style="display:flex;justify-content:space-between;gap:8px;align-items:start;cursor:pointer" onclick="showQuoteDetail('${q.id}')">
       <div style="min-width:0">
         <div style="font-weight:700">${q.address}</div>
         ${q.name?`<div style="font-size:.82rem;color:var(--t2)">${q.name}</div>`:''}
