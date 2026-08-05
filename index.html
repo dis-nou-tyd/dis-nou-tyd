@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-14'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-15'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -3529,6 +3529,22 @@ async function deleteInvoiceAndReverseLedger(invId){
   }
   return removedInv;
 }
+// UI entry point for deleting an invoice straight from the Fakture list —
+// reuses the exact same ledger-safe delete undoFinish already relied on
+// (removes the invoice's own ledger entry and recalculates the balance
+// from what's left), so a deleted invoice is fully gone from that
+// client's statement too, not just from the invoice list.
+async function confirmDeleteInvoice(id){
+  const inv=getInvoices().find(i=>i.id===id);
+  if(!inv) return;
+  const msg = inv.status==='sent'
+    ? 'Hierdie faktuur is reeds gestuur — die kliënt het dit dalk al gesien. Oorweeg eerder \'n Krediet Nota as die bedrag net verkeerd is.\n\nSkrap in elk geval? Dit word ook van die kliënt se staat verwyder.'
+    : 'Skrap hierdie faktuur permanent? Dit word ook van die kliënt se staat verwyder.';
+  if(!confirm(msg+'\n\n'+inv.address+' — R'+inv.amount.toFixed(2))) return;
+  await deleteInvoiceAndReverseLedger(id);
+  toast('🗑 Faktuur geskrap');
+  renderParentTab('invoices');
+}
 
 // Lets Bestuur create a fully real invoice not tied to any completed
 // route job — e.g. a special one-off charge. Produces the exact same kind
@@ -4467,10 +4483,18 @@ async function recoverInvoices(dateKey, missingByDriver){
   toast(`✓ ${recovered} faktuur/fakture herstel`);
 }
 
+// Which dates are expanded in the Fakture accordion — today starts open,
+// everything else starts collapsed, so opening the tab isn't an
+// overwhelming wall of every invoice ever created. Persists across
+// re-renders (polling etc.) since it lives outside the render function.
+let INVOICE_OPEN_DATES=new Set([todayKey()]);
+function toggleInvoiceDate(dateKey){
+  if(INVOICE_OPEN_DATES.has(dateKey)) INVOICE_OPEN_DATES.delete(dateKey);
+  else INVOICE_OPEN_DATES.add(dateKey);
+  renderParentTab('invoices');
+}
 function renderInvoices(ct){
   const invs=getInvoices().slice().reverse(); // newest first
-  const pending=invs.filter(i=>i.status==='pending');
-  const sent=invs.filter(i=>i.status==='sent');
 
   const newBtn=el('button','btn btn-blue');
   newBtn.style.cssText='margin-bottom:10px;width:100%';
@@ -4484,33 +4508,54 @@ function renderInvoices(ct){
   cnBtn.onclick=showCreditNoteLookup;
   ct.appendChild(cnBtn);
 
-  const recBtn=el('button','btn-sec btn');
-  recBtn.style.cssText='margin-bottom:10px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
-  recBtn.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
-  recBtn.onclick=showRecoverInvoices;
-  ct.appendChild(recBtn);
-
   if(invs.length===0){
     const empty=el('div','empty');
     empty.innerHTML='<div class="ei">🧾</div><h3>Geen fakture nog</h3><p>Fakture verskyn hier sodra bestuurders tuine afmerk.</p>';
     ct.appendChild(empty);
+    const recBtn0=el('button','btn-sec btn');
+    recBtn0.style.cssText='margin-top:10px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
+    recBtn0.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
+    recBtn0.onclick=showRecoverInvoices;
+    ct.appendChild(recBtn0);
     return;
   }
 
-  if(pending.length){
-    const lbl=el('div','divlbl');
-    lbl.textContent=`📤 STUUR GEREED (${pending.length})`;
-    ct.appendChild(lbl);
-    pending.forEach(inv=>ct.appendChild(makeInvCard(inv)));
-  }
+  // Grouped by day and shown as a click-to-expand accordion instead of one
+  // long flat "pending then sent" list — with months of invoices piling
+  // up, finding "today's" or "last Tuesday's" invoices meant scrolling
+  // past everything else first. Newest date first; each date's own
+  // pending/sent split is preserved inside it.
+  const byDate={};
+  invs.forEach(inv=>{ (byDate[inv.dateKey]=byDate[inv.dateKey]||[]).push(inv); });
+  const dateKeys=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
 
-  if(sent.length){
-    const lbl=el('div','divlbl');
-    lbl.style.marginTop='8px';
-    lbl.textContent=`✓ GESTUUR (${sent.length})`;
-    ct.appendChild(lbl);
-    sent.slice(0,10).forEach(inv=>ct.appendChild(makeInvCard(inv,true)));
-  }
+  dateKeys.forEach(dateKey=>{
+    const dayInvs=byDate[dateKey];
+    const dayPending=dayInvs.filter(i=>i.status==='pending');
+    const daySent=dayInvs.filter(i=>i.status==='sent');
+    const dayTotal=dayInvs.reduce((s,i)=>s+i.amount,0);
+    const isOpen=INVOICE_OPEN_DATES.has(dateKey);
+    const label=dayInvs[0].date||dateKey;
+
+    const hdr=el('div');
+    hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
+      +'background:var(--card);border:1px solid var(--brd);border-radius:10px;padding:12px 14px;margin-top:8px';
+    hdr.innerHTML=`
+      <div>
+        <div style="font-weight:700">${isOpen?'▾':'▸'} ${label}</div>
+        <div style="font-size:.76rem;color:var(--t2);margin-top:2px">
+          ${dayInvs.length} faktu${dayInvs.length===1?'ur':'re'}${dayPending.length?' · '+dayPending.length+' wag om te stuur':''}
+        </div>
+      </div>
+      <div style="font-weight:800">R${dayTotal.toFixed(0)}</div>`;
+    hdr.onclick=()=>toggleInvoiceDate(dateKey);
+    ct.appendChild(hdr);
+
+    if(isOpen){
+      dayPending.forEach(inv=>ct.appendChild(makeInvCard(inv)));
+      daySent.forEach(inv=>ct.appendChild(makeInvCard(inv,true)));
+    }
+  });
 
   // Credit notes previously had nowhere to live after the moment they were
   // created — this list is the first place they can actually be found,
@@ -4520,7 +4565,7 @@ function renderInvoices(ct){
   const creditNotes=getCreditNotes();
   if(creditNotes.length){
     const lbl=el('div','divlbl');
-    lbl.style.marginTop='8px';
+    lbl.style.marginTop='14px';
     lbl.textContent=`🧾 KREDIET NOTAS (${creditNotes.length})`;
     ct.appendChild(lbl);
     creditNotes.forEach(cn=>{
@@ -4556,6 +4601,15 @@ function renderInvoices(ct){
       ct.appendChild(card);
     });
   }
+
+  // Moved to the very bottom — this is a recovery/repair tool for a rare
+  // edge case, not something that belongs above the actual invoice list
+  // every time the tab opens.
+  const recBtn=el('button','btn-sec btn');
+  recBtn.style.cssText='margin-top:16px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
+  recBtn.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
+  recBtn.onclick=showRecoverInvoices;
+  ct.appendChild(recBtn);
 }
 
 // ══════════════════ CREDIT NOTES ═══════════════════════════════════════════════
@@ -4782,6 +4836,10 @@ function makeInvCard(inv,isSent=false){
               border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
         ✏️ Wysig
       </button>
+      <button onclick="confirmDeleteInvoice('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--red)">
+        🗑
+      </button>
     </div>
     `:`<div class="inv-sent">✓ Gestuur – tik om terug te plaas</div>
     <div class="inv-actions" style="margin-top:6px">
@@ -4796,6 +4854,10 @@ function makeInvCard(inv,isSent=false){
       <button onclick="event.stopPropagation();showEditInvoiceModal('${inv.id}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
               border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
         ✏️ Wysig
+      </button>
+      <button onclick="event.stopPropagation();confirmDeleteInvoice('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--red)">
+        🗑
       </button>
     </div>`}`;
 
@@ -6626,10 +6688,10 @@ function showQuoteDetail(id){
     ${row('Wys op lys vanaf', q.scheduledDate)}
     ${row('Geskep deur', q.createdByName+' · '+q.dateStr)}
     ${!hidePrice?row('Kwotasie bedrag', priceKnown?('R'+(q.quotedAmount||0)):'Nog nie geprys nie'):''}
-    ${priceKnown&&!hidePrice?`<div style="display:flex;gap:8px;margin-top:10px">
+    ${priceKnown&&!hidePrice?`<div style="display:flex;gap:6px;margin-top:10px">
       <button class="btn-sec btn" style="flex:1;padding:8px;font-size:.8rem" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>
-      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="viewQuotePDF('${q.id}')">👁</button>
-      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
+      <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:8px 10px;font-size:.76rem" onclick="viewQuotePDF('${q.id}')">👁</button>
+      <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:8px 10px;font-size:.76rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
     </div>`:''}
     <button class="btn btn-sec" style="margin-top:8px" onclick="document.getElementById('quote-detail-modal').remove()">Sluit</button>
   </div>`;
@@ -6657,17 +6719,19 @@ function quoteCardHtml(q,canFinalize,hidePrice){
         <div style="margin-top:4px">${quoteStatusBadge(q)}</div>
       </div>
     </div>
-    ${priceKnown&&!hidePrice?`<div style="display:flex;gap:8px;margin-top:10px">
+    ${priceKnown&&!hidePrice?`<div style="display:flex;gap:6px;margin-top:10px">
       <button class="btn-sec btn" style="flex:1;padding:8px;font-size:.8rem" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>
-      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="viewQuotePDF('${q.id}')">👁</button>
-      <button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
+      <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:8px 10px;font-size:.76rem" onclick="viewQuotePDF('${q.id}')">👁</button>
+      <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:8px 10px;font-size:.76rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
     </div>`:''}
-    ${canFinalize&&(q.status==='pending')?`<div style="display:flex;gap:8px;margin-top:8px">
-      <button class="btn btn-blue" style="flex:1;padding:9px;font-size:.85rem;white-space:nowrap" onclick="showQuoteForm('${q.id}')">${priceKnown?'✏️ Wysig prys':'💰 Formaliseer prys'}</button>
-      <button class="btn btn-sec" style="padding:9px 14px" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
+    ${canFinalize&&q.status==='pending'&&!priceKnown?`<div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="showQuoteForm('${q.id}')">💰 Formaliseer prys</button>
+      <button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
     </div>`:''}
-    ${canFinalize&&priceKnown&&q.status==='pending'?`<div style="display:flex;gap:8px;margin-top:8px">
-      <button class="btn btn-blue" style="flex:1;padding:9px;font-size:.85rem;white-space:nowrap" onclick="openClientForm({fromQuote:'${q.id}'})">✓ Aanvaar</button>
+    ${canFinalize&&priceKnown&&q.status==='pending'?`<div style="display:flex;gap:6px;margin-top:8px">
+      <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:12px;font-size:.78rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig prys</button>
+      <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="openClientForm({fromQuote:'${q.id}'})">✓ Aanvaar</button>
+      <button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800;color:var(--red)" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
     </div>`:''}
   </div>`;
 }
