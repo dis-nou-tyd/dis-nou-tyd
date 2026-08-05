@@ -42,6 +42,7 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
 
 /* ── LOGIN ── */
 #s-login{align-items:center;justify-content:center;padding:20px;
+  overflow-y:auto;
   background:linear-gradient(155deg,var(--g9) 0%,var(--g8) 42%,var(--bg) 42%)}
 .lbox{background:var(--card);border-radius:24px;padding:32px 24px;width:100%;
   max-width:380px;box-shadow:0 12px 40px rgba(0,0,0,.18);display:flex;flex-direction:column;gap:18px}
@@ -297,8 +298,8 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
   align-items:center;justify-content:center;color:#fff;font-size:1.2rem;font-weight:800}
 .dsi{flex:1}.dsi h3{font-size:.95rem;font-weight:700}
 .dsi p{font-size:.78rem;color:var(--t2);margin-top:1px}
-.dsprog{height:5px;background:var(--brd);border-radius:100px;margin-top:6px;overflow:hidden}
-.dspf{height:100%;border-radius:100px;transition:width .5s}
+.dsprog{height:5px;background:var(--brd);border-radius:100px;margin-top:6px;overflow:hidden;display:flex}
+.dspf{height:100%;transition:width .5s}
 .section-lbl{font-size:.72rem;font-weight:800;color:var(--t2);
   text-transform:uppercase;letter-spacing:.5px}
 
@@ -454,7 +455,7 @@ const CLIENT_MASTER = [{"code":"3DE001","name":"3E LAAN 24 SKULD","d120":0.0,"d9
 
 // ══════════════════ CONFIG ════════════════════════════════════════════════════
 const PARENT_PIN = '2580';
-const OFFICE_PIN = '1985';
+const OFFICE_PIN = '1987';
 const DRIVERS = {
   jasper: {name:'Jasper', icon:'🌿', color:'#2E7D32', pin:'1',
     workers:['Pierre Jantjies','Mervin Nero','Lionel Pieterse','Dawid Faro','Ismael'],
@@ -468,7 +469,7 @@ const DRIVERS = {
   gordon: {name:'Gordon', icon:'🍃', color:'#E65100', pin:'4',
     workers:['Boeta Jagers','Poenkels','Reagan Jantjies','Emile'],
     vehicle:'', rate:370},
-  pierre: {name:'Pierre (Terreinbestuurder)', icon:'🚗', color:'#00695C', password:'vanzyl1975',
+  pierre: {name:'Pierre (Terreinbestuurder)', icon:'🚗', color:'#00695C', password:'1975',
     workers:[],  // casuals only — differ day to day, added via the "Voeg werker by" field
     vehicle:'', rate:350},
 };
@@ -594,8 +595,53 @@ function todayKey(){ return new Date().toISOString().split('T')[0]; }
 const CACHE = {
   invoices: [], ledger: {}, invSeq: 1000, quotes: [], expenses: [], bankTxns: [], creditNotes: [],
   progress: {},      // { [driverId+'_'+dateKey]: {route,vehicle,workers} }
+  workerRoster: {},  // { [driverId]: [permanent worker names...] } — Pierre-editable, replaces DRIVERS[x].workers as source of truth once seeded
   ready: false,
 };
+
+// ══════════════════ WORKER ROSTER (Pierre's team management) ══════════════════
+// Permanent roster lives in Firestore (editable at runtime by Pierre or a
+// driver for their own bakkie), seeded once from the DRIVERS constant.
+function getRoster(driverId){
+  if(CACHE.workerRoster && CACHE.workerRoster[driverId]!==undefined) return CACHE.workerRoster[driverId];
+  return (DRIVERS[driverId]?.workers||[]).slice();
+}
+async function ensureWorkerRosterSeeded(){
+  const existing=await sGet('worker_roster', null);
+  if(existing){ CACHE.workerRoster=existing; return; }
+  const seeded={};
+  Object.entries(DRIVERS).forEach(([id,d])=>{ if(id!=='pierre') seeded[id]=(d.workers||[]).slice(); });
+  CACHE.workerRoster=seeded;
+  await sSet('worker_roster', seeded);
+}
+async function saveRoster(){ await sSet('worker_roster', CACHE.workerRoster); }
+
+// Today's-only (or any single date's) worker moves layer, on top of the
+// permanent roster — { [driverId]: {addedPermanent:[], addedTemp:[], removed:[]} }.
+// addedPermanent is recorded here too (in addition to updating the roster
+// itself) purely so an already-open tablet picks the change up on its next
+// poll — the roster change alone would only be seen at that driver's next
+// fresh login.
+async function getWorkerMovesForDate(dateKey){ return await sGet('worker_moves_'+dateKey, {}); }
+async function saveWorkerMovesForDate(dateKey, moves){ await sSet('worker_moves_'+dateKey, moves); }
+function _moveBucket(moves,driverId){
+  if(!moves[driverId]) moves[driverId]={addedPermanent:[],addedTemp:[],removed:[]};
+  return moves[driverId];
+}
+// Builds the actual worker set for a given roster+moves combination — used
+// both at login/backfill time and by the live-poll sync so the logic can't
+// drift between the two call sites.
+function applyRosterAndMoves(driverId, moves){
+  const workers={};
+  getRoster(driverId).forEach(w=>{ workers[w]={present:true,loan:''}; });
+  const b=moves[driverId];
+  if(b){
+    b.removed.forEach(n=>{ delete workers[n]; });
+    b.addedPermanent.forEach(n=>{ if(!workers[n]) workers[n]={present:true,loan:''}; });
+    b.addedTemp.forEach(n=>{ workers[n]={present:true,loan:'',casual:true}; });
+  }
+  return workers;
+}
 
 async function hydrateCache(){
   const [invoices, ledger, invSeq, quotes, expenses, bankTxns, creditNotes] = await Promise.all([
@@ -713,10 +759,11 @@ function saveBankTxns(list){ CACHE.bankTxns=list; sSet('bank_txns', list); }
 function getLedger(){ return CACHE.ledger; }
 function saveLedger(l){ CACHE.ledger=l; sSet('ledger', l); }
 
-function nextInvNum(){
-  const n = CACHE.invSeq||1000;
+async function nextInvNum(){
+  const freshSeq = await sGet('inv_seq', CACHE.invSeq||1000);
+  const n = freshSeq||1000;
   CACHE.invSeq = n+1;
-  sSet('inv_seq', n+1);
+  await sSet('inv_seq', n+1);
   return 'DNT-'+String(n+1);
 }
 
@@ -732,7 +779,7 @@ function startPolling(){
         const [invoices, ledger, quotes] = await Promise.all([sGet('invoices',CACHE.invoices), sGet('ledger',CACHE.ledger), sGet('quotes',CACHE.quotes)]);
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
         await Promise.all(Object.keys(DRIVERS).map(fetchDriverProgress));
-        const NO_AUTOREFRESH_TABS=['payroll','map','statements'];
+        const NO_AUTOREFRESH_TABS=['payroll','map','statements','history'];
         if(S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
           // Preserve scroll position across this background refresh — a
           // full re-render was resetting scroll to the top every ~6
@@ -765,6 +812,35 @@ function startPolling(){
             CACHE.progress[ck]=remote;
             if(S.driverTab==='route') refresh();
           }
+          // Pick up schedule edits Bestuur/Jan make against TODAY after this
+          // driver's list was already loaded — e.g. removing a garden via
+          // the schedule editor used to only affect tomorrow onward; a job
+          // skipped/edited for today now actually updates the live list.
+          try{
+            const [skips, overrides, moves] = await Promise.all([getSkipList(S.driver, dk), getDateOverrides(S.driver, dk), getWorkerMovesForDate(dk)]);
+            let changed=false;
+            if(skips.length){
+              const before=S.route.length;
+              S.route=S.route.filter(g=>g.completed || g.active || !skips.includes(g.schedId));
+              if(S.route.length!==before) changed=true;
+            }
+            if(Object.keys(overrides).length){
+              S.route=S.route.map(g=>{
+                if(g.completed||g.active) return g; // don't rewrite a job already in progress/done
+                const ov=overrides[g.schedId];
+                if(!ov) return g;
+                changed=true;
+                return {...g, ...ov};
+              });
+            }
+            const mb=moves[S.driver];
+            if(mb){
+              mb.removed.forEach(n=>{ if(n in S.workers){ delete S.workers[n]; changed=true; } });
+              mb.addedPermanent.forEach(n=>{ if(!(n in S.workers)){ S.workers[n]={present:true,loan:''}; changed=true; } });
+              mb.addedTemp.forEach(n=>{ if(!(n in S.workers)){ S.workers[n]={present:true,loan:'',casual:true}; changed=true; } });
+            }
+            if(changed){ saveProgress(); if(S.driverTab==='route') refresh(); if(S.driverTab==='workers') renderDriverTab('workers'); }
+          }catch(e){ /* stay silent, retry next tick */ }
         }
       }
     }catch(e){ /* stay silent, retry next tick */ }
@@ -1074,10 +1150,11 @@ async function switchToYesterdayList(){
     if(skips.length) S.route=S.route.filter(g=>!skips.includes(g.schedId));
     if(Object.keys(overrides).length) S.route=S.route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
     S.vehicle={kmStart:'',kmEnd:'',diesel:''};
-    S.workers={};
+    await ensureWorkerRosterSeeded();
+    const moves=await getWorkerMovesForDate(yk).catch(()=>({}));
+    S.workers=applyRosterAndMoves(id, moves);
     const d=DRIVERS[id];
     S.workers[d.name]={present:true,loan:''};
-    if(d.workers) d.workers.forEach(w=>{ S.workers[w]={present:true,loan:''}; });
   }
   renderDriverTab('route');
 }
@@ -1113,9 +1190,10 @@ async function loginDriver(id){
       S.route=S.route.map(g=>overrides[g.schedId]?{...g, ...overrides[g.schedId]}:g);
     }
     S.vehicle={kmStart:'',kmEnd:'',diesel:''};
-    S.workers={};
+    await ensureWorkerRosterSeeded();
+    const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
+    S.workers=applyRosterAndMoves(id, moves);
     S.workers[d.name]={present:true,loan:''};
-    if(d.workers) d.workers.forEach(w=>{ S.workers[w]={present:true,loan:''}; });
   }
   renderDriverTab('route');
   startPolling();
@@ -1178,6 +1256,7 @@ function formatToday(){
 // who worked which day. Loans (leen) are tracked as a running balance per
 // person so a repayment this week automatically reduces what they still owe.
 let PAY_WEEK_OFFSET=0; // 0 = current week, -1 = last week, etc.
+let PAY_OPEN_GROUP=null; // null = folder view; a group id = drilled into that bakkie/office group
 let PR_DEDUCTIONS={}; // { [employeeKey]: [{reason, amount}, ...] } — itemized "other" deductions per week
 
 function mondayOfWeek(offsetWeeks){
@@ -2227,11 +2306,32 @@ async function renderWages(ct){
 
   // Build one group per driver-span, plus a standalone group for employees
   // with no driver route (e.g. Jan, paid as foreman/office).
+  await ensureWorkerRosterSeeded();
   const groups=Object.entries(DRIVERS).map(([id,d])=>({
-    id, label:d.icon+' '+d.name, isDriver:true, driverId:id, rate:d.rate||0, members:d.workers||[]
+    id, label:d.icon+' '+d.name, isDriver:true, driverId:id, rate:d.rate||0, members:getRoster(id)
   }));
   groups.push({id:'_office', label:'🗂️ Kantoor / Toesig', isDriver:false, driverId:null, rate:0,
     members:['Jan']});
+
+  // Casual workers never sit on the permanent roster (DRIVERS[id].workers)
+  // — they only ever exist inside a specific day's saved Dagstaat record,
+  // added on the spot. Without this step, anyone who worked as a casual
+  // that week simply never showed up in payroll at all — this scans every
+  // day this driver logged, and pulls in any name marked casual so they're
+  // not missed on payday.
+  const casualProgsByDriver={};
+  await Promise.all(groups.filter(g=>g.isDriver).map(async g=>{
+    const progs=await Promise.all(dateKeys.map(dk=>sGet('progress_'+g.driverId+'_'+dk,null)));
+    const seen=new Set();
+    progs.forEach(p=>{
+      if(!p||!p.workers) return;
+      Object.entries(p.workers).forEach(([name,w])=>{
+        if(w.casual && !g.members.includes(name)) seen.add(name);
+      });
+    });
+    casualProgsByDriver[g.id]=[...seen];
+  }));
+  groups.forEach(g=>{ if(casualProgsByDriver[g.id]) g.members=[...g.members, ...casualProgsByDriver[g.id]]; });
 
   let bodyHtml='', grandNetto=0, grandUIF=0, grandLeen=0;
   PR_DEDUCTIONS={};
@@ -2260,12 +2360,15 @@ async function renderWages(ct){
   }));
 
   // Phase 2: build the display — purely synchronous from here, everything
-  // needed is already sitting in attendanceData.
+  // needed is already sitting in attendanceData. Each group's HTML and
+  // subtotal are kept separate so we can show either the folder grid or
+  // just one drilled-in group, instead of always showing everyone at once.
   let flatIdx=0;
+  const groupHtml={}, groupNetto={};
   for(const g of groups){
     const rowNames = g.isDriver ? [{name:g.label.replace(/^\S+\s/,''),isLead:true,rate:g.rate,driverId:g.driverId}, ...g.members.map(m=>({name:m,isLead:false,rate:EMPLOYEE_RATES[m]??242,driverId:g.driverId}))]
                                  : g.members.map(m=>({name:m,isLead:false,rate:EMPLOYEE_RATES[m]??0,driverId:null}));
-    let groupRows='';
+    let groupRows='', gNetto=0;
     for(const person of rowNames){
       const key=person.name;
       const rec=saved[key]||{};
@@ -2281,10 +2384,11 @@ async function renderWages(ct){
       const aftrekkings = (Number(uif)||0)+(Number(loanNew)||0)+(Number(ander)||0);
       const netto = totaal-aftrekkings;
       grandNetto+=netto; grandUIF+=Number(uif)||0; grandLeen+=Number(loanNew)||0;
+      gNetto+=netto;
       const paid=!!rec.paid;
-      const rid='pr_'+wkKey.replace(/-/g,'')+'_'+key.replace(/[^a-zA-Z0-9]/g,'');
+      const isCasual=!person.isLead && casualProgsByDriver[g.id] && casualProgsByDriver[g.id].includes(key);
       groupRows+=`<div class="pr-row" data-emp="${encodeURIComponent(key)}">
-        <div class="pr-name">${key}${person.isLead?' <span style="color:var(--t3);font-weight:400">(bestuurder)</span>':''}</div>
+        <div class="pr-name">${key}${person.isLead?' <span style="color:var(--t3);font-weight:400">(bestuurder)</span>':''}${isCasual?' <span style="background:#FFF3CD;color:#856404;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:100px">Los werker hierdie week</span>':''}</div>
         <div class="pr-fields">
           <label>Koers/dag<input class="inp pr-rate" type="number" value="${rate}" style="padding:6px" oninput="prRecalc(this)"></label>
           <label>Dae<input class="inp pr-days" type="number" value="${days}" style="padding:6px" oninput="prRecalc(this)"></label>
@@ -2310,50 +2414,83 @@ async function renderWages(ct){
         </div>
       </div>`;
     }
-    bodyHtml+=`<div class="pr-group"><div class="pr-grouphdr">${g.label}</div>${groupRows}</div>`;
+    groupHtml[g.id]=groupRows;
+    groupNetto[g.id]=gNetto;
   }
 
   // Aggregate outstanding loan balances across every employee — answers
   // "who owes what" at a glance instead of having to open each person's
-  // individual Leen-boek one at a time.
+  // individual Leen-boek one at a time. Fetched in parallel, same reason
+  // as the attendance data above.
   const allEmployeeNames=[];
   for(const g of groups){
     if(g.isDriver) allEmployeeNames.push(g.label.replace(/^\S+\s/,''));
     allEmployeeNames.push(...g.members);
   }
-  const loanBalances=[];
-  for(const name of allEmployeeNames){
-    const l=await getLoanLedger(name);
-    if(l.balance>0) loanBalances.push({name, balance:l.balance});
-  }
+  const loanLedgers=await Promise.all(allEmployeeNames.map(name=>getLoanLedger(name)));
+  const loanBalances=allEmployeeNames.map((name,i)=>({name, balance:loanLedgers[i].balance})).filter(l=>l.balance>0);
   loanBalances.sort((a,b)=>b.balance-a.balance);
   const totalLoans=loanBalances.reduce((s,l)=>s+l.balance,0);
 
+  const loanSummaryHtml=loanBalances.length?`
+    <div class="divlbl" style="margin-top:10px">🏦 UITSTAANDE LENINGS (R${totalLoans.toFixed(0)})</div>
+    ${loanBalances.map(l=>`<div style="display:flex;justify-content:space-between;font-size:.82rem;padding:5px 0;border-bottom:1px solid var(--brd);cursor:pointer"
+        onclick="openLoanLedger('${encodeURIComponent(l.name)}')">
+      <span>${l.name}</span><b style="color:#C62828">R${l.balance.toFixed(2)}</b>
+    </div>`).join('')}
+    ` : '';
+
+  // ── A group is open: show just that group's rows, drilled in ──
+  if(PAY_OPEN_GROUP && groupHtml[PAY_OPEN_GROUP]!==undefined){
+    const g=groups.find(x=>x.id===PAY_OPEN_GROUP);
+    ct.innerHTML=`
+      <button class="btn-sec btn" style="margin-bottom:10px" onclick="PAY_OPEN_GROUP=null;renderWagesInto()">← Terug na alle bakkies</button>
+      <div class="ovhdr"><h2>${g.label}</h2><p>${rangeLbl}</p></div>
+      <div class="ovgrid">
+        <div class="ovc"><div class="v">R${groupNetto[g.id].toFixed(0)}</div><div class="l">Netto vir hierdie groep</div></div>
+      </div>
+      <div id="pr-body">${groupHtml[g.id]}</div>
+      <button class="btn" style="margin-top:12px" onclick="savePayrollWeek('${wkKey}')">💾 Stoor week / Save week</button>
+    `;
+    return;
+  }
+
+  // ── Folder view: one clickable card per bakkie/office group ──
   ct.innerHTML=`
     <div class="ovhdr">
       <h2>💰 Personeel / Payroll</h2>
       <p>${rangeLbl}</p>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:10px">
-      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET--;renderWagesInto()">← Vorige week</button>
-      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET=0;renderWagesInto()">Hierdie week</button>
-      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET++;renderWagesInto()">Volgende week →</button>
+      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET--;PAY_OPEN_GROUP=null;renderWagesInto()">← Vorige week</button>
+      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET=0;PAY_OPEN_GROUP=null;renderWagesInto()">Hierdie week</button>
+      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET++;PAY_OPEN_GROUP=null;renderWagesInto()">Volgende week →</button>
     </div>
     <div class="ovgrid">
       <div class="ovc"><div class="v">R${grandNetto.toFixed(0)}</div><div class="l">Totale lone (netto)</div></div>
       <div class="ovc"><div class="v">R${grandUIF.toFixed(0)}</div><div class="l">UIF totaal</div></div>
       <div class="ovc"><div class="v">R${grandLeen.toFixed(0)}</div><div class="l">Leen afbetaal</div></div>
     </div>
-    ${loanBalances.length?`
-    <div class="divlbl" style="margin-top:10px">🏦 UITSTAANDE LENINGS (R${totalLoans.toFixed(0)})</div>
-    ${loanBalances.map(l=>`<div style="display:flex;justify-content:space-between;font-size:.82rem;padding:5px 0;border-bottom:1px solid var(--brd);cursor:pointer"
-        onclick="openLoanLedger('${encodeURIComponent(l.name)}')">
-      <span>${l.name}</span><b style="color:#C62828">R${l.balance.toFixed(2)}</b>
-    </div>`).join('')}
-    ` : ''}
-    <div id="pr-body">${bodyHtml}</div>
-    <button class="btn" style="margin-top:12px" onclick="savePayrollWeek('${wkKey}')">💾 Stoor week / Save week</button>
+    ${loanSummaryHtml}
+    <div class="divlbl" style="margin-top:12px">BAKKIES <span style="font-weight:400;color:var(--t3)">· tik om oop te maak</span></div>
+    <div id="pr-folders" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
   `;
+  const fc=document.getElementById('pr-folders');
+  groups.forEach(g=>{
+    const rowCount=(g.isDriver?1:0)+g.members.length;
+    const casualCount=(casualProgsByDriver[g.id]||[]).length;
+    const card=el('div');
+    card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:12px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;background:var(--card)';
+    card.onclick=()=>{ PAY_OPEN_GROUP=g.id; renderWagesInto(); };
+    card.innerHTML=`<div>
+        <div style="font-weight:700">${g.label}</div>
+        <div style="font-size:.78rem;color:var(--t2)">${rowCount} mense${casualCount>0?' · '+casualCount+' los werker'+(casualCount>1?'s':'')+' hierdie week':''}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <b>R${(groupNetto[g.id]||0).toFixed(0)}</b><span style="color:var(--t3)">›</span>
+      </div>`;
+    fc.appendChild(card);
+  });
 }
 
 // Recalculates Totaal/Netto live as fields are edited — no re-render, so
@@ -2418,7 +2555,8 @@ function refreshDeductionList(encKey){
 }
 
 async function savePayrollWeek(wkKey){
-  const data={};
+  const existing=await sGet('payroll_'+wkKey, {});
+  const data={...existing};
   document.querySelectorAll('#pr-body .pr-row').forEach(row=>{
     const name=decodeURIComponent(row.dataset.emp);
     const extraDeductions=PR_DEDUCTIONS[name]||[];
@@ -2693,6 +2831,7 @@ function renderRoute(ct){
       <div class="stat"><div class="v">${skipped}</div><div class="l">Geskip</div></div>
     </div>`;
   ct.appendChild(hdr);
+  renderQuoteVisitRequests(ct);
 
   // Backfill toggle — lets a driver fill in yesterday's list if they missed
   // it, or switch back to today. Deliberately limited to yesterday only,
@@ -2746,6 +2885,122 @@ function renderRoute(ct){
   edb.innerHTML='🏁 Dag Klaar / End Day — Genereer verslag';
   edb.onclick=()=>endDriverDay();
   ct.appendChild(edb);
+}
+
+// Quote site-visit requests assigned to this driver — sit at the top of
+// today's list, above the regular garden cards, so a driver deals with
+// them first. Deliberately has no price field: drivers report what they
+// saw and how long it'll take; only Bestuur turns that into a final price.
+function renderQuoteVisitRequests(ct){
+  if(S.workDate) return; // not relevant on a backfilled past day
+  const mine=getQuotes().filter(q=>q.status==='assigned' && q.assignedDriver===S.driver);
+  if(mine.length===0) return;
+  const lbl=el('div','divlbl');
+  lbl.style.marginTop='0';
+  lbl.innerHTML=`📍 KWOTASIE VERSOEKE (${mine.length}) <span style="font-weight:400;color:var(--t3)">· gaan kyk en vul in</span>`;
+  ct.appendChild(lbl);
+  mine.forEach(q=>{
+    const card=el('div','gc');
+    card.style.cssText='border:2px solid var(--blue);margin-bottom:8px';
+    card.innerHTML=`
+      <div class="gc-top" style="cursor:default">
+        <div class="gnum" style="background:var(--blue)">💬</div>
+        <div class="ginfo">
+          <div class="gaddr">${q.address}</div>
+          ${q.name?`<div class="gname">${q.name}</div>`:''}
+          ${q.requestNote?`<div class="notebox" style="margin-top:6px">📋 ${q.requestNote}</div>`:''}
+        </div>
+      </div>
+      <button class="btn btn-blue" style="width:100%;margin-top:8px" onclick="openQuoteVisitForm('${q.id}')">📝 Vul in / Fill in</button>`;
+    ct.appendChild(card);
+  });
+}
+function openQuoteVisitForm(qId){
+  document.getElementById('qvisit-modal')?.remove();
+  const q=getQuotes().find(x=>x.id===qId);
+  if(!q) return;
+  const bg=el('div','mbg'); bg.id='qvisit-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">📝 ${q.address}
+      <button class="mclose" onclick="document.getElementById('qvisit-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">Beskryf wat gedoen moet word en hoe lank dit sal vat — Bestuur bepaal die prys self.</p>
+    <div><div class="flbl" style="margin-bottom:5px">Werk benodig / Work needed *</div>
+      <textarea class="inp" id="qv-tasks" rows="3" style="resize:none" placeholder="bv. Gras sny, beddings skoonmaak…">${q.tasks||''}</textarea></div>
+    <div><div class="flbl" style="margin-bottom:5px">Beraamde tyd / Estimated time</div>
+      <div style="display:flex;gap:6px">
+        <input class="inp" id="qv-durhrs" type="number" min="0" placeholder="Ure" style="flex:1" value="${q.durationHrs||''}">
+        <input class="inp" id="qv-durmin" type="number" min="0" max="59" placeholder="Minute" style="flex:1" value="${q.durationMin||''}">
+      </div></div>
+    <div><div class="flbl" style="margin-bottom:5px">Ander notas / Other notes</div>
+      <textarea class="inp" id="qv-notes" rows="2" style="resize:none" placeholder="enigiets anders wat Bestuur moet weet…">${q.driverNotes||''}</textarea></div>
+    <button class="btn" onclick="submitQuoteVisit('${qId}')">✓ Stuur terug / Send back</button>
+    <button class="btn btn-sec" onclick="document.getElementById('qvisit-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+function submitQuoteVisit(qId){
+  const tasks=document.getElementById('qv-tasks').value.trim();
+  if(!tasks){ alert('Beskryf asb die werk wat benodig word'); return; }
+  const durationHrs=parseInt(document.getElementById('qv-durhrs').value)||0;
+  const durationMin=parseInt(document.getElementById('qv-durmin').value)||0;
+  const driverNotes=document.getElementById('qv-notes').value.trim();
+  const qs=getQuotes().map(q=>q.id===qId?{...q,tasks,durationHrs,durationMin,driverNotes,status:'pending',submittedAt:Date.now(),submittedBy:S.driver}:q);
+  saveQuotes(qs);
+  document.getElementById('qvisit-modal')?.remove();
+  toast('✓ Gestuur na Bestuur / Sent to Bestuur');
+  renderDriverTab('route');
+}
+
+// Pierre/Jan/Bestuur send a driver to go look at a potential client — the
+// driver reports back (above), and only Bestuur turns that into a priced
+// quote (see showQuoteForm's "Formaliseer" path in quoteCardHtml).
+function showQuoteRequestForm(){
+  document.getElementById('quote-req-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='quote-req-modal';
+  const driverOptions=Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,d])=>`<option value="${id}">${d.icon} ${d.name}</option>`).join('');
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">📍 Vra bestuurder om te gaan kyk
+      <button class="mclose" onclick="document.getElementById('quote-req-modal').remove()">✕</button>
+    </div>
+    <div><div class="flbl" style="margin-bottom:5px">Adres / Address *</div>
+      <input class="inp" id="qr-addr" placeholder="bv. Voortrekker 45, Velddrif"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Naam / Name</div>
+      <input class="inp" id="qr-name" placeholder="Kliënt naam"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Selfoon / Phone</div>
+      <input class="inp" id="qr-phone" placeholder="082 000 0000"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Stuur na bestuurder / Assign to driver *</div>
+      <select class="inp" id="qr-driver">${driverOptions}</select></div>
+    <div><div class="flbl" style="margin-bottom:5px">Notas vir bestuurder / Note for the driver</div>
+      <textarea class="inp" id="qr-note" rows="2" style="resize:none" placeholder="bv. Kliënt wil weet oor gras en heining"></textarea></div>
+    <button class="btn" onclick="submitQuoteRequest()">📍 Stuur versoek / Send request</button>
+    <button class="btn btn-sec" onclick="document.getElementById('quote-req-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+function submitQuoteRequest(){
+  const addr=document.getElementById('qr-addr').value.trim();
+  const driverId=document.getElementById('qr-driver').value;
+  if(!addr){ alert('Voer n adres in'); return; }
+  const q={
+    id:'Q-'+Date.now(),
+    address:addr,
+    name:document.getElementById('qr-name').value.trim(),
+    phone:document.getElementById('qr-phone').value.trim(),
+    assignedDriver:driverId,
+    requestNote:document.getElementById('qr-note').value.trim(),
+    quotedAmount:0, tasks:'', durationHrs:'', durationMin:'', frequency:'Weekliks',
+    status:'assigned',
+    createdBy: S.driver||(S.isOffice?'office':'bestuur'),
+    createdByName: S.driver?DRIVERS[S.driver].name:(S.isOffice?'Jan':'Bestuur'),
+    dateStr: new Date().toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'}),
+  };
+  const qs=getQuotes().slice(); qs.push(q); saveQuotes(qs);
+  document.getElementById('quote-req-modal')?.remove();
+  toast('📍 Versoek gestuur na '+DRIVERS[driverId].name);
+  if(S.screen==='parent') renderParentTab('quotes'); else renderDriverTab('quotes');
 }
 
 function makeGardenCard(g,idx){
@@ -2849,21 +3104,37 @@ function startGarden(id,e){
   refresh(); toast('▶ Gestart om '+t);
 }
 
+const _FINISHING_IDS=new Set();
 function finishGarden(id,e){
   if(e) e.stopPropagation();
+  // A fast double-tap (or a slow render on a laggy tablet) could fire this
+  // twice before the button UI updates to "Klaar" — each call would create
+  // its own invoice for the same job. This guard makes the second call a
+  // no-op regardless of timing.
+  if(_FINISHING_IDS.has(id)) return;
+  _FINISHING_IDS.add(id);
+  setTimeout(()=>_FINISHING_IDS.delete(id), 4000);
   const t=nowTime();
   upd(id,g=>{
     const dur=calcDur(g.timeIn,t);
-    const updated={...g,active:false,completed:true,timeOut:t,durationMin:dur};
-    // Auto-create invoice — keep its id on the garden so an undo can find
-    // and safely remove the exact right invoice, not guess by matching.
-    const inv=createInvoice(updated);
-    return {...updated,invoiced:true,invId:inv?inv.id:null};
+    return {...g,active:false,completed:true,timeOut:t,durationMin:dur,invoiced:true};
   });
   S.expanded=null;
   refresh();
   const g=S.route.find(r=>r.id===id);
   toast('✓ Klaar! '+( g?g.durationMin+' min':'')+'  · Faktuur gegenereer');
+  // Create the invoice asynchronously, against a freshly-fetched copy of
+  // the shared invoice list — not CACHE.invoices, which could be hours
+  // stale if this driver logged in at the start of the day and never got
+  // a live update since. Multiple drivers working at the same time were
+  // each saving from their own stale copy, and whoever saved last
+  // silently erased everyone else's invoices from earlier that day. This
+  // doesn't perfectly eliminate the race (two saves in the same instant
+  // could still collide), but shrinks the window from "hours" to
+  // "a fraction of a second," which is the realistic, safe fix here.
+  if(g) createInvoice(g).then(inv=>{
+    if(inv) upd(id, gg=>({...gg, invId:inv.id}));
+  });
 }
 
 // Lets a driver undo an accidental tap — Begin just reverts the start time;
@@ -2938,39 +3209,60 @@ function calcDur(a,b){
 }
 
 // ══════════════════ INVOICE CREATION ══════════════════════════════════════════
-function createInvoice(garden){
-  const invs=getInvoices();
-  const now=S.workDate ? new Date(S.workDate+'T12:00:00') : new Date();
+async function createInvoice(garden, overrideDriverId, overrideDateKey){
+  const useDriverId=overrideDriverId||S.driver;
+  const useDateKey=overrideDateKey||S.workDate;
+  const now=useDateKey ? new Date(useDateKey+'T12:00:00') : new Date();
   const dateStr=now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  const dateKey=S.workDate || now.toISOString().split('T')[0];
-  const driver=DRIVERS[S.driver];
+  const dateKey=useDateKey || now.toISOString().split('T')[0];
+  const driver=DRIVERS[useDriverId];
   const amount=(garden.cost||0)+(parseFloat(garden.extraWorkAmount)||0);
   const cashPaid=garden.cash&&garden.cashAmount;
-  const inv={
-    id:nextInvNum(),
-    date:dateStr, dateKey,
-    pastelCode:garden.pastelCode||'',
-    address:garden.address,
-    name:garden.name||'',
-    amount:amount,
-    extraWork:garden.extraWork||'',
-    extraWorkAmount:parseFloat(garden.extraWorkAmount)||0,
-    baseAmount:garden.cost||0,
-    cashPaid:cashPaid?parseFloat(garden.cashAmount):0,
-    durationMin:garden.durationMin||0,
-    timeIn:garden.timeIn,
-    timeOut:garden.timeOut,
-    driver:driver.name,
-    driverId:S.driver,
-    isOnceOff:!!garden.isOnceOff,
-    status:'pending',  // pending | sent
-    services:[
-      garden.gif?'Gif':'',garden.sny?'Sny':'',
-      garden.inspeksie?'Inspeksie':'',garden.bet?'Bet':''
-    ].filter(Boolean).join(', ')||'Tuinonderhoud',
-  };
-  invs.push(inv);
-  saveInvoices(invs);
+
+  // A real Firestore transaction — not just "fetch fresh, then save".
+  // Fetching fresh narrows the window where two drivers could collide, but
+  // doesn't close it: if both devices fetch before either has saved, both
+  // still race to write, and the later one wins, erasing the earlier
+  // invoice. A transaction is different — Firestore itself detects the
+  // conflict and automatically retries the whole read+write as a single
+  // atomic unit, so this is what actually guarantees nothing gets lost,
+  // confirmed by testing two drivers finishing a job in the same instant.
+  const inv=await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    const seqDoc=await transaction.get(FS_KV.doc('inv_seq'));
+    const invDoc=await transaction.get(FS_KV.doc('invoices'));
+    const n=(seqDoc.exists?JSON.parse(seqDoc.data().value):1000)||1000;
+    const invoices=invDoc.exists?JSON.parse(invDoc.data().value):[];
+    const newInv={
+      id:'DNT-'+String(n+1),
+      date:dateStr, dateKey,
+      pastelCode:garden.pastelCode||'',
+      address:garden.address,
+      name:garden.name||'',
+      amount:amount,
+      extraWork:garden.extraWork||'',
+      extraWorkAmount:parseFloat(garden.extraWorkAmount)||0,
+      baseAmount:garden.cost||0,
+      cashPaid:cashPaid?parseFloat(garden.cashAmount):0,
+      durationMin:garden.durationMin||0,
+      timeIn:garden.timeIn,
+      timeOut:garden.timeOut,
+      driver:driver.name,
+      driverId:useDriverId,
+      isOnceOff:!!garden.isOnceOff,
+      status:'pending',  // pending | sent
+      services:[
+        garden.gif?'Gif':'',garden.sny?'Sny':'',
+        garden.inspeksie?'Inspeksie':'',garden.bet?'Bet':''
+      ].filter(Boolean).join(', ')||'Tuinonderhoud',
+    };
+    invoices.push(newInv);
+    transaction.set(FS_KV.doc('inv_seq'), {value: JSON.stringify(n+1)});
+    transaction.set(FS_KV.doc('invoices'), {value: JSON.stringify(invoices)});
+    return newInv;
+  }), 8000, 'createInvoice-transaction');
+
+  CACHE.invSeq=(CACHE.invSeq||1000)+1;
+  const invs=getInvoices().slice(); invs.push(inv); CACHE.invoices=invs;
   // Update client ledger
   addLedgerEntry(inv);
   return inv;
@@ -3016,7 +3308,7 @@ function addPayment(clientKey,amount,date,method,driverId){
 }
 
 // ══════════════════ WORKERS TAB ════════════════════════════════════════════════
-function renderWorkers(ct){
+async function renderWorkers(ct){
   const d=DRIVERS[S.driver];
   const km=S.vehicle;
   const kmNum=(km.kmStart&&km.kmEnd)?(parseFloat(km.kmEnd)-parseFloat(km.kmStart)):null;
@@ -3073,8 +3365,9 @@ function renderWorkers(ct){
   }
 
   const wc=el('div','vcard');
-  const casualNames=Object.keys(S.workers).filter(n=>S.workers[n]?.casual&&!(d.workers||[]).includes(n)&&n!==d.name);
-  const allNames=[d.name, ...(d.workers||[]), ...casualNames];
+  const roster=getRoster(S.driver);
+  const casualNames=Object.keys(S.workers).filter(n=>S.workers[n]?.casual&&!roster.includes(n)&&n!==d.name);
+  const allNames=[d.name, ...roster, ...casualNames];
   const total=Object.values(S.workers).reduce((s,w)=>s+(parseFloat(w.loan)||0),0);
   wc.innerHTML=`<div class="vtitle">👷 Werkers / Workers</div>
     ${allNames.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:6px 0">Geen werkers bygevoeg vir vandag nie.</p>':''}
@@ -3102,6 +3395,154 @@ function renderWorkers(ct){
         R${total.toFixed(2)}</span>
     </div>`;
   ct.appendChild(wc);
+
+  // Every driver (except Pierre, who has no bakkie of his own) can manage
+  // their OWN permanent team here — this edits the shared roster, so it's
+  // visible to Pierre and Bestuur too, not just today's list.
+  if(S.driver!=='pierre'){
+    const rc=el('div','vcard');
+    rc.innerHTML=`<div class="vtitle">📌 My permanente span</div>
+      <p style="font-size:.78rem;color:var(--t2);margin:0 0 8px">Werkers hier bly permanent op jou bakkie totdat jy hulle verwyder — anders as 'n los werker vandag.</p>
+      ${roster.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:2px 0">Geen permanente werkers nie.</p>':
+        roster.map(w=>`<div class="wrow" style="grid-template-columns:1fr auto">
+          <div class="wname">${w}</div>
+          <button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="driverRemovePermanentWorker('${w}')">✕ Verwyder permanent</button>
+        </div>`).join('')}
+      <div style="display:flex;gap:8px;padding-top:8px">
+        <input class="inp" id="perm-name-in" placeholder="Naam vir permanente span…" style="padding:9px 10px">
+        <button class="btn" style="flex-shrink:0;padding:9px 14px" onclick="driverAddPermanentWorker()">＋ Voeg permanent by</button>
+      </div>`;
+    ct.appendChild(rc);
+  }
+
+  // Pierre alone manages every bakkie's team — move workers between drivers
+  // or add casuals to any of them, permanent or just for today.
+  if(S.driver==='pierre'){
+    await renderPierreTeamAdmin(ct);
+  }
+}
+
+async function renderPierreTeamAdmin(ct){
+  const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
+  const mc=el('div','vcard');
+  mc.innerHTML=`<div class="vtitle">👷 Alle Spanne — Bestuur</div>
+    <p style="font-size:.78rem;color:var(--t2);margin:0 0 10px">Skuif werkers tussen bakkies of voeg los werkers by. Kies "Permanent" om dit blywend te maak, of "Net vandag" vir 'n tydelike skuif.</p>
+    ${Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,dd])=>{
+      const roster=getRoster(id);
+      const b=moves[id]||{addedPermanent:[],addedTemp:[],removed:[]};
+      const activeList=[...roster.filter(n=>!b.removed.includes(n)), ...b.addedTemp.filter(n=>!b.removed.includes(n))];
+      return `<div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px">
+        <div style="font-weight:700;display:flex;align-items:center;gap:6px;margin-bottom:4px"><span>${dd.icon}</span> ${dd.name}</div>
+        ${activeList.length===0?'<p style="color:var(--t2);font-size:.8rem;margin:4px 0">Geen werkers nie.</p>':
+          activeList.map(n=>{
+            const isTemp=b.addedTemp.includes(n);
+            return `<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
+              <span style="flex:1">${n}${isTemp?' <span style="color:var(--ora);font-size:.68rem">(net vandag)</span>':''}</span>
+              <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem" onclick="pierreStartMove('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
+              <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveWorker('${n.replace(/'/g,"\\'")}','${id}',${isTemp})">✕</button>
+            </div>`;
+          }).join('')}
+      </div>`;
+    }).join('')}
+    <input type="hidden" id="pierre-worker-source" value="">
+    <p id="pierre-move-note" style="font-size:.76rem;color:var(--blue);display:none;margin:0 0 6px"></p>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-top:6px;border-top:1px solid var(--brd);padding-top:10px">
+      <input class="inp" id="pierre-worker-name" placeholder="Naam van werker…">
+      <div style="display:flex;gap:6px">
+        <select class="inp" id="pierre-worker-driver" style="flex:1">
+          ${Object.entries(DRIVERS).filter(([id])=>id!=='pierre').map(([id,dd])=>`<option value="${id}">${dd.name}</option>`).join('')}
+        </select>
+        <select class="inp" id="pierre-worker-type" style="flex:1">
+          <option value="permanent">Permanent</option>
+          <option value="temp">Net vandag</option>
+        </select>
+      </div>
+      <button class="btn" onclick="pierreAddWorker()">＋ Voeg by / Skuif</button>
+    </div>`;
+  ct.appendChild(mc);
+}
+
+function pierreStartMove(name, fromDriverId){
+  document.getElementById('pierre-worker-name').value=name;
+  document.getElementById('pierre-worker-source').value=fromDriverId;
+  const note=document.getElementById('pierre-move-note');
+  note.style.display='block';
+  note.textContent=`Skuif "${name}" van ${DRIVERS[fromDriverId].name} — kies die nuwe bakkie en of dit permanent of net vandag is, dan tik "Voeg by / Skuif".`;
+  document.getElementById('pierre-worker-name').scrollIntoView({behavior:'smooth',block:'center'});
+}
+
+async function pierreAddWorker(){
+  const name=document.getElementById('pierre-worker-name').value.trim();
+  const target=document.getElementById('pierre-worker-driver').value;
+  const type=document.getElementById('pierre-worker-type').value;
+  const source=document.getElementById('pierre-worker-source').value;
+  if(!name){ toast('Voer n naam in'); return; }
+
+  const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
+  const tb=_moveBucket(moves,target);
+
+  if(type==='permanent'){
+    if(!CACHE.workerRoster[target]) CACHE.workerRoster[target]=[];
+    if(!CACHE.workerRoster[target].includes(name)) CACHE.workerRoster[target].push(name);
+    if(source && source!==target && CACHE.workerRoster[source]){
+      CACHE.workerRoster[source]=CACHE.workerRoster[source].filter(n=>n!==name);
+    }
+    await saveRoster();
+    if(!tb.addedPermanent.includes(name)) tb.addedPermanent.push(name);
+  } else {
+    if(!tb.addedTemp.includes(name)) tb.addedTemp.push(name);
+  }
+  if(source && source!==target){
+    const sb=_moveBucket(moves,source);
+    if(!sb.removed.includes(name)) sb.removed.push(name);
+    sb.addedTemp=sb.addedTemp.filter(n=>n!==name);
+  }
+  await saveWorkerMovesForDate(todayKey(), moves);
+
+  document.getElementById('pierre-worker-name').value='';
+  document.getElementById('pierre-worker-source').value='';
+  document.getElementById('pierre-move-note').style.display='none';
+  toast('✓ '+name+' bygewerk');
+  renderDriverTab('workers');
+}
+
+async function pierreRemoveWorker(name, driverId, isTemp){
+  const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
+  const b=_moveBucket(moves,driverId);
+  if(isTemp){
+    b.addedTemp=b.addedTemp.filter(n=>n!==name);
+  } else {
+    if(CACHE.workerRoster[driverId]) CACHE.workerRoster[driverId]=CACHE.workerRoster[driverId].filter(n=>n!==name);
+    await saveRoster();
+    if(!b.removed.includes(name)) b.removed.push(name);
+  }
+  await saveWorkerMovesForDate(todayKey(), moves);
+  toast('✓ '+name+' verwyder');
+  renderDriverTab('workers');
+}
+
+async function driverAddPermanentWorker(){
+  const inp=document.getElementById('perm-name-in');
+  const name=inp.value.trim();
+  if(!name){ inp.focus(); return; }
+  const id=S.driver;
+  if(!CACHE.workerRoster[id]) CACHE.workerRoster[id]=[];
+  if(!CACHE.workerRoster[id].includes(name)) CACHE.workerRoster[id].push(name);
+  await saveRoster();
+  if(!S.workers[name]) S.workers[name]={present:true,loan:''};
+  saveProgress();
+  toast('✓ '+name+' by jou permanente span gevoeg');
+  renderDriverTab('workers');
+}
+async function driverRemovePermanentWorker(name){
+  const id=S.driver;
+  if(!confirm('Verwyder "'+name+'" permanent van jou span?')) return;
+  if(CACHE.workerRoster[id]) CACHE.workerRoster[id]=CACHE.workerRoster[id].filter(n=>n!==name);
+  await saveRoster();
+  delete S.workers[name];
+  saveProgress();
+  toast('✓ '+name+' permanent verwyder');
+  renderDriverTab('workers');
 }
 
 function addCasualWorker(){
@@ -3214,7 +3655,7 @@ async function renderParentTab(tab){
 }
 
 // ══════════════════ PARENT: OVERVIEW ══════════════════════════════════════════
-function renderOverview(ct){
+async function renderOverview(ct){
   const now=new Date();
   const dayEn=now.toLocaleDateString('en-US',{weekday:'long'});
   const weekN=getWeekNum(now);
@@ -3254,14 +3695,17 @@ function renderOverview(ct){
         <div class="dsi">
           <h3>${d.name}</h3>
           <p>${started? doneToday+' / '+totalToday+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalToday+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
-          <div class="dsprog"><div class="dspf" style="background:${d.color};width:${pct}%"></div></div>
+          <div class="dsprog">
+            <div class="dspf" style="background:${d.color};width:${totalToday>0?Math.round(100*doneToday/totalToday):0}%"></div>
+            <div class="dspf" style="background:var(--ora);width:${totalToday>0?Math.round(100*skippedToday/totalToday):0}%"></div>
+          </div>
         </div>
       </div>`;
     }).join('')}
     <button class="btn btn-blue" onclick="showOnceOff()">
       ＋ Voeg eenmalige werk by / Add Once-Off
     </button>`;
-  populateDayReports();
+  await populateDayReports();
 }
 
 // Scans the last 3 days across every driver for a "day ended" flag, so
@@ -3334,7 +3778,10 @@ function renderOfficeOverview(ct,now,dayEn,week){
       <div class="dsi">
         <h3>${d.name}</h3>
         <p>${started? doneToday+' / '+totalCount+' tuine klaar'+(skippedToday>0?' ('+skippedToday+' geskip)':'') : (totalCount+' tuine vandag · nog nie begin nie')}${d.vehicle?' · '+d.vehicle:''}</p>
-        <div class="dsprog"><div class="dspf" style="background:${d.color};width:${pct}%"></div></div>
+        <div class="dsprog">
+          <div class="dspf" style="background:${d.color};width:${totalCount>0?Math.round(100*doneToday/totalCount):0}%"></div>
+          <div class="dspf" style="background:var(--ora);width:${totalCount>0?Math.round(100*skippedToday/totalCount):0}%"></div>
+        </div>
         <p style="font-weight:800;font-size:1.05rem;color:${d.color};margin-top:4px">R${total.toFixed(0)}</p>
       </div>
     </div>`;
@@ -3353,6 +3800,88 @@ function renderOfficeOverview(ct,now,dayEn,week){
 }
 
 // ══════════════════ PARENT: INVOICES ══════════════════════════════════════════
+// Recovers invoices lost to the race-condition bug (fixed in v68) by
+// reading back from each driver's own daily progress record — which is
+// stored separately per driver, so it was never at risk from the shared-
+// list overwrite that wiped the invoices themselves. Matches by content
+// (driver + address + date + amount) rather than the invoice id stored on
+// the garden, since that id may itself point at an invoice that no longer
+// exists.
+function showRecoverInvoices(){
+  document.getElementById('recover-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='recover-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">🔧 Herstel ontbrekende fakture
+      <button class="mclose" onclick="document.getElementById('recover-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Kyk deur elke bestuurder se eie dagrekord vir tuine wat afgemerk is as klaar, maar waarvoor geen faktuur meer bestaan nie — en maak dit weer aan.
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Datum</div>
+      <input class="inp" id="recover-date" type="date" value="${todayKey()}"></div>
+    <button class="btn" onclick="scanForMissingInvoices()">🔍 Deursoek / Scan</button>
+    <div id="recover-results"></div>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+
+async function scanForMissingInvoices(){
+  const dateKey=document.getElementById('recover-date').value;
+  if(!dateKey){ alert('Kies n datum'); return; }
+  const results=document.getElementById('recover-results');
+  results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Deursoek…</p>';
+
+  const currentInvs=getInvoices();
+  const missingByDriver={};
+  let totalMissing=0, totalValue=0;
+
+  for(const driverId of Object.keys(DRIVERS)){
+    const prog=await sGet('progress_'+driverId+'_'+dateKey, null);
+    if(!prog||!prog.route) continue;
+    const completed=prog.route.filter(g=>g.completed);
+    const missing=completed.filter(g=>{
+      const amount=(g.cost||0)+(parseFloat(g.extraWorkAmount)||0);
+      return !currentInvs.some(i=>i.driverId===driverId && i.dateKey===dateKey &&
+        i.address===g.address && Math.abs(i.amount-amount)<0.01);
+    });
+    if(missing.length){
+      missingByDriver[driverId]=missing;
+      totalMissing+=missing.length;
+      totalValue+=missing.reduce((s,g)=>s+(g.cost||0)+(parseFloat(g.extraWorkAmount)||0),0);
+    }
+  }
+
+  if(totalMissing===0){
+    results.innerHTML='<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ Geen ontbrekende fakture gevind vir hierdie datum nie.</p>';
+    return;
+  }
+
+  results.innerHTML=`
+    <div style="background:#FFF3CD;border:1px solid #FFE082;border-radius:10px;padding:12px;margin:10px 0">
+      <div style="font-weight:800;font-size:1.05rem">${totalMissing} faktu(u)r(e) ontbreek — R${totalValue.toFixed(2)}</div>
+      ${Object.entries(missingByDriver).map(([id,items])=>
+        `<div style="font-size:.82rem;margin-top:4px">${DRIVERS[id].icon} ${DRIVERS[id].name}: ${items.length} faktu(u)r(e)</div>`
+      ).join('')}
+    </div>
+    <button class="btn" style="background:var(--g8)" onclick='recoverInvoices(${JSON.stringify(dateKey)}, ${JSON.stringify(missingByDriver)})'>✓ Herstel al ${totalMissing} nou / Recover all ${totalMissing} now</button>
+  `;
+}
+
+async function recoverInvoices(dateKey, missingByDriver){
+  const results=document.getElementById('recover-results');
+  results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Herstel besig…</p>';
+  let recovered=0, failed=0;
+  for(const [driverId, gardens] of Object.entries(missingByDriver)){
+    for(const g of gardens){
+      try{ await createInvoice(g, driverId, dateKey); recovered++; }
+      catch(e){ failed++; console.error('Kon nie faktuur herstel nie:', g.address, e); }
+    }
+  }
+  results.innerHTML=`<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${recovered} faktu(u)r(e) herstel${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
+  toast(`✓ ${recovered} faktuur/fakture herstel`);
+}
+
 function renderInvoices(ct){
   const invs=getInvoices().slice().reverse(); // newest first
   const pending=invs.filter(i=>i.status==='pending');
@@ -3363,6 +3892,12 @@ function renderInvoices(ct){
   cnBtn.innerHTML='🧾 Krediet Nota / Credit Note';
   cnBtn.onclick=showCreditNoteLookup;
   ct.appendChild(cnBtn);
+
+  const recBtn=el('button','btn-sec btn');
+  recBtn.style.cssText='margin-bottom:10px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
+  recBtn.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
+  recBtn.onclick=showRecoverInvoices;
+  ct.appendChild(recBtn);
 
   if(invs.length===0){
     const empty=el('div','empty');
@@ -4052,7 +4587,7 @@ function drawHistory(ct){
             <div style="font-size:.78rem;color:var(--t2)">
               ${g.completed?`✓ Klaar · ${g.timeIn||'–'}→${g.timeOut||'–'} · ${g.durationMin||0}min`:
                 g.skipReason?`⚠️ Geskip: ${g.skipReason}`:'Nie gedoen nie'}
-              ${g.completed?` <button onclick="showEditTimeModal('${g.id}')" style="background:none;border:none;color:var(--g8);font-weight:700;cursor:pointer;padding:0;margin-left:4px">✏️ Wysig tyd</button>`:''}
+              ${g.completed?` <button onclick="showEditTimeModal('${g.id}')" style="background:none;border:none;color:var(--g8);font-weight:700;cursor:pointer;padding:0;margin-left:4px">✏️ Wysig</button>`:''}
             </div>
             ${g.driverNotes?`<div style="font-size:.78rem;color:var(--t2);margin-top:2px">📝 ${g.driverNotes}</div>`:''}
           </div>
@@ -4064,23 +4599,32 @@ function drawHistory(ct){
   document.getElementById('hist-date').onchange=e=>histSetDate(e.target.value);
 }
 
-// Manager-only manual time correction — drivers can't edit this, only Bestuur
-// reviewing History. Recomputes duration from the new times automatically.
+// Manager-only manual correction — drivers can't edit this, only Bestuur
+// reviewing History. Covers the common "fix a mistake after the fact"
+// cases: wrong time, wrong amount, or a duplicate/wrong invoice that needs
+// deleting. Amount changes are kept in sync with the linked invoice and
+// the client's ledger balance, not just the route record, so the History
+// view, the invoice, and the client statement never disagree with each other.
 function showEditTimeModal(gardenId){
   const g=(HIST.data?.route||[]).find(x=>x.id===gardenId);
   if(!g) return;
   document.getElementById('edit-time-modal')?.remove();
   const bg=el('div','mbg'); bg.id='edit-time-modal';
   bg.innerHTML=`<div class="modal">
-    <div class="mhdr">✏️ Wysig tyd — ${g.address}
+    <div class="mhdr">✏️ Wysig — ${g.address}
       <button class="mclose" onclick="document.getElementById('edit-time-modal').remove()">✕</button>
     </div>
-    <p style="font-size:.78rem;color:var(--t2);margin:-4px 0 8px">Slegs Bestuur kan tye handmatig wysig — bestuurders kan nie.</p>
+    <p style="font-size:.78rem;color:var(--t2);margin:-4px 0 8px">Slegs Bestuur kan hierdie wysig — bestuurders kan nie. Wysigings aan bedrag word ook op die faktuur en kliënt-rekening toegepas.</p>
     <div><div class="flbl" style="margin-bottom:5px">Tyd in / Time in</div>
       <input class="inp" id="et-in" type="time" value="${g.timeIn||''}"></div>
     <div><div class="flbl" style="margin-bottom:5px">Tyd uit / Time out</div>
       <input class="inp" id="et-out" type="time" value="${g.timeOut||''}"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Basiese bedrag / Base amount (R)</div>
+      <input class="inp" id="et-cost" type="number" value="${g.cost||0}"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Ekstra werk bedrag / Extra work amount (R)</div>
+      <input class="inp" id="et-extra" type="number" value="${g.extraWorkAmount||0}"></div>
     <button class="btn" onclick="submitEditTime('${gardenId}')">Stoor / Save</button>
+    ${g.invId?`<button class="btn btn-sec" style="color:var(--red)" onclick="historyDeleteInvoice('${gardenId}')">🗑️ Skrap faktuur / Delete invoice</button>`:''}
     <button class="btn btn-sec" onclick="document.getElementById('edit-time-modal').remove()">Kanselleer</button>
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
@@ -4098,9 +4642,64 @@ async function submitEditTime(gardenId){
   let mins=(h2*60+m2)-(h1*60+m1);
   if(mins<0) mins+=24*60; // crossed midnight edge case
   g.durationMin=mins;
+
+  const newCost=parseFloat(document.getElementById('et-cost').value)||0;
+  const newExtra=parseFloat(document.getElementById('et-extra').value)||0;
+  const amountChanged = newCost!==(g.cost||0) || newExtra!==(parseFloat(g.extraWorkAmount)||0);
+  g.cost=newCost; g.extraWorkAmount=newExtra;
+
+  if(amountChanged && g.invId){
+    const invs=getInvoices();
+    const inv=invs.find(i=>i.id===g.invId);
+    if(inv){
+      const oldAmount=inv.amount||0;
+      inv.baseAmount=newCost; inv.extraWorkAmount=newExtra; inv.amount=newCost+newExtra;
+      inv.timeIn=timeIn; inv.timeOut=timeOut; inv.durationMin=mins;
+      saveInvoices(invs);
+      const delta=inv.amount-oldAmount;
+      const led=getLedger();
+      const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
+      if(key){
+        const entry=(led[key].entries||[]).find(e2=>e2.invId===inv.id);
+        if(entry) entry.debit=inv.amount;
+        led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
+        saveLedger(led);
+      }
+    }
+  }
+
   await sSet('progress_'+HIST.driverId+'_'+HIST.date, HIST.data);
   document.getElementById('edit-time-modal')?.remove();
-  toast('✓ Tyd opgedateer');
+  toast('✓ Opgedateer');
+  drawHistory(document.getElementById('p-content'));
+}
+
+async function historyDeleteInvoice(gardenId){
+  const g=(HIST.data?.route||[]).find(x=>x.id===gardenId);
+  if(!g || !g.invId) return;
+  if(!confirm('Skrap hierdie faktuur? Dit sal ook van die kliënt se rekening verwyder word.')) return;
+  const invs=getInvoices();
+  const inv=invs.find(i=>i.id===g.invId);
+  if(inv){
+    if(inv.status==='sent'){
+      alert('Hierdie faktuur is reeds gestuur — kan nie sommer geskrap word nie. Gebruik eerder \'n Krediet Nota.\n\nThis invoice has already been sent — use a Credit Note instead.');
+      return;
+    }
+    const idx=invs.indexOf(inv);
+    invs.splice(idx,1);
+    saveInvoices(invs);
+    const led=getLedger();
+    const key=Object.keys(led).find(k=>invoiceMatchesClient(inv, led[k]));
+    if(key){
+      led[key].entries=(led[key].entries||[]).filter(e2=>e2.invId!==inv.id);
+      led[key].balance=(led[key].entries||[]).reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
+      saveLedger(led);
+    }
+  }
+  g.completed=false; g.timeOut=''; g.durationMin=0; g.invoiced=false; g.invId=null;
+  await sSet('progress_'+HIST.driverId+'_'+HIST.date, HIST.data);
+  document.getElementById('edit-time-modal')?.remove();
+  toast('🗑️ Faktuur geskrap');
   drawHistory(document.getElementById('p-content'));
 }
 
@@ -5108,6 +5707,7 @@ async function schedPatchLiveIfToday(driverId,week,day,schedId,newItem,mode){
 function quoteStatusBadge(q){
   if(q.status==='accepted') return `<span class="badge" style="background:var(--g1);color:var(--g8)">✓ Aanvaar</span>`;
   if(q.status==='declined') return `<span class="badge" style="background:var(--brd);color:var(--t2)">✕ Verwerp</span>`;
+  if(q.status==='assigned') return `<span class="badge" style="background:var(--bluep);color:var(--blue)">📍 Wag vir besoek</span>`;
   return `<span class="badge" style="background:var(--goldp);color:#795548">⏳ Wag</span>`;
 }
 function buildQuotePDF(q){
@@ -5158,50 +5758,63 @@ async function shareQuotePDF(id){
     `Kwotasie – ${q.address}`, `Kwotasie bedrag: R${(q.quotedAmount||0).toFixed(2)}`);
   toast('📄 Kwotasie PDF gereed');
 }
-function quoteCardHtml(q,isParent){
+function quoteCardHtml(q,canFinalize,hidePrice){
   const durTxt = (q.durationHrs||q.durationMin) ?
     `${q.durationHrs?q.durationHrs+'u ':''}${q.durationMin?q.durationMin+'min':''}`.trim() : '';
+  const priceKnown = q.status!=='assigned' && (q.quotedAmount||0)>0;
   return `<div class="gc" style="padding:12px 14px;${q.status==='declined'?'opacity:.6':''}">
     <div style="display:flex;justify-content:space-between;gap:8px;align-items:start">
       <div style="min-width:0">
         <div style="font-weight:700">${q.address}</div>
         ${q.name?`<div style="font-size:.82rem;color:var(--t2)">${q.name}</div>`:''}
         ${q.phone?`<div style="font-size:.78rem;color:var(--t2)">📞 ${q.phone}</div>`:''}
+        ${q.requestNote?`<div style="font-size:.8rem;color:var(--blue);margin-top:4px">📍 ${q.requestNote}</div>`:''}
         ${q.tasks?`<div style="font-size:.8rem;margin-top:4px">${q.tasks}</div>`:''}
         ${durTxt?`<div style="font-size:.78rem;color:var(--t2);margin-top:2px">⏱ Beraamde tyd: ${durTxt}</div>`:''}
-        <div style="font-size:.72rem;color:var(--t3);margin-top:4px">Deur ${q.createdByName} · ${q.dateStr}</div>
+        ${q.driverNotes?`<div style="font-size:.78rem;color:var(--t2);margin-top:2px">📝 ${q.driverNotes}</div>`:''}
+        <div style="font-size:.72rem;color:var(--t3);margin-top:4px">Deur ${q.createdByName} · ${q.dateStr}${q.assignedDriver?' · Toegewys aan '+DRIVERS[q.assignedDriver].name:''}</div>
       </div>
       <div style="text-align:right;flex-shrink:0">
-        <div style="font-weight:800;font-size:1.05rem">R${q.quotedAmount||0}</div>
+        ${!hidePrice?(priceKnown?`<div style="font-weight:800;font-size:1.05rem">R${q.quotedAmount||0}</div>`:`<div style="font-size:.72rem;color:var(--t3)">Nog nie geprys nie</div>`):''}
         <div style="margin-top:4px">${quoteStatusBadge(q)}</div>
       </div>
     </div>
-    <div style="display:flex;gap:8px;margin-top:10px">
+    ${priceKnown&&!hidePrice?`<div style="display:flex;gap:8px;margin-top:10px">
       <button class="btn-sec btn" style="flex:1;padding:8px;font-size:.8rem" onclick="shareQuotePDF('${q.id}')">📄 Stuur Kwotasie (PDF)</button>
-      ${isParent?`<button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig</button>`:''}
-    </div>
-    ${isParent&&q.status==='pending'?`<div style="display:flex;gap:8px;margin-top:8px">
-      <button class="btn btn-blue" style="flex:1;padding:9px;font-size:.85rem;white-space:nowrap" onclick="openClientForm({fromQuote:'${q.id}'})">✓ Aanvaar</button>
+      ${canFinalize?`<button class="btn-sec btn" style="padding:8px 12px;font-size:.8rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig</button>`:''}
+    </div>`:''}
+    ${canFinalize&&(q.status==='pending')?`<div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn btn-blue" style="flex:1;padding:9px;font-size:.85rem;white-space:nowrap" onclick="showQuoteForm('${q.id}')">${priceKnown?'✏️ Wysig prys':'💰 Formaliseer prys'}</button>
       <button class="btn btn-sec" style="padding:9px 14px" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
+    </div>`:''}
+    ${canFinalize&&priceKnown&&q.status==='pending'?`<div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn btn-blue" style="flex:1;padding:9px;font-size:.85rem;white-space:nowrap" onclick="openClientForm({fromQuote:'${q.id}'})">✓ Aanvaar</button>
     </div>`:''}
   </div>`;
 }
 function renderQuotesDriver(ct){
-  const mine=getQuotes().filter(q=>q.createdBy===S.driver);
+  const mine=getQuotes().filter(q=>q.createdBy===S.driver || q.assignedDriver===S.driver);
   ct.innerHTML=`
     <button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>
+    ${S.driver==='pierre'?'<button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Vra bestuurder om te gaan kyk</button>':''}
     ${mine.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:30px 0">Geen kwotasies opgeneem nie.</p>':
-      mine.map(q=>quoteCardHtml(q,false)).join('')}`;
+      mine.map(q=>quoteCardHtml(q,false,q.createdBy!==S.driver)).join('')}`;
 }
 function renderQuotesParent(ct){
   const all=getQuotes();
+  const assigned=all.filter(q=>q.status==='assigned');
   const pending=all.filter(q=>q.status==='pending');
-  const rest=all.filter(q=>q.status!=='pending');
+  const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned');
+  const canFinalize=!S.isOffice; // only Bestuur decides/prices — Jan reviews only
+  const hidePrice=!!S.isOffice;  // Jan never sees quote pricing, only daily totals elsewhere
   ct.innerHTML=`
-    <button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>
+    ${canFinalize?'<button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>':''}
+    <button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Vra bestuurder om te gaan kyk</button>
+    <div class="divlbl">WAG VIR BESOEK (${assigned.length}) <span style="font-weight:400;color:var(--t3)">· bestuurder moet nog gaan kyk</span></div>
+    ${assigned.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen versoeke wat wag nie.</p>':assigned.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
     <div class="divlbl">WAG OP BESLUIT (${pending.length})</div>
-    ${pending.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen kwotasies wat wag nie.</p>':pending.map(q=>quoteCardHtml(q,true)).join('')}
-    ${rest.length?`<div class="divlbl">VERLEDE</div>${rest.map(q=>quoteCardHtml(q,true)).join('')}`:''}`;
+    ${pending.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen kwotasies wat wag nie.</p>':pending.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
+    ${rest.length?`<div class="divlbl">VERLEDE</div>${rest.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}`:''}`;
 }
 
 function showQuoteForm(editId){
