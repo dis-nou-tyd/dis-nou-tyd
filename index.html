@@ -916,10 +916,10 @@ async function hydrateCache(){
     ensureCollectionMigrated('quotes', 'quotes', false),
     ensureCollectionMigrated('credit_notes', 'credit_notes', false),
   ]);
-  const [invoices, ledger, invSeq, quotes, expenses, bankTxns, creditNotes] = await Promise.all([
-    collGetAllCritical('invoices'), collGetAllKeyedCritical('ledger'), sGet('inv_seq', 1000), collGetAllCritical('quotes'), sGet('expenses', []), sGet('bank_txns', []), collGetAllCritical('credit_notes'),
+  const [invoices, ledger, invSeq, quotes, expenses, bankTxns, creditNotes, kleinkas] = await Promise.all([
+    collGetAllCritical('invoices'), collGetAllKeyedCritical('ledger'), sGet('inv_seq', 1000), collGetAllCritical('quotes'), sGet('expenses', []), sGet('bank_txns', []), collGetAllCritical('credit_notes'), sGet('kleinkas', []),
   ]);
-  CACHE.invoices=invoices||[]; CACHE.ledger=ledger||{}; CACHE.invSeq=invSeq; CACHE.quotes=quotes||[]; CACHE.expenses=expenses; CACHE.bankTxns=bankTxns; CACHE.creditNotes=creditNotes||[]; CACHE.ready=true;
+  CACHE.invoices=invoices||[]; CACHE.ledger=ledger||{}; CACHE.invSeq=invSeq; CACHE.quotes=quotes||[]; CACHE.expenses=expenses; CACHE.bankTxns=bankTxns; CACHE.creditNotes=creditNotes||[]; CACHE.kleinkas=kleinkas||[]; CACHE.ready=true;
 }
 
 async function loadProgress(dId, dateKey){
@@ -960,6 +960,13 @@ function saveQuotes(qs){ CACHE.quotes=qs; sSet('quotes', qs); }
 
 function getExpenses(){ return CACHE.expenses; }
 function saveExpenses(list){ CACHE.expenses=list; sSet('expenses', list); }
+function getKleinkas(){ return CACHE.kleinkas||[]; }
+async function saveKleinkas(list){
+  CACHE.kleinkas=list;
+  const ok=await sSet('kleinkas', list);
+  if(!ok) alert('⚠️ Kon nie die kleinkas-inskrywing stoor nie — kontroleer die internetverbinding en probeer weer.');
+  return ok;
+}
 
 const CATEGORY_ICONS={
   'Diesel/Petrol':'⛽','Olie':'🛢️','Gif/Chemikalieë':'🧪','Tuintoerusting':'🔧',
@@ -1053,7 +1060,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-57'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-59'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1820,7 +1827,7 @@ let EXP_FILTER={from:'',to:'',category:'',driverId:''};
 let INC_FILTER={from:'',to:'',clientKey:'',driverId:''};
 async function renderPayroll(ct){
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
-              ['uitgawes','🧾','Uitgawes'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
+              ['uitgawes','🧾','Uitgawes'],['kleinkas','💵','Kleinkas'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
   ct.innerHTML=`
     <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
       ${tabs.map(([id,icon,label])=>`
@@ -1830,6 +1837,7 @@ async function renderPayroll(ct){
     <div id="bk-body"></div>`;
   if(BK_SUBTAB==='lone') await renderWages(document.getElementById('bk-body'));
   else if(BK_SUBTAB==='inkomste') await renderIncome(document.getElementById('bk-body'));
+  else if(BK_SUBTAB==='kleinkas') await renderKleinkas(document.getElementById('bk-body'));
   else if(BK_SUBTAB==='bank') await renderBank(document.getElementById('bk-body'));
   else if(BK_SUBTAB==='fakture') renderFaktuurTools(document.getElementById('bk-body'));
   else await renderExpenses(document.getElementById('bk-body'));
@@ -1838,6 +1846,7 @@ function renderWagesInto(){ renderWages(document.getElementById('bk-body')); }
 function renderIncomeInto(){ renderIncome(document.getElementById('bk-body')); }
 function renderExpensesInto(){ renderExpenses(document.getElementById('bk-body')); }
 function renderBankInto(){ renderBank(document.getElementById('bk-body')); }
+function renderKleinkasInto(){ renderKleinkas(document.getElementById('bk-body')); }
 
 // Shared date-range helper: every "filterable list" tab (Inkomste, Uitgawes)
 // uses this so a custom From/To range behaves identically everywhere.
@@ -1872,6 +1881,122 @@ const EXPENSE_CATEGORIES=[
   'Voertuig Onderhoud','Trackers','Selfone','Kantoor Toerusting',
   'Salarisse (ekstra)','Verlof Uitbetaling','Jaareinde Bonusse','Ander'
 ];
+
+let KLEINKAS_MONTH_OFFSET=0;
+let KLEINKAS_FORM_TYPE='in';
+// A simple running ledger for the petty cash tin — money In (e.g. cash
+// collected from clients that gets kept as float, or a bank withdrawal to
+// top it up) and money Out (small day-to-day purchases), with a running
+// balance same as the client ledger detail already shows. Deliberately
+// standalone for now — not automatically linked to invoice cashPaid
+// amounts, since how that reconciliation should actually work hasn't been
+// decided yet; this just gives a place to log it manually either way.
+async function renderKleinkas(ct){
+  const mr=monthRange(KLEINKAS_MONTH_OFFSET);
+  const all=getKleinkas().slice().sort((a,b)=> a.date===b.date ? (a.ts||0)-(b.ts||0) : a.date.localeCompare(b.date));
+  const balance=all.reduce((s,e)=> s + (e.type==='in'?e.amount:-e.amount), 0);
+  const monthEntries=all.filter(e=>dateInRange(e.date, mr.from, mr.to));
+
+  ct.innerHTML=`
+    <div style="background:var(--g1);border:2px solid var(--g2);border-radius:var(--r);padding:16px;margin-bottom:12px;text-align:center">
+      <div style="font-size:.78rem;color:var(--t2);font-weight:700">HUIDIGE KLEINKAS SALDO</div>
+      <div style="font-size:1.8rem;font-weight:800;color:${balance<0?'var(--red)':'var(--g8)'}">R${balance.toFixed(2)}</div>
+    </div>
+
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="KLEINKAS_MONTH_OFFSET--;renderKleinkasInto()">← Vorige maand</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="KLEINKAS_MONTH_OFFSET=0;renderKleinkasInto()">Hierdie maand</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem;${KLEINKAS_MONTH_OFFSET>=0?'opacity:.4;pointer-events:none':''}" onclick="KLEINKAS_MONTH_OFFSET++;renderKleinkasInto()">Volgende →</button>
+    </div>
+
+    <div class="vcard" style="margin-bottom:12px">
+      <div class="vtitle">＋ Nuwe inskrywing</div>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button class="btn-sec btn" id="kk-type-in" style="flex:1" onclick="setKleinkasFormType('in')">+ In</button>
+        <button class="btn-sec btn" id="kk-type-out" style="flex:1" onclick="setKleinkasFormType('out')">− Uit</button>
+      </div>
+      <div style="margin-top:8px"><div class="flbl" style="margin-bottom:4px">Datum</div>
+        <input class="inp" type="date" id="kk-date" value="${todayKey()}"></div>
+      <div style="margin-top:8px"><div class="flbl" style="margin-bottom:4px">Bedrag (R)</div>
+        <input class="inp" type="number" id="kk-amount" placeholder="0"></div>
+      <div style="margin-top:8px"><div class="flbl" style="margin-bottom:4px">Rede</div>
+        <input class="inp" id="kk-category" placeholder="bv. koeldrank vir werkers"></div>
+      <button class="btn" style="margin-top:10px" onclick="submitKleinkasEntry()">Stoor</button>
+    </div>
+
+    <div class="divlbl">TRANSAKSIES — ${mr.label} (${monthEntries.length})</div>
+    <div id="kk-list"></div>`;
+
+  highlightKleinkasTypeButtons();
+
+  const listEl=document.getElementById('kk-list');
+  if(monthEntries.length===0){
+    listEl.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:16px 0">Geen kleinkas transaksies hierdie maand nie.</p>';
+    return;
+  }
+
+  // Running balance is computed over the FULL history (not just this
+  // month's filtered slice), so the SALDO column stays accurate no matter
+  // which month you're looking at.
+  let running=0;
+  const runningByEntry=new Map();
+  all.forEach(e=>{ running += (e.type==='in'?e.amount:-e.amount); runningByEntry.set(e, running); });
+
+  listEl.innerHTML=`
+    <div style="background:var(--card);border-radius:12px;border:2px solid var(--brd);overflow:hidden">
+      <div style="display:grid;grid-template-columns:65px 1fr 75px 65px 26px;padding:8px 12px;background:var(--bg);border-bottom:1px solid var(--brd)">
+        <span style="font-size:.66rem;font-weight:800;color:var(--t2)">DATUM</span>
+        <span style="font-size:.66rem;font-weight:800;color:var(--t2);padding:0 6px">BESKRYWING</span>
+        <span style="font-size:.66rem;font-weight:800;color:var(--t2);text-align:right">BEDRAG</span>
+        <span style="font-size:.66rem;font-weight:800;color:var(--t2);text-align:right">SALDO</span>
+        <span></span>
+      </div>
+      ${monthEntries.slice().reverse().map(e=>{
+        const bal=runningByEntry.get(e);
+        return `<div style="display:grid;grid-template-columns:65px 1fr 75px 65px 26px;padding:9px 12px;border-bottom:1px solid var(--brd);font-size:.78rem;align-items:center">
+          <span style="color:var(--t2)">${e.date}</span>
+          <span style="padding:0 6px">${e.category}${e.desc?' — '+e.desc:''}</span>
+          <span style="text-align:right;font-weight:700;color:${e.type==='in'?'var(--g8)':'var(--red)'}">${e.type==='in'?'+':'-'}R${e.amount.toFixed(2)}</span>
+          <span style="text-align:right;font-weight:700;color:${bal<0?'var(--red)':'var(--t2)'}">R${bal.toFixed(2)}</span>
+          <button onclick="deleteKleinkasEntry('${e.id}')" title="Verwyder"
+            style="width:auto;padding:2px 5px;font-size:.66rem;color:var(--red);background:none;border:1px solid var(--brd);border-radius:100px">✕</button>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+function setKleinkasFormType(type){
+  KLEINKAS_FORM_TYPE=type;
+  highlightKleinkasTypeButtons();
+}
+function highlightKleinkasTypeButtons(){
+  const inBtn=document.getElementById('kk-type-in'), outBtn=document.getElementById('kk-type-out');
+  if(!inBtn||!outBtn) return;
+  inBtn.style.background = KLEINKAS_FORM_TYPE==='in' ? 'var(--g8)' : '';
+  inBtn.style.color = KLEINKAS_FORM_TYPE==='in' ? '#fff' : '';
+  inBtn.style.borderColor = KLEINKAS_FORM_TYPE==='in' ? 'var(--g8)' : '';
+  outBtn.style.background = KLEINKAS_FORM_TYPE==='out' ? 'var(--red)' : '';
+  outBtn.style.color = KLEINKAS_FORM_TYPE==='out' ? '#fff' : '';
+  outBtn.style.borderColor = KLEINKAS_FORM_TYPE==='out' ? 'var(--red)' : '';
+}
+async function submitKleinkasEntry(){
+  const date=document.getElementById('kk-date').value;
+  const amount=parseFloat(document.getElementById('kk-amount').value);
+  const category=document.getElementById('kk-category').value.trim();
+  if(!date){ alert('Kies \'n datum'); return; }
+  if(isNaN(amount) || amount<=0){ alert('Voer \'n geldige bedrag in'); return; }
+  if(!category){ alert('Voer \'n rede in'); return; }
+  const entry={ id:'kk_'+Date.now(), date, type:KLEINKAS_FORM_TYPE, amount, category, desc:'', ts:Date.now() };
+  const ok=await saveKleinkas([...getKleinkas(), entry]);
+  if(!ok) return;
+  toast('✓ Kleinkas inskrywing gestoor');
+  renderKleinkasInto();
+}
+async function deleteKleinkasEntry(id){
+  if(!confirm('Verwyder hierdie kleinkas-inskrywing?')) return;
+  const ok=await saveKleinkas(getKleinkas().filter(e=>e.id!==id));
+  if(!ok) return;
+  renderKleinkasInto();
+}
 
 async function renderIncome(ct){
   ct.innerHTML='<div class="loadmsg">Laai inkomste… / Loading income…</div>';
@@ -4350,29 +4475,32 @@ let INSP_MONTH_OFFSET=0; // still used by "jump to this month" convenience
 let INSP_DATA_CACHE={};
 let INSP_OPEN_YEARS=new Set();
 let INSP_OPEN_MONTHS=new Set(); // keyed 'YYYY-MM'
+let INSP_DEFAULTS_APPLIED=false;
 // Real complex names read directly off the two paper "Inspeksie lys"
 // sheets (Jan's and Pierre's) — only ever used as a one-time starting
 // point if the list in Firestore is genuinely empty, same pattern as the
 // driver roster's hardcoded fallback. Never overwrites anything already
 // added by hand.
 const DEFAULT_INSPECTION_COMPLEXES = [
-  'AJF Kantore',
-  'Arendsnes',
-  'Bluetides',
-  'Granny Mac',
-  'Harbour Lights',
+  // Jan's list, in the order it was written
   'Harbourside',
   'Keel Close 47',
-  'Kosmos',
-  'Maxi Drive 29',
-  'Northwest Village',
+  'Granny Mac',
+  'Harbour Lights',
   'Poma - Jasper',
   'Poma - Nicky',
-  'Riviera Hotel',
-  'Soetdorings',
   'Veldpark - Jasper',
+  'Riviera Hotel',
+  'AJF Kantore',
+  'Maxi Drive 29',
+  // Pierre's list, in the order it was written
+  'Kosmos',
   'Vredezicht',
+  'Soetdorings',
+  'Northwest Village',
+  'Arendsnes',
   'Welgedaan Kompleks',
+  'Bluetides',
 ];
 async function ensureInspectionComplexesSeeded(){
   if(CACHE.inspectionComplexes) return CACHE.inspectionComplexes;
@@ -4380,7 +4508,7 @@ async function ensureInspectionComplexesSeeded(){
   if(stored && stored.length){
     CACHE.inspectionComplexes=stored;
   } else {
-    CACHE.inspectionComplexes=[...DEFAULT_INSPECTION_COMPLEXES].sort((a,b)=>a.localeCompare(b));
+    CACHE.inspectionComplexes=[...DEFAULT_INSPECTION_COMPLEXES];
     await sSet('inspection_complexes', CACHE.inspectionComplexes); // persist once — Firestore is the real source of truth from here on
   }
   return CACHE.inspectionComplexes;
@@ -4414,8 +4542,17 @@ async function renderInspeksiesTab(ct){
   sortedMonths.forEach(mk=>{ (byYear[mk.slice(0,4)]=byYear[mk.slice(0,4)]||[]).push(mk); });
   const years=Object.keys(byYear).sort().reverse();
 
-  if(INSP_OPEN_YEARS.size===0) INSP_OPEN_YEARS.add(String(sastNow().getFullYear()));
-  if(INSP_OPEN_MONTHS.size===0) INSP_OPEN_MONTHS.add(inspMonthKey(0));
+  // Only ever applied once — this used to re-trigger any time BOTH sets
+  // happened to be empty, which included the moment someone deliberately
+  // closed the last open year or month. That made closing the current
+  // year/month look like it did nothing: the very next render (fired by
+  // that same click) would see an empty set and immediately reopen the
+  // current year/month again.
+  if(!INSP_DEFAULTS_APPLIED){
+    INSP_OPEN_YEARS.add(String(sastNow().getFullYear()));
+    INSP_OPEN_MONTHS.add(inspMonthKey(0));
+    INSP_DEFAULTS_APPLIED=true;
+  }
 
   ct.innerHTML=`
     <div class="ovhdr">
@@ -4455,8 +4592,8 @@ async function renderInspeksiesTab(ct){
       const monthBox=el('div');
       monthBox.style.cssText='margin:6px 0 0 14px;background:var(--card);border-radius:10px;border:1px solid var(--brd);overflow:hidden';
       monthBox.innerHTML=`
-        <div style="display:grid;grid-template-columns:1.3fr .75fr 1.3fr .75fr 1.3fr;gap:4px;padding:8px 10px;background:var(--bg);font-size:.64rem;font-weight:800;color:var(--t2)">
-          <span>KOMPLEKS</span><span>DATUM 1</span><span>OPMERKING 1</span><span>DATUM 2</span><span>OPMERKING 2</span>
+        <div style="display:grid;grid-template-columns:26px 1.3fr .75fr 1.3fr .75fr 1.3fr;gap:4px;padding:8px 10px;background:var(--bg);font-size:.64rem;font-weight:800;color:var(--t2)">
+          <span></span><span>KOMPLEKS</span><span>DATUM 1</span><span>OPMERKING 1</span><span>DATUM 2</span><span>OPMERKING 2</span>
         </div>
         <div id="insp-body-${mk}"></div>
         <div style="padding:8px 10px;display:flex;gap:8px;border-top:1px solid var(--brd)">
@@ -4478,13 +4615,12 @@ async function renderInspeksiesTab(ct){
         const v2=(rec.visits&&rec.visits[1])||{date:'',status:'',comment:''};
         const safeName=name.replace(/'/g,"\\'");
         const row=el('div');
-        row.style.cssText='display:grid;grid-template-columns:1.3fr .75fr 1.3fr .75fr 1.3fr;gap:4px;padding:7px 10px;border-top:1px solid var(--brd);align-items:start;font-size:.8rem';
+        row.style.cssText='display:grid;grid-template-columns:26px 1.3fr .75fr 1.3fr .75fr 1.3fr;gap:4px;padding:7px 10px;border-top:1px solid var(--brd);align-items:start;font-size:.8rem';
         row.innerHTML=`
-          <span style="font-weight:700;padding-top:6px">${name}
-            <button onclick="confirmRemoveInspectionComplex('${safeName}')" title="Verwyder kompleks"
-              style="width:auto;flex-shrink:0;padding:1px 5px;font-size:.62rem;font-weight:700;color:var(--red);
-                     background:var(--bg);border:1px solid var(--brd);border-radius:100px;margin-left:4px">✕</button>
-          </span>
+          <button onclick="confirmRemoveInspectionComplex('${safeName}')" title="Verwyder kompleks"
+            style="width:auto;flex-shrink:0;padding:1px 5px;font-size:.62rem;font-weight:700;color:var(--red);
+                   background:var(--bg);border:1px solid var(--brd);border-radius:100px;margin-top:5px">✕</button>
+          <span style="font-weight:700;padding-top:6px">${name}</span>
           ${inspVisitDateHtml(safeName,mk,0,v1.date)}
           ${inspVisitStatusHtml(safeName,mk,0,v1)}
           ${inspVisitDateHtml(safeName,mk,1,v2.date)}
@@ -4522,7 +4658,7 @@ async function submitAddInspectionComplex(){
   if(!name) return;
   const list=await ensureInspectionComplexesSeeded();
   if(list.includes(name)){ inp.value=''; toast('Kompleks bestaan reeds'); return; }
-  const updated=[...list, name].sort((a,b)=>a.localeCompare(b));
+  const updated=[...list, name];
   const ok=await sSet('inspection_complexes', updated);
   if(!ok){
     alert('⚠️ Kon nie die kompleks stoor nie — kontroleer die internetverbinding en probeer weer.');
