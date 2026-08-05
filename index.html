@@ -1053,7 +1053,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-51'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-54'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -3234,15 +3234,32 @@ function renderDriverTab(tab){
   if(tab==='workers')     renderWorkers(c);
   if(tab==='vordering')   renderVorderingTab(c);
   if(tab==='spanne')      renderSpanneTab(c);
-  if(tab==='inspeksies')  renderPlaceholderTab(c,'🔍 Inspeksies','Kom binnekort.');
+  if(tab==='inspeksies')  renderInspeksiesTab(c);
   if(tab==='masjiene')    renderPlaceholderTab(c,'🔧 Masjiene','Kom binnekort.');
   if(tab==='summary')     renderSummary(c);
 }
 // Toggles Pierre's extra tabs (Spanne, Inspeksies, Masjiene) — nobody
 // else needs these, so they stay hidden for every other driver.
+// The tab bar is one shared set of DOM elements reused across every
+// driver login (nothing gets rebuilt from scratch when someone logs in),
+// so reordering it for Pierre and then having a normal driver log in
+// afterward would leave it stuck in Pierre's order unless every login
+// explicitly puts it back — hence setting BOTH orders here, not just
+// Pierre's.
+const PIERRE_TAB_ORDER=['route','workers','summary','quotes','vordering','spanne','inspeksies','masjiene'];
+const DEFAULT_TAB_ORDER=['route','quotes','workers','vordering','spanne','inspeksies','masjiene','summary'];
+function reorderTabs(containerId, order){
+  const bar=document.getElementById(containerId);
+  if(!bar) return;
+  order.forEach(dataTab=>{
+    const btn=bar.querySelector(`[data-tab="${dataTab}"]`);
+    if(btn) bar.appendChild(btn); // moves this button to the end, in the sequence called — ends up in exactly the given order
+  });
+}
 function applyDriverTabs(){
   const isPierre = S.driver==='pierre';
   document.querySelectorAll('#d-tabs .pierre-only').forEach(t=>{ t.style.display = isPierre ? '' : 'none'; });
+  reorderTabs('d-tabs', isPierre ? PIERRE_TAB_ORDER : DEFAULT_TAB_ORDER);
   applyCompactTabs('d-tabs');
 }
 // Tabs size to fit their own text (see .tab CSS) rather than stretching
@@ -4322,6 +4339,122 @@ function renderVorderingTab(ct){
     ${rows}`;
 }
 
+// ══════════════════ INSPEKSIES (Pierre) ═══════════════════════════════════════
+// Modeled directly on the paper sheets: a complex list Pierre builds up
+// himself (no fixed setup needed elsewhere), inspected roughly twice a
+// month, each visit logged with its own date + remark. Complexes persist
+// month to month once added; only the visits are month-specific — matches
+// how the real paper worked (a fresh sheet each month, but the same
+// complex names carried over).
+let INSP_MONTH_OFFSET=0;
+let INSP_DATA_CACHE={};
+async function ensureInspectionComplexesSeeded(){
+  if(CACHE.inspectionComplexes) return CACHE.inspectionComplexes;
+  CACHE.inspectionComplexes=await sGet('inspection_complexes', []);
+  return CACHE.inspectionComplexes;
+}
+function inspMonthKey(offset){
+  const d=sastNow(); d.setDate(1); d.setMonth(d.getMonth()+offset);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');
+}
+function inspMonthLabel(offset){
+  const d=sastNow(); d.setDate(1); d.setMonth(d.getMonth()+offset);
+  return MONTHS_AF[d.getMonth()]+' '+d.getFullYear();
+}
+async function renderInspeksiesTab(ct){
+  ct.innerHTML='<div class="loadmsg">Laai... / Loading...</div>';
+  const complexes=await ensureInspectionComplexesSeeded();
+  const monthKey=inspMonthKey(INSP_MONTH_OFFSET);
+  const monthLabel=inspMonthLabel(INSP_MONTH_OFFSET);
+  const monthData=await sGet('inspections_'+monthKey, {});
+  INSP_DATA_CACHE[monthKey]=monthData;
+
+  ct.innerHTML=`
+    <div class="ovhdr">
+      <h2>🔍 Inspeksie lys (komplekse)</h2>
+      <p>${monthLabel}</p>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="INSP_MONTH_OFFSET--;renderInspeksiesTab(document.getElementById('d-content'))">← Vorige maand</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="INSP_MONTH_OFFSET=0;renderInspeksiesTab(document.getElementById('d-content'))">Hierdie maand</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem;${INSP_MONTH_OFFSET>=0?'opacity:.4;pointer-events:none':''}" onclick="INSP_MONTH_OFFSET++;renderInspeksiesTab(document.getElementById('d-content'))">Volgende →</button>
+    </div>
+    <div id="insp-list"></div>
+    <div style="display:flex;gap:8px;margin-top:10px">
+      <input class="inp" id="insp-new-complex" placeholder="Nuwe kompleks se naam…" style="flex:1">
+      <button class="btn" style="flex-shrink:0" onclick="submitAddInspectionComplex()">＋ Voeg by</button>
+    </div>`;
+
+  const listEl=document.getElementById('insp-list');
+  if(complexes.length===0){
+    listEl.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Nog geen komplekse bygevoeg nie. Voeg een by hieronder.</p>';
+    return;
+  }
+  complexes.forEach((name,ci)=>{
+    const rec=monthData[name]||{visits:[]};
+    const visits=(rec.visits&&rec.visits.length)?rec.visits:[{date:'',note:''},{date:'',note:''}];
+    const safeName=name.replace(/'/g,"\\'");
+    const card=el('div','vcard');
+    card.style.marginBottom='10px';
+    card.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div class="vtitle" style="margin:0">${name}</div>
+        <button class="btn-sec btn" style="width:auto;padding:3px 8px;font-size:.68rem;color:var(--red)" onclick="confirmRemoveInspectionComplex('${safeName}')">✕ Verwyder</button>
+      </div>
+      <div id="insp-visits-${ci}"></div>
+      <button class="btn-sec btn" style="width:100%;margin-top:6px;font-size:.76rem" onclick="addInspectionVisitSlot('${safeName}')">＋ Voeg besoek by</button>`;
+    listEl.appendChild(card);
+    const visitsHolder=card.querySelector('#insp-visits-'+ci);
+    visits.forEach((v,vi)=>{
+      const row=el('div');
+      row.style.cssText='display:flex;gap:6px;margin-bottom:6px;align-items:center';
+      row.innerHTML=`
+        <input class="inp" type="date" value="${v.date||''}" style="flex:1;padding:7px" onchange="saveInspectionVisit('${safeName}',${vi},'date',this.value)">
+        <input class="inp" placeholder="Opmerking…" value="${(v.note||'').replace(/"/g,'&quot;')}" style="flex:2;padding:7px" onchange="saveInspectionVisit('${safeName}',${vi},'note',this.value)">`;
+      visitsHolder.appendChild(row);
+    });
+  });
+}
+async function submitAddInspectionComplex(){
+  const inp=document.getElementById('insp-new-complex');
+  const name=inp.value.trim();
+  if(!name) return;
+  const list=await ensureInspectionComplexesSeeded();
+  if(!list.includes(name)){
+    list.push(name);
+    list.sort((a,b)=>a.localeCompare(b));
+    CACHE.inspectionComplexes=list;
+    await sSet('inspection_complexes', list);
+  }
+  inp.value='';
+  renderInspeksiesTab(document.getElementById('d-content'));
+}
+async function confirmRemoveInspectionComplex(name){
+  if(!confirm(`Verwyder "${name}" van die inspeksie-lys? Dit verwyder nie geskiedenis wat reeds gestoor is nie — net die kompleks van toekomstige lyste.`)) return;
+  const list=(await ensureInspectionComplexesSeeded()).filter(n=>n!==name);
+  CACHE.inspectionComplexes=list;
+  await sSet('inspection_complexes', list);
+  renderInspeksiesTab(document.getElementById('d-content'));
+}
+async function saveInspectionVisit(name, idx, field, value){
+  const monthKey=inspMonthKey(INSP_MONTH_OFFSET);
+  const monthData=INSP_DATA_CACHE[monthKey]||{};
+  if(!monthData[name]) monthData[name]={visits:[]};
+  while(monthData[name].visits.length<=idx) monthData[name].visits.push({date:'',note:''});
+  monthData[name].visits[idx][field]=value;
+  INSP_DATA_CACHE[monthKey]=monthData;
+  await sSet('inspections_'+monthKey, monthData);
+}
+async function addInspectionVisitSlot(name){
+  const monthKey=inspMonthKey(INSP_MONTH_OFFSET);
+  const monthData=INSP_DATA_CACHE[monthKey]||{};
+  if(!monthData[name]) monthData[name]={visits:[{date:'',note:''},{date:'',note:''}]};
+  monthData[name].visits.push({date:'',note:''});
+  INSP_DATA_CACHE[monthKey]=monthData;
+  await sSet('inspections_'+monthKey, monthData);
+  renderInspeksiesTab(document.getElementById('d-content'));
+}
+
 // Equipment/machine fuel — Pierre's responsibility alone, and moved off
 // his Dagstaat too, same reasoning as Spanne: his Dagstaat should be a
 // plain match for every other driver's, not carry extra admin fields.
@@ -4344,7 +4477,6 @@ async function renderPierreTeamAdmin(ct){
   const mc=el('div','vcard');
   mc.innerHTML=`<div class="vtitle">👷 Alle Spanne — Bestuur</div>
     <p style="font-size:.78rem;color:var(--t2);margin:0 0 10px">Skuif werkers tussen bakkies of voeg los werkers by. Kies "Permanent" om dit blywend te maak, of "Net vandag" vir 'n tydelike skuif. Werkers wat bestuurders self by hul eie lys byvoeg wys ook hier.</p>
-    <button class="btn-sec btn" style="width:100%;margin-bottom:10px;color:var(--red)" onclick="resetWorkerRosterToDefaults()">🔄 Herstel alle spanne na oorspronklike lyste</button>
     ${Object.entries(DRIVERS).map(([id,dd])=>{
       const roster=getRoster(id);
       const b=moves[id]||{addedPermanent:[],addedTemp:[],removed:[]};
@@ -4385,7 +4517,8 @@ async function renderPierreTeamAdmin(ct){
         </select>
       </div>
       <button class="btn" onclick="pierreAddWorker()">＋ Voeg by / Skuif</button>
-    </div>`;
+    </div>
+    <button class="btn-sec btn" style="width:auto;padding:4px 10px;margin:16px auto 0;display:block;font-size:.68rem;color:var(--t3)" onclick="resetWorkerRosterToDefaults()">🔄 Herstel alle spanne na oorspronklike lyste</button>`;
   ct.appendChild(mc);
 }
 // Removes a casual worker a driver added themselves (via the unified
