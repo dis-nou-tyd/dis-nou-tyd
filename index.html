@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-20'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-21'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1034,6 +1034,7 @@ async function checkForNewVersion(){
   }catch(e){ /* stay silent, retry next tick */ }
 }
 
+let PIERRE_SPANNE_SIG=''; // last-seen signature of Spanne tab data, used to skip no-op re-renders during polling
 function startPolling(){
   stopPolling();
   POLL_TIMER=setInterval(async ()=>{
@@ -1082,10 +1083,34 @@ function startPolling(){
         }catch(e){ /* stay silent, retry next tick */ }
         // Spanne also shows every driver's self-added casual workers,
         // which live in each driver's own day-progress record rather than
-        // the roster — that can change independently of the roster diff
-        // above, so this refreshes unconditionally every tick rather than
-        // trying to diff several other drivers' records first.
-        if(S.driverTab==='spanne') renderDriverTab('spanne');
+        // the roster, so it can change independently of the roster diff
+        // above. Previously this re-rendered unconditionally every tick,
+        // which rebuilt the whole tab every ~6 seconds regardless of
+        // whether anything had actually changed — resetting scroll
+        // position and generally feeling like the screen was "constantly
+        // refreshing." Now it only re-renders when something in the
+        // underlying data actually differs, and preserves scroll position
+        // when it does, same as the parent screen's poll refresh already does.
+        if(S.driverTab==='spanne'){
+          try{
+            const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
+            const progs={};
+            await Promise.all(Object.keys(DRIVERS).map(async id=>{
+              progs[id]=await sGet('progress_'+id+'_'+todayKey(), null).catch(()=>null);
+            }));
+            const workersOnly={};
+            Object.entries(progs).forEach(([id,p])=>{ workersOnly[id]=p&&p.workers||{}; });
+            const sig=JSON.stringify({roster:CACHE.workerRoster, moves, workers:workersOnly});
+            if(sig!==PIERRE_SPANNE_SIG){
+              PIERRE_SPANNE_SIG=sig;
+              const dc=document.getElementById('d-content');
+              const prevScroll=dc?dc.scrollTop:0;
+              await renderDriverTab('spanne');
+              const newDc=document.getElementById('d-content');
+              if(newDc) newDc.scrollTop=prevScroll;
+            }
+          }catch(e){ /* stay silent, retry next tick */ }
+        }
         // Lightweight self-check in case this driver is also open on another
         // tablet — but only when working on TODAY. While backfilling a past
         // day (S.workDate set), this used to still hardcode today's date,
