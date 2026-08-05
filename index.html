@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-15'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-18'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1066,6 +1066,26 @@ function startPolling(){
           CACHE.quotes=await sGet('quotes',CACHE.quotes);
           renderQuotesDriver(document.getElementById('d-content'));
         }
+        // Keep the shared permanent worker roster live too — a driver
+        // adding themselves a permanent team member, or Pierre moving
+        // someone between bakkies from his Spanne tab, should show up
+        // everywhere that roster is visible (especially Pierre's Spanne
+        // tab and his own Werkers list) without anyone needing to
+        // navigate away and back or reload. Runs regardless of backfill
+        // state since the roster itself isn't date-specific.
+        try{
+          const freshRoster=await sGet('worker_roster', null);
+          if(freshRoster && JSON.stringify(freshRoster)!==JSON.stringify(CACHE.workerRoster)){
+            CACHE.workerRoster=freshRoster;
+            if(S.driverTab==='workers') renderDriverTab('workers');
+          }
+        }catch(e){ /* stay silent, retry next tick */ }
+        // Spanne also shows every driver's self-added casual workers,
+        // which live in each driver's own day-progress record rather than
+        // the roster — that can change independently of the roster diff
+        // above, so this refreshes unconditionally every tick rather than
+        // trying to diff several other drivers' records first.
+        if(S.driverTab==='spanne') renderDriverTab('spanne');
         // Lightweight self-check in case this driver is also open on another
         // tablet — but only when working on TODAY. While backfilling a past
         // day (S.workDate set), this used to still hardcode today's date,
@@ -3177,6 +3197,7 @@ function renderRoute(ct){
   // it, or switch back to today. Deliberately limited to yesterday only,
   // and behaves exactly like a normal day once saved — same invoices, same
   // everything, no special marker anywhere else in the app.
+  let showFillYesterdayBtn=false;
   if(isBackfill){
     const backBtn=el('button','btn-sec btn');
     backBtn.style.cssText='width:100%;margin-bottom:10px;background:var(--g1);border-color:var(--g8);color:var(--g8);font-weight:700';
@@ -3187,25 +3208,23 @@ function renderRoute(ct){
     const y=sastNow(); y.setDate(y.getDate()-1);
     const yWeekday=y.getDay();
     if(yWeekday!==0 && yWeekday!==6){ // only offer this if yesterday was an actual work day
-      const fillBtn=el('button','btn-sec btn');
-      fillBtn.style.cssText='width:100%;margin-bottom:10px;font-size:.85rem';
-      fillBtn.innerHTML='📝 Was jy gister nie by nie? Vul gister se lys in';
-      fillBtn.onclick=()=>switchToYesterdayList();
-      ct.appendChild(fillBtn);
+      showFillYesterdayBtn=true;
     }
   }
 
   if(r.length===0){
     const emp=el('div','empty');
     emp.innerHTML='<div class="ei">📋</div><h3>Geen tuine vir vandag</h3><p>Geen geskeduleerde tuine nie.<br>Kontak bestuur.</p>';
-    ct.appendChild(emp); return;
+    ct.appendChild(emp);
+    if(showFillYesterdayBtn){
+      const fillBtn=el('button','btn-sec btn');
+      fillBtn.style.cssText='width:100%;margin-top:10px;font-size:.85rem';
+      fillBtn.innerHTML='📝 Was jy gister nie by nie? Vul gister se lys in';
+      fillBtn.onclick=()=>switchToYesterdayList();
+      ct.appendChild(fillBtn);
+    }
+    return;
   }
-
-  // Once-off button
-  const ab=el('button','btn btn-blue btn-sm');
-  ab.textContent='＋ Eenmalige kliënt / Once-off';
-  ab.onclick=()=>showOnceOff();
-  ct.appendChild(ab);
 
   // Small, single-purpose button to peek at tomorrow's list — no
   // multi-day browsing, nothing stored, just "what's tomorrow."
@@ -3217,6 +3236,23 @@ function renderRoute(ct){
 
   // Garden cards
   r.forEach((g,i)=>ct.appendChild(makeGardenCard(g,i)));
+
+  // Once-off and "fill in yesterday" moved down here, below the actual
+  // route — both are occasional/secondary actions, not things a driver
+  // needs every time they open the app, so they shouldn't sit above the
+  // list they're here to look at every single day.
+  if(showFillYesterdayBtn){
+    const fillBtn=el('button','btn-sec btn');
+    fillBtn.style.cssText='width:100%;margin-top:18px;font-size:.85rem';
+    fillBtn.innerHTML='📝 Was jy gister nie by nie? Vul gister se lys in';
+    fillBtn.onclick=()=>switchToYesterdayList();
+    ct.appendChild(fillBtn);
+  }
+  const ab=el('button','btn btn-blue btn-sm');
+  ab.style.cssText='width:100%;margin-top:10px';
+  ab.textContent='＋ Eenmalige kliënt / Once-off';
+  ab.onclick=()=>showOnceOff();
+  ct.appendChild(ab);
 
   // End-of-day report — placed last, at the very bottom, on purpose. Drivers
   // scroll past everything else first, so it's much harder to tap by accident.
@@ -3896,14 +3932,17 @@ async function renderWorkers(ct){
       const isCasual=casualNames.includes(w);
       const isPermanent=roster.includes(w);
       return `<div class="wrow">
-        <div class="wname">${w}${isCasual?' <span style="font-size:.68rem;color:var(--t2);font-weight:400">(los werker)</span>':''}</div>
+        <div class="wname" style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <span>${w}${isCasual?' <span style="font-size:.68rem;color:var(--t2);font-weight:400">(los werker)</span>':''}</span>
+          ${(isCasual||isPermanent)?`<button onclick="${isCasual?`removeCasualWorker('${w}')`:`driverRemovePermanentWorker('${w.replace(/'/g,"\\'")}')`}"
+              style="width:auto;flex-shrink:0;padding:3px 9px;font-size:.72rem;font-weight:700;color:var(--red);
+                     background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">✕</button>`:''}
+        </div>
         <button class="wtog ${ws.present?'wp':'wa'}" onclick="togWorker('${w}')">
           ${ws.present?'✓ Teenwoordig':'✗ Afwesig'}</button>
         <div class="wloan"><input class="inp" type="number" placeholder="Leen R"
           value="${ws.loan||''}" oninput="setLoan('${w}',this.value)"
           style="padding:8px 10px;font-size:.82rem"></div>
-        ${isCasual?`<button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="removeCasualWorker('${w}')">✕</button>`:''}
-        ${isPermanent?`<button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="driverRemovePermanentWorker('${w.replace(/'/g,"\\'")}')">✕</button>`:''}
       </div>`;
     }).join('')}
     <div style="display:flex;gap:8px;padding-top:8px;flex-wrap:wrap">
@@ -3938,25 +3977,42 @@ async function renderSpanneTab(ct){
 async function renderPierreTeamAdmin(ct){
   await ensureWorkerRosterSeeded();
   const moves=await getWorkerMovesForDate(todayKey()).catch(()=>({}));
+  // Pull each driver's own live progress too — a driver adding themselves
+  // a casual ("Los vandag") worker on their own Werkers tab writes only to
+  // their own day's progress record, completely separately from the
+  // roster/moves system Pierre's own tools use here. Without this, those
+  // additions were invisible on this tab even though Pierre is meant to
+  // see every worker on every bakkie at all times.
+  const todayProgress={};
+  await Promise.all(Object.keys(DRIVERS).map(async id=>{
+    todayProgress[id]=await sGet('progress_'+id+'_'+todayKey(), null).catch(()=>null);
+  }));
   const mc=el('div','vcard');
   mc.innerHTML=`<div class="vtitle">👷 Alle Spanne — Bestuur</div>
-    <p style="font-size:.78rem;color:var(--t2);margin:0 0 10px">Skuif werkers tussen bakkies of voeg los werkers by. Kies "Permanent" om dit blywend te maak, of "Net vandag" vir 'n tydelike skuif.</p>
+    <p style="font-size:.78rem;color:var(--t2);margin:0 0 10px">Skuif werkers tussen bakkies of voeg los werkers by. Kies "Permanent" om dit blywend te maak, of "Net vandag" vir 'n tydelike skuif. Werkers wat bestuurders self by hul eie lys byvoeg wys ook hier.</p>
     <button class="btn-sec btn" style="width:100%;margin-bottom:10px;color:var(--red)" onclick="resetWorkerRosterToDefaults()">🔄 Herstel alle spanne na oorspronklike lyste</button>
     ${Object.entries(DRIVERS).map(([id,dd])=>{
       const roster=getRoster(id);
       const b=moves[id]||{addedPermanent:[],addedTemp:[],removed:[]};
       const activeList=[...roster.filter(n=>!b.removed.includes(n)), ...b.addedTemp.filter(n=>!b.removed.includes(n))];
+      const driverCasuals=Object.entries(todayProgress[id]?.workers||{})
+        .filter(([n,w])=>w&&w.casual&&!activeList.includes(n))
+        .map(([n])=>n);
       return `<div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px">
         <div style="font-weight:700;display:flex;align-items:center;gap:6px;margin-bottom:4px"><span>${dd.icon}</span> ${dd.name}</div>
-        ${activeList.length===0?'<p style="color:var(--t2);font-size:.8rem;margin:4px 0">Geen werkers nie.</p>':
-          activeList.map(n=>{
-            const isTemp=b.addedTemp.includes(n);
-            return `<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
-              <span style="flex:1">${n}${isTemp?' <span style="color:var(--ora);font-size:.68rem">(net vandag)</span>':''}</span>
-              <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem" onclick="pierreStartMove('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
-              <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveWorker('${n.replace(/'/g,"\\'")}','${id}',${isTemp})">✕</button>
-            </div>`;
-          }).join('')}
+        ${(activeList.length===0&&driverCasuals.length===0)?'<p style="color:var(--t2);font-size:.8rem;margin:4px 0">Geen werkers nie.</p>':''}
+        ${activeList.map(n=>{
+          const isTemp=b.addedTemp.includes(n);
+          return `<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
+            <span style="flex:1">${n}${isTemp?' <span style="color:var(--ora);font-size:.68rem">(net vandag)</span>':''}</span>
+            <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem" onclick="pierreStartMove('${n.replace(/'/g,"\\'")}','${id}')">Skuif</button>
+            <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveWorker('${n.replace(/'/g,"\\'")}','${id}',${isTemp})">✕</button>
+          </div>`;
+        }).join('')}
+        ${driverCasuals.map(n=>`<div style="display:flex;align-items:center;gap:6px;font-size:.82rem;padding:3px 0">
+          <span style="flex:1">${n} <span style="color:var(--blue);font-size:.68rem">(los — deur bestuurder self)</span></span>
+          <button class="btn-sec btn" style="padding:3px 8px;font-size:.72rem;color:var(--red)" onclick="pierreRemoveDriverCasual('${n.replace(/'/g,"\\'")}','${id}')">✕</button>
+        </div>`).join('')}
       </div>`;
     }).join('')}
     <input type="hidden" id="pierre-worker-source" value="">
@@ -3975,6 +4031,23 @@ async function renderPierreTeamAdmin(ct){
       <button class="btn" onclick="pierreAddWorker()">＋ Voeg by / Skuif</button>
     </div>`;
   ct.appendChild(mc);
+}
+// Removes a casual worker a driver added themselves (via the unified
+// Werkers add control) straight from Pierre's Spanne tab — this writes
+// directly into that driver's own day-progress record, not the shared
+// roster/moves system, since that's where the driver's own addition lives.
+async function pierreRemoveDriverCasual(name, driverId){
+  const key='progress_'+driverId+'_'+todayKey();
+  const prog=await sGet(key, null);
+  if(!prog || !prog.workers || !(name in prog.workers)){ toast('Kon nie werker vind nie'); renderDriverTab('spanne'); return; }
+  const workers={...prog.workers};
+  delete workers[name];
+  const updated={...prog, workers};
+  await sSet(key, updated);
+  CACHE.progress[driverId+'_'+todayKey()]=updated;
+  if(S.driver===driverId) S.workers=workers;
+  toast('✓ '+name+' verwyder');
+  renderDriverTab('spanne');
 }
 
 function pierreStartMove(name, fromDriverId){
