@@ -675,23 +675,36 @@ async function collDelete(name, docId){
 }
 
 // One-time, self-healing migration from the old single-blob docs to the
-// new per-record collections — runs automatically on load, only copies
-// data across if the new collection is still empty, and never touches or
-// deletes the old blob (so nothing is destructive; if anything looks
-// wrong after this, the original data is still sitting there untouched).
+// new per-record collections — runs automatically on load, and never
+// touches or deletes the old blob (so nothing is destructive; if anything
+// looks wrong after this, the original data is still sitting there
+// untouched).
+//
+// v2 note: the original version of this function bailed out the moment it
+// saw ANY document already in the new collection, assuming that meant
+// migration had already happened. That was wrong — a handful of brand-new
+// invoices/quotes/etc. created directly in the new collections (after the
+// Firestore rules were widened) was enough to make it look "already
+// migrated" and permanently skip copying over the real historical data.
+// This version instead checks each individual record from the old blob by
+// its own ID, and only writes the ones genuinely missing — so it can't
+// mistake "a few new records exist" for "nothing old needs copying," and
+// re-running it is always safe (it never overwrites a record that's
+// already present in the new collection).
 async function ensureCollectionMigrated(oldKey, collName, isKeyed){
-  const flagKey='migrated_v1_'+collName;
+  const flagKey='migrated_v2_'+collName;
   const already = await sGet(flagKey, false);
   if(already) return;
   try{
-    const probe = await withTimeout(collRef(collName).limit(1).get(), STORAGE_TIMEOUT_MS, 'probe:'+collName);
-    if(!probe.empty){ await sSet(flagKey, true); return; } // already has real docs — nothing to do
     const old = await sGet(oldKey, isKeyed?{}:[]);
     const entries = isKeyed ? Object.entries(old) : old.map(r=>[r.id, r]);
     if(entries.length===0){ await sSet(flagKey, true); return; } // nothing to migrate
     for(const [id, data] of entries){
       if(!id) continue;
-      await collRef(collName).doc(String(id)).set(data);
+      const doc = await withTimeout(collRef(collName).doc(String(id)).get(), STORAGE_TIMEOUT_MS, 'migrateCheck:'+collName+'/'+id);
+      if(!doc.exists){
+        await collRef(collName).doc(String(id)).set(data);
+      }
     }
     await sSet(flagKey, true);
   }catch(e){
@@ -978,7 +991,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-6'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-7'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
