@@ -1012,7 +1012,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-18'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-20'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1048,7 +1048,7 @@ function startPolling(){
         ]);
         CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.quotes=quotes;
         await Promise.all(Object.keys(DRIVERS).map(fetchDriverProgress));
-        const NO_AUTOREFRESH_TABS=['payroll','map','statements','history'];
+        const NO_AUTOREFRESH_TABS=['payroll','map','history'];
         if(S.screen==='parent' && !NO_AUTOREFRESH_TABS.includes(S.parentTab)){
           // Preserve scroll position across this background refresh — a
           // full re-render was resetting scroll to the top every ~6
@@ -6738,6 +6738,7 @@ function showQuoteDetail(id){
   document.getElementById('quote-detail-modal')?.remove();
   const hidePrice=_quoteHidePriceForViewer(q);
   const priceKnown = q.status!=='assigned' && (q.quotedAmount||0)>0;
+  const canFinalize=!S.isOffice; // only Bestuur prices/decides — Jan can send drivers for quotes but not price them
   const durTxt = (q.durationHrs||q.durationMin) ?
     `${q.durationHrs?q.durationHrs+'u ':''}${q.durationMin?q.durationMin+'min':''}`.trim() : '';
   const row=(label,val)=> val?`<div style="padding:8px 0;border-bottom:1px solid var(--brd)">
@@ -6749,7 +6750,12 @@ function showQuoteDetail(id){
     <div class="mhdr">💬 Kwotasie besonderhede
       <button class="mclose" onclick="document.getElementById('quote-detail-modal').remove()">✕</button>
     </div>
-    <div style="margin-bottom:6px">${quoteStatusBadge(q)}</div>
+    <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
+      ${quoteStatusBadge(q)}
+      ${canFinalize&&q.status==='declined'?`<button onclick="unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
+          style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
+                 background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
+    </div>
     ${row('Adres', q.address)}
     ${row('Kliënt naam', q.name)}
     ${row('Selfoon', q.phone)}
@@ -6789,7 +6795,12 @@ function quoteCardHtml(q,canFinalize,hidePrice){
       </div>
       <div style="text-align:right;flex-shrink:0">
         ${!hidePrice?(priceKnown?`<div style="font-weight:800;font-size:1.05rem">R${q.quotedAmount||0}</div>`:`<div style="font-size:.72rem;color:var(--t3)">Nog nie geprys nie</div>`):''}
-        <div style="margin-top:4px">${quoteStatusBadge(q)}</div>
+        <div style="margin-top:4px;display:flex;align-items:center;gap:4px;justify-content:flex-end">
+          ${quoteStatusBadge(q)}
+          ${canFinalize&&q.status==='declined'?`<button onclick="event.stopPropagation();unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
+              style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
+                     background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
+        </div>
       </div>
     </div>
     ${priceKnown&&!hidePrice?`<div style="display:flex;gap:6px;margin-top:10px">
@@ -6941,6 +6952,16 @@ async function declineQuote(id){
   if(!confirm('Merk hierdie kwotasie as verwerp?'))return;
   await collUpdate('quotes', id, {status:'declined'});
   CACHE.quotes=getQuotes().map(q=>q.id===id?{...q,status:'declined'}:q);
+  refreshQuotesScreen();
+}
+// Brings a declined quote straight back to the table — no confirm dialog,
+// since undoing is low-stakes and the whole point is a quick "oops, not
+// that one" fix rather than another decision to make.
+async function unDeclineQuote(id){
+  await collUpdate('quotes', id, {status:'pending'});
+  CACHE.quotes=getQuotes().map(q=>q.id===id?{...q,status:'pending'}:q);
+  toast('↩️ Kwotasie herstel');
+  document.getElementById('quote-detail-modal')?.remove();
   refreshQuotesScreen();
 }
 
