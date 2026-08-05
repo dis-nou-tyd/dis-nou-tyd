@@ -93,6 +93,7 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
 .tab{flex:0 0 auto;padding:8px 14px;font-size:.76rem;font-weight:700;white-space:nowrap;
   color:var(--t2);border:2px solid var(--brd);background:var(--bg);border-radius:100px;cursor:pointer}
 .tab.on{color:#fff;background:var(--g8);border-color:var(--g8)}
+.tabs.compact .tab{padding:6px 9px;font-size:.68rem}
 
 /* ── CONTENT ── */
 .content{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
@@ -383,6 +384,7 @@ input[type=number]{-moz-appearance:textfield}
   .dbtn{padding:20px 10px}
   .dbtn span{font-size:1.05rem}
   .tab{padding:12px 20px;font-size:.9rem}
+  .tabs.compact .tab{padding:8px 12px;font-size:.76rem}
   .startbtn{padding:14px 24px;font-size:1.05rem}
   .finbtn{padding:14px 24px;font-size:1.05rem}
   .donelbl{padding:11px 20px;font-size:1rem}
@@ -449,7 +451,6 @@ input[type=number]{-moz-appearance:textfield}
   <div class="tabs" id="p-tabs">
     <button class="tab on" data-tab="overview">📊 Oorsig</button>
     <button class="tab" data-tab="quotes">💬 Kwotasies</button>
-    <button class="tab" data-tab="invoices">🧾 Fakture</button>
     <button class="tab" data-tab="ledger">📒 Kliënte</button>
     <button class="tab" data-tab="statements">📄 State</button>
     <button class="tab" data-tab="payroll">💰 Boekhouding</button>
@@ -1052,7 +1053,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-46'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-51'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1752,11 +1753,12 @@ async function loginOffice(){
 // but never invoices, statements, or client account balances (ledger) —
 // those stay with Bestuur only.
 function applyRoleTabs(){
-  const restricted = ['invoices','statements','ledger','payroll'];
+  const restricted = ['statements','ledger','payroll'];
   document.querySelectorAll('#p-tabs .tab').forEach(t=>{
     const isRestricted = restricted.includes(t.dataset.tab);
     t.style.display = (S.isOffice && isRestricted) ? 'none' : '';
   });
+  applyCompactTabs('p-tabs');
 }
 
 function formatToday(){
@@ -1818,7 +1820,7 @@ let EXP_FILTER={from:'',to:'',category:'',driverId:''};
 let INC_FILTER={from:'',to:'',clientKey:'',driverId:''};
 async function renderPayroll(ct){
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
-              ['uitgawes','🧾','Uitgawes'],['bank','🏦','Bank']];
+              ['uitgawes','🧾','Uitgawes'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
   ct.innerHTML=`
     <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
       ${tabs.map(([id,icon,label])=>`
@@ -1829,6 +1831,7 @@ async function renderPayroll(ct){
   if(BK_SUBTAB==='lone') await renderWages(document.getElementById('bk-body'));
   else if(BK_SUBTAB==='inkomste') await renderIncome(document.getElementById('bk-body'));
   else if(BK_SUBTAB==='bank') await renderBank(document.getElementById('bk-body'));
+  else if(BK_SUBTAB==='fakture') renderFaktuurTools(document.getElementById('bk-body'));
   else await renderExpenses(document.getElementById('bk-body'));
 }
 function renderWagesInto(){ renderWages(document.getElementById('bk-body')); }
@@ -3240,6 +3243,21 @@ function renderDriverTab(tab){
 function applyDriverTabs(){
   const isPierre = S.driver==='pierre';
   document.querySelectorAll('#d-tabs .pierre-only').forEach(t=>{ t.style.display = isPierre ? '' : 'none'; });
+  applyCompactTabs('d-tabs');
+}
+// Tabs size to fit their own text (see .tab CSS) rather than stretching
+// to fill the bar — good for a handful of tabs, but with more of them
+// (Pierre has the most: Route/Kwotasies/Dagstaat/Vordering/Spanne/
+// Inspeksies/Masjiene/Opsomming) they simply ran off the edge of the
+// screen instead of shrinking, cutting the last one or two off entirely.
+// Switches to smaller padding/font once a bar has enough visible tabs
+// that the full size genuinely doesn't fit, rather than shrinking every
+// tab bar in the app just because one of them is crowded.
+function applyCompactTabs(containerId){
+  const bar=document.getElementById(containerId);
+  if(!bar) return;
+  const visibleCount=Array.from(bar.children).filter(t=>t.style.display!=='none').length;
+  bar.classList.toggle('compact', visibleCount>=7);
 }
 function renderPlaceholderTab(ct,title,note){
   ct.innerHTML=`<div class="empty"><div class="ei">🧰</div><h3>${title}</h3><p>${note}</p></div>`;
@@ -3788,11 +3806,11 @@ async function deleteInvoiceAndReverseLedger(invId){
   }
   return removedInv;
 }
-// UI entry point for deleting an invoice straight from the Fakture list —
+// UI entry point for deleting an invoice straight from a client's page —
 // reuses the exact same ledger-safe delete undoFinish already relied on
 // (removes the invoice's own ledger entry and recalculates the balance
 // from what's left), so a deleted invoice is fully gone from that
-// client's statement too, not just from the invoice list.
+// client's statement too, not just from wherever it was being viewed.
 async function confirmDeleteInvoice(id){
   const inv=getInvoices().find(i=>i.id===id);
   if(!inv) return;
@@ -3802,26 +3820,52 @@ async function confirmDeleteInvoice(id){
   if(!confirm(msg+'\n\n'+inv.address+' — R'+inv.amount.toFixed(2))) return;
   await deleteInvoiceAndReverseLedger(id);
   toast('🗑 Faktuur geskrap');
-  renderParentTab('invoices');
+  refreshInvoiceViews(inv);
 }
 
 // Lets Bestuur create a fully real invoice not tied to any completed
 // route job — e.g. a special one-off charge. Produces the exact same kind
 // of invoice as a finished garden: its own document, linked into the
 // client's ledger/statement, downloadable as the same PDF template.
+// Combines clients who already have an account with clients who only
+// exist on a driver's schedule and have never been invoiced yet — the
+// old version of this picker only showed the first group, which meant a
+// client already on someone's route but never yet invoiced couldn't be
+// selected at all, and had to be retyped by hand — exactly how near-
+// duplicate accounts (the same real client under two slightly different
+// spellings of their address) were happening.
+function getAllKnownClients(){
+  const combined={};
+  Object.entries(getLedger()).forEach(([key,c])=>{
+    combined[key]={key, address:c.address, name:c.name||'', pastelCode:c.code||'', hasAccount:true};
+  });
+  const sched=SCHEDULE||ALL_ROUTES;
+  Object.values(sched||{}).forEach(weeks=>{
+    Object.values(weeks||{}).forEach(days=>{
+      Object.values(days||{}).forEach(clients=>{
+        (clients||[]).forEach(c=>{
+          const key=c.pastelCode||c.address;
+          if(key && !combined[key]){
+            combined[key]={key, address:c.address, name:c.name||'', pastelCode:c.pastelCode||'', hasAccount:false};
+          }
+        });
+      });
+    });
+  });
+  return Object.values(combined).sort((a,b)=>(a.name||a.address).localeCompare(b.name||b.address));
+}
 function showManualInvoiceForm(){
   document.getElementById('manual-inv-modal')?.remove();
-  const led=getLedger();
-  const clientOptions=Object.entries(led)
-    .sort((a,b)=>(a[1].name||a[1].address).localeCompare(b[1].name||b[1].address))
-    .map(([key,c])=>`<option value="${key}">${c.name||c.address}${c.name?' — '+c.address:''}</option>`).join('');
+  const clientList=getAllKnownClients();
+  const clientOptions=clientList
+    .map(c=>`<option value="${c.key}">${c.name||c.address}${c.name?' — '+c.address:''}${c.hasAccount?'':' (nog nie gefaktureer nie)'}</option>`).join('');
   const driverOptions=Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}">${d.icon} ${d.name}</option>`).join('');
   const bg=el('div','mbg'); bg.id='manual-inv-modal';
   bg.innerHTML=`<div class="modal">
     <div class="mhdr">➕ Nuwe faktuur
       <button class="mclose" onclick="document.getElementById('manual-inv-modal').remove()">✕</button>
     </div>
-    <div><div class="flbl" style="margin-bottom:5px">Bestaande kliënt (opsioneel) / Existing client</div>
+    <div><div class="flbl" style="margin-bottom:5px">Kliënt / Client *</div>
       <select class="inp" id="mi-client" onchange="_fillManualInvoiceClient(this.value)">
         <option value="">— Nuwe kliënt / New client —</option>
         ${clientOptions}
@@ -3830,8 +3874,8 @@ function showManualInvoiceForm(){
       <input class="inp" id="mi-addr" placeholder="Kliënt adres"></div>
     <div><div class="flbl" style="margin-bottom:5px">Naam / Name</div>
       <input class="inp" id="mi-name" placeholder="Kliënt naam"></div>
-    <div><div class="flbl" style="margin-bottom:5px">Pastel kode (indien bekend)</div>
-      <input class="inp" id="mi-pastel" placeholder="bv. VOOR012"></div>
+    <div><div class="flbl" style="margin-bottom:5px">Pastel kode</div>
+      <input class="inp" id="mi-pastel" placeholder="Los leeg tensy nog van vantevore"></div>
     <div><div class="flbl" style="margin-bottom:5px">Datum / Date *</div>
       <input class="inp" id="mi-date" type="date" value="${todayKey()}"></div>
     <div><div class="flbl" style="margin-bottom:5px">Werk / Services</div>
@@ -3873,13 +3917,24 @@ function _updateManualInvoiceTotal(){
   const el2=document.getElementById('mi-total-preview');
   if(el2) el2.textContent='Totaal: R'+total.toFixed(2);
 }
+// Locks the address/name fields once a specific client is picked — typing
+// even a slightly different address here used to be exactly how the same
+// real client ended up with two separate accounts.
 function _fillManualInvoiceClient(key){
-  if(!key) return;
-  const c=getLedger()[key];
+  const addrInp=document.getElementById('mi-addr'), nameInp=document.getElementById('mi-name'), pastelInp=document.getElementById('mi-pastel');
+  if(!key){
+    addrInp.value=''; nameInp.value=''; pastelInp.value='';
+    addrInp.readOnly=false; nameInp.readOnly=false;
+    addrInp.style.background=''; nameInp.style.background='';
+    return;
+  }
+  const c=getAllKnownClients().find(x=>x.key===key);
   if(!c) return;
-  document.getElementById('mi-addr').value=c.address||'';
-  document.getElementById('mi-name').value=c.name||'';
-  document.getElementById('mi-pastel').value=c.code||'';
+  addrInp.value=c.address||'';
+  nameInp.value=c.name||'';
+  pastelInp.value=c.pastelCode||'';
+  addrInp.readOnly=true; nameInp.readOnly=true;
+  addrInp.style.background='var(--bg)'; nameInp.style.background='var(--bg)';
 }
 async function submitManualInvoice(){
   const address=document.getElementById('mi-addr').value.trim();
@@ -3905,7 +3960,7 @@ async function submitManualInvoice(){
   const inv=await createManualInvoice(fields);
   document.getElementById('manual-inv-modal')?.remove();
   toast('✓ Faktuur geskep — '+inv.id);
-  renderParentTab('invoices');
+  refreshInvoiceViews(inv);
   if(confirm('Faktuur geskep. Wil jy nou die PDF genereer en stuur?')) await shareInvoicePDF(inv.id);
 }
 // Same safe single-document write as a normal job-triggered invoice, just
@@ -4586,14 +4641,13 @@ document.querySelectorAll('#p-tabs .tab').forEach(t=>{
 });
 
 async function renderParentTab(tab){
-  if(S.isOffice && (tab==='invoices' || tab==='statements' || tab==='ledger' || tab==='payroll')) tab='overview';
+  if(S.isOffice && (tab==='statements' || tab==='ledger' || tab==='payroll')) tab='overview';
   S.parentTab=tab;
   document.querySelectorAll('#p-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===tab));
   const c=document.getElementById('p-content');
   c.innerHTML='';
   if(tab==='overview')   await renderOverview(c);
   if(tab==='quotes')     await renderQuotesParent(c);
-  if(tab==='invoices')   await renderInvoices(c);
   if(tab==='ledger')     await renderLedger(c);
   if(tab==='statements') await renderStatements(c);
   if(tab==='payroll')    await renderPayroll(c);
@@ -5105,12 +5159,13 @@ async function recoverInvoices(dateKey, missingByDriver){
     : `<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${recovered} faktu(u)r(e) herstel${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
   toast(stoppedEarly ? `⚠️ Gestop na ${recovered} — bediener oorlaai` : `✓ ${recovered} faktuur/fakture herstel`);
   // The recovery above genuinely works — createInvoice already updates
-  // CACHE.invoices — but the Fakture list rendered behind this modal was
-  // never told to rebuild, so it kept showing whatever it looked like
-  // before the scan. That's exactly why this could look like nothing had
-  // happened even though the invoices were really created.
-  if(recovered>0 && S.screen==='parent' && S.parentTab==='invoices'){
-    renderInvoices(document.getElementById('p-content'));
+  // CACHE.invoices — but whatever view was showing invoices at the time
+  // (a client's page, or the Fakture tools list) was never told to
+  // rebuild, so it kept showing whatever it looked like before the scan.
+  // That's exactly why this could look like nothing had happened even
+  // though the invoices were really created.
+  if(recovered>0){
+    refreshInvoiceViews();
   }
 }
 
@@ -5209,22 +5264,53 @@ async function fixWronglyInvoiced(dateKey, wrongByDriver){
   }
   results.innerHTML=`<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${fixed} faktu(u)r(e) verwyder en rekeninge reggestel${skippedSent>0?` · ${skippedSent} was reeds gestuur (gebruik Krediet Nota)`:''}${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
   toast(`✓ ${fixed} foutiewe faktuur/fakture herstel`);
-  renderParentTab('invoices');
+  refreshInvoiceViews();
 }
 
-// Which dates are expanded in the Fakture accordion — today starts open,
-// everything else starts collapsed, so opening the tab isn't an
-// overwhelming wall of every invoice ever created. Persists across
-// re-renders (polling etc.) since it lives outside the render function.
-let INVOICE_OPEN_DATES=new Set([todayKey()]);
-function toggleInvoiceDate(dateKey){
-  if(INVOICE_OPEN_DATES.has(dateKey)) INVOICE_OPEN_DATES.delete(dateKey);
-  else INVOICE_OPEN_DATES.add(dateKey);
-  renderParentTab('invoices');
+function makeCreditNoteCard(cn){
+  const card=el('div','inv-item');
+  card.innerHTML=`
+    <div class="inv-hdr">
+      <div>
+        <div class="inv-addr">${cn.address}</div>
+        <div class="inv-meta">
+          ${cn.name?cn.name+' · ':''}${cn.date}<br>
+          <span class="inv-driver">Vir faktuur: ${cn.originalInvoiceId}</span>
+          ${cn.reason?' · '+cn.reason:''}
+        </div>
+      </div>
+      <div>
+        <div class="inv-amount" style="color:var(--red)">-R${cn.total.toFixed(2)}</div>
+        <div class="inv-driver">${cn.id}</div>
+      </div>
+    </div>
+    <div class="inv-actions">
+      <button class="inv-wa" onclick="shareCreditNotePDF('${cn.id}')" style="background:#C62828;flex:1">
+        📄 Stuur Krediet Nota (PDF)
+      </button>
+      <button onclick="viewCreditNotePDF('${cn.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+        👁
+      </button>
+      <button onclick="downloadCreditNotePDF('${cn.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+        ⬇️
+      </button>
+    </div>`;
+  return card;
 }
-function renderInvoices(ct){
-  const invs=getInvoices().slice().reverse(); // newest first
 
+// Invoices used to have their own tab, grouped by day and split into
+// pending/sent. In practice this business doesn't send invoices out
+// proactively — they're kept on hand until a client actually asks, so
+// "which ones have been sent" was never a meaningful distinction, and
+// browsing by date was less useful than just looking at a specific
+// client's own page (see showClientLedger) to see everything tied to
+// them in one place, invoices included. What's left here is the handful
+// of tools that don't belong to any one client: creating an invoice from
+// scratch, crediting an existing one, and the two repair scans.
+function renderFaktuurTools(ct){
+  ct.innerHTML='';
   const newBtn=el('button','btn btn-blue');
   newBtn.style.cssText='margin-bottom:10px;width:100%';
   newBtn.innerHTML='➕ Nuwe faktuur (vanaf niks) / New invoice from scratch';
@@ -5237,120 +5323,51 @@ function renderInvoices(ct){
   cnBtn.onclick=showCreditNoteLookup;
   ct.appendChild(cnBtn);
 
-  if(invs.length===0){
-    const empty=el('div','empty');
-    empty.innerHTML='<div class="ei">🧾</div><h3>Geen fakture nog</h3><p>Fakture verskyn hier sodra bestuurders tuine afmerk.</p>';
-    ct.appendChild(empty);
-    const recBtn0=el('button','btn-sec btn');
-    recBtn0.style.cssText='margin-top:10px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
-    recBtn0.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
-    recBtn0.onclick=showRecoverInvoices;
-    ct.appendChild(recBtn0);
-    return;
-  }
-
-  // Grouped by day and shown as a click-to-expand accordion instead of one
-  // long flat "pending then sent" list — with months of invoices piling
-  // up, finding "today's" or "last Tuesday's" invoices meant scrolling
-  // past everything else first. Newest date first; each date's own
-  // pending/sent split is preserved inside it.
-  const byDate={};
-  invs.forEach(inv=>{ (byDate[inv.dateKey]=byDate[inv.dateKey]||[]).push(inv); });
-  const dateKeys=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
-
-  dateKeys.forEach(dateKey=>{
-    const dayInvs=byDate[dateKey];
-    const dayPending=dayInvs.filter(i=>i.status==='pending');
-    const daySent=dayInvs.filter(i=>i.status==='sent');
-    const dayTotal=dayInvs.reduce((s,i)=>s+i.amount,0);
-    const isOpen=INVOICE_OPEN_DATES.has(dateKey);
-    const label=dayInvs[0].date||dateKey;
-
-    const hdr=el('div');
-    hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
-      +'background:var(--card);border:1px solid var(--brd);border-radius:10px;padding:12px 14px;margin-top:8px';
-    hdr.innerHTML=`
-      <div>
-        <div style="font-weight:700">${isOpen?'▾':'▸'} ${label}</div>
-        <div style="font-size:.76rem;color:var(--t2);margin-top:2px">
-          ${dayInvs.length} faktu${dayInvs.length===1?'ur':'re'}${dayPending.length?' · '+dayPending.length+' wag om te stuur':''}
-        </div>
-      </div>
-      <div style="font-weight:800">R${dayTotal.toFixed(0)}</div>`;
-    hdr.onclick=()=>toggleInvoiceDate(dateKey);
-    ct.appendChild(hdr);
-
-    if(isOpen){
-      dayPending.forEach(inv=>ct.appendChild(makeInvCard(inv)));
-      daySent.forEach(inv=>ct.appendChild(makeInvCard(inv,true)));
-    }
-  });
-
-  // Credit notes previously had nowhere to live after the moment they were
-  // created — this list is the first place they can actually be found,
-  // re-viewed, re-downloaded, or re-sent later. They already reduce the
-  // client's ledger balance and now also show up as their own line on
-  // that client's statement (see getMonthPayments).
   const creditNotes=getCreditNotes();
   if(creditNotes.length){
     const lbl=el('div','divlbl');
-    lbl.style.marginTop='14px';
     lbl.textContent=`🧾 KREDIET NOTAS (${creditNotes.length})`;
     ct.appendChild(lbl);
-    creditNotes.forEach(cn=>{
-      const card=el('div','inv-item');
-      card.innerHTML=`
-        <div class="inv-hdr">
-          <div>
-            <div class="inv-addr">${cn.address}</div>
-            <div class="inv-meta">
-              ${cn.name?cn.name+' · ':''}${cn.date}<br>
-              <span class="inv-driver">Vir faktuur: ${cn.originalInvoiceId}</span>
-              ${cn.reason?' · '+cn.reason:''}
-            </div>
-          </div>
-          <div>
-            <div class="inv-amount" style="color:var(--red)">-R${cn.total.toFixed(2)}</div>
-            <div class="inv-driver">${cn.id}</div>
-          </div>
-        </div>
-        <div class="inv-actions">
-          <button class="inv-wa" onclick="shareCreditNotePDF('${cn.id}')" style="background:#C62828;flex:1">
-            📄 Stuur Krediet Nota (PDF)
-          </button>
-          <button onclick="viewCreditNotePDF('${cn.id}')" style="background:var(--bg);border:2px solid var(--brd);
-                  border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-            👁
-          </button>
-          <button onclick="downloadCreditNotePDF('${cn.id}')" style="background:var(--bg);border:2px solid var(--brd);
-                  border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-            ⬇️
-          </button>
-        </div>`;
-      ct.appendChild(card);
-    });
+    creditNotes.forEach(cn=>ct.appendChild(makeCreditNoteCard(cn)));
   }
 
-  // Moved to the very bottom — this is a recovery/repair tool for a rare
-  // edge case, not something that belongs above the actual invoice list
-  // every time the tab opens.
+  // Moved to the very bottom — these are recovery/repair tools for rare
+  // edge cases, not something that belongs above everything else.
   const recBtn=el('button','btn-sec btn');
   recBtn.style.cssText='margin-top:16px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
   recBtn.innerHTML='🔧 Herstel ontbrekende fakture / Recover missing invoices';
   recBtn.onclick=showRecoverInvoices;
   ct.appendChild(recBtn);
 
-  // Companion tool for the opposite problem: a garden marked done (and
-  // invoiced), then later changed to a skip reason like "Oorgesit" without
-  // the invoice ever being reversed — which used to be possible before
-  // setSkip() checked for this. Finds any invoice still sitting there for
-  // a garden that's now marked skipped, so it can be cleaned up.
   const wrongBtn=el('button','btn-sec btn');
   wrongBtn.style.cssText='margin-top:8px;width:100%;background:#FFF3CD;border-color:#FFE082;color:#856404';
   wrongBtn.innerHTML='🔍 Vind foutief gefaktureerde (oorgesit ens.) tuine';
   wrongBtn.onclick=showWronglyInvoicedScan;
   ct.appendChild(wrongBtn);
 }
+
+// Invoices no longer have their own tab — this refreshes whichever view
+// is actually showing them right now: the client's own page if it's
+// open (re-matching which client, same as everywhere else — pastelCode
+// first, else address), and/or the Fakture tools sub-tab under
+// Boekhouding if that's what's open (mainly for the credit notes list).
+// Accepts either an invoice/credit-note object (matched by pastelCode/
+// address) or a raw ledger key string directly.
+function refreshInvoiceViews(invOrKey){
+  const modal=document.getElementById('ledger-modal');
+  if(modal && invOrKey){
+    const led=getLedger();
+    let key=null;
+    if(typeof invOrKey==='string') key=invOrKey;
+    else key=Object.keys(led).find(k=>invoiceMatchesClient(invOrKey, led[k]));
+    if(key && led[key]) showClientLedger(key, led[key]);
+  }
+  if(S.screen==='parent' && S.parentTab==='payroll' && BK_SUBTAB==='fakture'){
+    const body=document.getElementById('bk-body');
+    if(body) renderFaktuurTools(body);
+  }
+}
+
 
 // ══════════════════ CREDIT NOTES ═══════════════════════════════════════════════
 // Enter an invoice number → pull up its line items → pick which ones (or how
@@ -5480,7 +5497,7 @@ async function submitCreditNote(invId){
   document.getElementById('cn-form-modal')?.remove();
   toast('✓ Krediet Nota geskep');
   await shareCreditNotePDF(cn.id);
-  renderParentTab('invoices');
+  refreshInvoiceViews(cn);
 }
 function buildCreditNotePDF(cn){
   const {jsPDF}=window.jspdf;
@@ -5531,8 +5548,8 @@ function downloadCreditNotePDF(cnId){
   downloadPDF(buildCreditNotePDF(cn), `KredietNota_${cn.id}.pdf`);
 }
 
-function makeInvCard(inv,isSent=false){
-  const card=el('div','inv-item'+(isSent?' sent':''));
+function makeInvCard(inv){
+  const card=el('div','inv-item');
   const total=inv.amount.toFixed(2);
   const invText=buildInvoiceText(inv);
   const waText=encodeURIComponent(invText);
@@ -5559,7 +5576,6 @@ function makeInvCard(inv,isSent=false){
         <div class="inv-driver">${inv.id}</div>
       </div>
     </div>
-    ${!isSent?`
     <div class="inv-actions">
       <button class="inv-wa" onclick="shareInvoicePDF('${inv.id}')" style="background:var(--g8);flex:1">
         📄 Stuur Faktuur (PDF)
@@ -5580,30 +5596,7 @@ function makeInvCard(inv,isSent=false){
               border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--red)">
         🗑
       </button>
-    </div>
-    `:`<div class="inv-sent">✓ Gestuur – tik om terug te plaas</div>
-    <div class="inv-actions" style="margin-top:6px">
-      <button onclick="event.stopPropagation();viewInvoicePDF('${inv.id}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-        👁 Bekyk
-      </button>
-      <button onclick="event.stopPropagation();downloadInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-        ⬇️
-      </button>
-      <button onclick="event.stopPropagation();showEditInvoiceModal('${inv.id}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-        ✏️ Wysig
-      </button>
-      <button onclick="event.stopPropagation();confirmDeleteInvoice('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--red)">
-        🗑
-      </button>
-    </div>`}`;
-
-  if(isSent){
-    card.querySelector('.inv-sent').onclick=()=>markPending(inv.id);
-  }
+    </div>`;
 
   return card;
 }
@@ -5876,7 +5869,7 @@ async function shareInvoicePDF(id){
   if(!inv) return;
   const blob=buildInvoicePDF(inv);
   markSent(id);
-  renderParentTab('invoices');
+  refreshInvoiceViews(inv);
   await shareOrDownloadPDF(blob, `Faktuur_${inv.id}.pdf`,
     `Faktuur ${inv.id}`, `Faktuur vir ${inv.address} — R${inv.amount.toFixed(2)}`);
   toast('📄 Faktuur PDF gereed');
@@ -5902,8 +5895,9 @@ async function markSent(id){
 }
 async function markPending(id){
   await collUpdate('invoices', id, {status:'pending'});
+  const inv=getInvoices().find(i=>i.id===id);
   CACHE.invoices=getInvoices().map(i=>i.id===id?{...i,status:'pending'}:i);
-  renderParentTab('invoices');
+  refreshInvoiceViews(inv);
 }
 
 // Pricing sometimes needs correcting after the fact. Editing an invoice
@@ -5983,7 +5977,7 @@ async function submitEditInvoice(invId){
 
   document.getElementById('edit-inv-modal')?.remove();
   toast('✓ Faktuur bygewerk');
-  renderParentTab('invoices');
+  refreshInvoiceViews(editedInv);
 }
 
 function previewInv(id){
@@ -6351,6 +6345,13 @@ async function renderLedger(ct){
   ct.appendChild(listWrap);
 
   renderLedgerList(ct);
+
+  // Tucked away at the bottom, small — not something used often.
+  const mergeBtn=el('button','btn-sec btn');
+  mergeBtn.style.cssText='width:auto;padding:4px 10px;margin:14px auto 0;display:block;font-size:.68rem;color:var(--t3)';
+  mergeBtn.innerHTML='🔀 Merge kliënte';
+  mergeBtn.onclick=showMergeClientsModal;
+  ct.appendChild(mergeBtn);
 }
 // Lets Bestuur match a driver-logged "cash for a past job" entry to the
 // real client and apply it as a payment on their account — same
@@ -6436,10 +6437,104 @@ function renderLedgerList(ct){
   });
 }
 
+// Combines two client accounts that turned out to be the same real client
+// under two slightly different spellings/keys — every invoice that
+// pointed at the OLD one is repointed at the SURVIVING one's canonical
+// address/Pastel code, the old account's transaction history is folded
+// into the survivor's, its balance is recomputed from the combined
+// entries, and the old account is deleted. Nothing about the invoices
+// themselves is edited beyond which client they belong to — amounts,
+// dates, services all stay exactly as they were.
+function showMergeClientsModal(){
+  document.getElementById('merge-clients-modal')?.remove();
+  const led=getLedger();
+  const options=Object.entries(led)
+    .sort((a,b)=>(a[1].name||a[1].address).localeCompare(b[1].name||b[1].address))
+    .map(([key,c])=>`<option value="${key}">${c.name||c.address}${c.name?' — '+c.address:''} (R${(c.balance||0).toFixed(0)})</option>`).join('');
+  const bg=el('div','mbg'); bg.id='merge-clients-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">🔀 Merge kliënte
+      <button class="mclose" onclick="document.getElementById('merge-clients-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Vir wanneer dieselfde kliënt per ongeluk twee rekeninge het (bv. adres effens anders gespel). Alle fakture, transaksies en saldo van die eerste kliënt skuif na die tweede — dan word die eerste een verwyder. Kan nie ontdoen word nie.
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Skuif VAN (word verwyder) / Merge FROM (deleted)</div>
+      <select class="inp" id="mrg-from"><option value="">— Kies kliënt —</option>${options}</select></div>
+    <div><div class="flbl" style="margin-bottom:5px">Skuif NA (bly staan) / Merge INTO (kept)</div>
+      <select class="inp" id="mrg-to"><option value="">— Kies kliënt —</option>${options}</select></div>
+    <button class="btn" style="background:var(--red)" onclick="submitMergeClients()">🔀 Merge nou / Merge now</button>
+    <button class="btn btn-sec" onclick="document.getElementById('merge-clients-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+async function submitMergeClients(){
+  const fromKey=document.getElementById('mrg-from').value;
+  const toKey=document.getElementById('mrg-to').value;
+  if(!fromKey||!toKey){ alert('Kies albei kliënte'); return; }
+  if(fromKey===toKey){ alert('Kies twee verskillende kliënte'); return; }
+  const led=getLedger();
+  const fromC=led[fromKey], toC=led[toKey];
+  if(!fromC||!toC){ alert('Kon nie kliënte vind nie'); return; }
+  if(!confirm(`Skuif alles van "${fromC.name||fromC.address}" na "${toC.name||toC.address}", en verwyder "${fromC.name||fromC.address}" permanent?\n\nDit kan nie ontdoen word nie.`)) return;
+
+  let mergedTo=null;
+  try{
+    mergedTo = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+      const fromRef=FS_DB.collection('ledger').doc(fromKey);
+      const toRef=FS_DB.collection('ledger').doc(toKey);
+      const [fromDoc,toDoc]=await Promise.all([transaction.get(fromRef), transaction.get(toRef)]);
+      if(!fromDoc.exists||!toDoc.exists) return null;
+      const fromData=fromDoc.data(), toData=toDoc.data();
+      const combinedEntries=[...(toData.entries||[]), ...(fromData.entries||[])]
+        .sort((a,b)=>(a.date||'').localeCompare(b.date||''));
+      toData.entries=combinedEntries;
+      toData.balance=combinedEntries.reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
+      transaction.set(toRef, toData);
+      transaction.delete(fromRef);
+      return toData;
+    }), 8000, 'mergeClients-transaction');
+  }catch(e){
+    console.error('Merge het misluk:', e);
+    alert('Kon nie merge nie.\n\nRede / Reason: '+(e&&e.message?e.message:e)+'\n\nStuur asb hierdie boodskap aan — dit help om die probleem reg te maak.');
+    return;
+  }
+  if(!mergedTo){ alert('Kon nie een van die kliënte vind nie — probeer weer.'); return; }
+
+  // Repoint every invoice that belonged to the removed client so it now
+  // matches the survivor — otherwise the invoices themselves would still
+  // exist but match nothing (invoiceMatchesClient has no ledger record
+  // left to compare against).
+  const affectedInvoices=getInvoices().filter(inv=>invoiceMatchesClient(inv, fromC));
+  await Promise.all(affectedInvoices.map(inv=>
+    collUpdate('invoices', inv.id, {pastelCode: toC.code||'', address: toC.address})
+      .catch(e=>console.error('Kon nie faktuur oordra nie:', inv.id, e))
+  ));
+  const affectedIds=new Set(affectedInvoices.map(i=>i.id));
+  CACHE.invoices=getInvoices().map(inv=>
+    affectedIds.has(inv.id) ? {...inv, pastelCode: toC.code||'', address: toC.address} : inv
+  );
+
+  const newLed={...getLedger()};
+  delete newLed[fromKey];
+  newLed[toKey]=mergedTo;
+  CACHE.ledger=newLed;
+
+  document.getElementById('merge-clients-modal')?.remove();
+  toast(`✓ Gemerge na ${toC.name||toC.address}`);
+  if(S.screen==='parent' && S.parentTab==='ledger'){
+    renderLedger(document.getElementById('p-content'));
+  }
+}
+
 function showClientLedger(key,c){
+  document.getElementById('ledger-modal')?.remove();
   const bg=el('div','mbg'); bg.id='ledger-modal';
   const entries=(c.entries||[]).slice().reverse();
   const bal=c.balance||0;
+  const clientInvoices=getInvoices().filter(inv=>invoiceMatchesClient(inv,c)).sort((a,b)=>b.dateKey.localeCompare(a.dateKey));
+  const clientCreditNotes=getCreditNotes().filter(cn=>invoiceMatchesClient(cn,c));
   bg.innerHTML=`<div class="modal">
     <div class="mhdr">${c.address}
       <button class="mclose" onclick="document.getElementById('ledger-modal').remove()">✕</button>
@@ -6499,9 +6594,18 @@ function showClientLedger(key,c){
         }).join('');
       })():'<div style="padding:20px;text-align:center;color:var(--t2)">Geen transaksies</div>'}
     </div>
+    <div class="divlbl">FAKTURE (${clientInvoices.length}) <span style="font-weight:400;color:var(--t3)">· gehou tot iemand daarvoor vra</span></div>
+    <div id="client-inv-cards">${clientInvoices.length?'':'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:16px 0">Geen fakture nog vir hierdie kliënt nie.</p>'}</div>
+    ${clientCreditNotes.length?`<div class="divlbl">🧾 KREDIET NOTAS (${clientCreditNotes.length})</div><div id="client-cn-cards"></div>`:''}
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
   document.body.appendChild(bg);
+  const invHolder=document.getElementById('client-inv-cards');
+  clientInvoices.forEach(inv=>invHolder.appendChild(makeInvCard(inv)));
+  if(clientCreditNotes.length){
+    const cnHolder=document.getElementById('client-cn-cards');
+    clientCreditNotes.forEach(cn=>cnHolder.appendChild(makeCreditNoteCard(cn)));
+  }
 }
 // One-off repair for a client's ledger: removes any entry that still
 // references an invoice which no longer exists (e.g. left behind by a
