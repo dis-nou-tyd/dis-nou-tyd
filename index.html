@@ -552,6 +552,34 @@ async function sGet(key, fallback){
     return d && d.value!==undefined ? JSON.parse(d.value) : fallback;
   }catch{ return fallback; }
 }
+// For data where silently accepting an empty/stale fallback would be
+// actively dangerous — invoices and the ledger, specifically, since a
+// blank result there looks exactly like "no invoices exist" rather than
+// "the read failed" — this retries a couple of times first, and if it
+// still can't get a real answer, flips the sync badge red so the person
+// knows NOT to trust what's on screen, instead of quietly showing an
+// empty/wrong list with a calm green "synced" badge. A single dropped
+// request (very plausible on a tablet with patchy signal out in a garden)
+// used to be enough to make every invoice look like it had vanished for
+// the rest of that session.
+async function sGetCritical(key, fallback, retries=2){
+  for(let attempt=0; attempt<=retries; attempt++){
+    try{
+      const doc = await withTimeout(FS_KV.doc(key).get(), STORAGE_TIMEOUT_MS, 'sGetCritical:'+key);
+      if(!doc.exists) return fallback; // genuinely empty — not a failure
+      const d = doc.data();
+      const val = d && d.value!==undefined ? JSON.parse(d.value) : fallback;
+      STORAGE_OK=true; updateSyncBadge();
+      return val;
+    }catch(e){
+      if(attempt<retries){ await new Promise(r=>setTimeout(r, 500*(attempt+1))); continue; }
+      console.error('Kon nie kritieke data laai nie na herhaalde pogings:', key, e);
+      STORAGE_OK=false; updateSyncBadge();
+      return fallback;
+    }
+  }
+  return fallback;
+}
 // A write failing is a real problem — Firestore unreachable, blocked by
 // security rules, or no internet connection.
 async function sSet(key, value){
@@ -691,7 +719,7 @@ function applyRosterAndMoves(driverId, moves){
 
 async function hydrateCache(){
   const [invoices, ledger, invSeq, quotes, expenses, bankTxns, creditNotes] = await Promise.all([
-    sGet('invoices', []), sGet('ledger', {}), sGet('inv_seq', 1000), sGet('quotes', []), sGet('expenses', []), sGet('bank_txns', []), sGet('credit_notes', []),
+    sGetCritical('invoices', []), sGetCritical('ledger', {}), sGet('inv_seq', 1000), sGet('quotes', []), sGet('expenses', []), sGet('bank_txns', []), sGet('credit_notes', []),
   ]);
   CACHE.invoices=invoices; CACHE.ledger=ledger; CACHE.invSeq=invSeq; CACHE.quotes=quotes; CACHE.expenses=expenses; CACHE.bankTxns=bankTxns; CACHE.creditNotes=creditNotes; CACHE.ready=true;
 }
@@ -3902,7 +3930,8 @@ async function scanForMissingInvoices(){
   const results=document.getElementById('recover-results');
   results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Deursoek…</p>';
 
-  const currentInvs=getInvoices();
+  const currentInvs = await sGetCritical('invoices', getInvoices());
+  CACHE.invoices = currentInvs; // this scan just re-synced the real list — keep the rest of the app in step with it
   const missingByDriver={};
   let totalMissing=0, totalValue=0;
 
@@ -4644,6 +4673,7 @@ function drawHistory(ct){
       </select>
     </div>
     ${!data?`<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:30px 0">Geen rekord vir ${d.name} op ${HIST.date} nie.</p>`:`
+    <button class="btn-sec btn" style="width:100%;margin:6px 0;color:var(--blue)" onclick="showMoveDayModal()">🔧 Skuif hierdie dag na 'n ander datum</button>
     <div class="ovgrid" style="margin-top:8px">
       <div class="ovc"><div class="v">${route.length}</div><div class="l">Tuine totaal</div></div>
       <div class="ovc"><div class="v" style="color:var(--g7)">${done}</div><div class="l">Klaar</div></div>
@@ -4682,6 +4712,85 @@ function drawHistory(ct){
     </div>`}`;
   document.getElementById('hist-driver').onchange=e=>histSetDriver(e.target.value);
   document.getElementById('hist-date').onchange=e=>histSetDate(e.target.value);
+}
+
+// Relabels a whole day's saved record (and any invoices/ledger entries it
+// created) onto a different date — for fixing a day that got filed under
+// the wrong date, e.g. by a driver's tablet having the wrong timezone
+// before that was fixed. This does NOT delete anything real: the jobs,
+// their completed/skipped state, and their invoices all move together to
+// the corrected date, so nothing gets lost or double-counted. The source
+// date is left empty afterward so that driver gets a fresh list generated
+// for it next time, instead of the day it used to (wrongly) hold.
+function showMoveDayModal(){
+  if(!HIST.data){ toast('Geen rekord om te skuif nie'); return; }
+  document.getElementById('move-day-modal')?.remove();
+  const d=DRIVERS[HIST.driverId];
+  const route=HIST.data.route||[];
+  const done=route.filter(g=>g.completed).length;
+  const invCount=route.filter(g=>g.invId).length;
+  const bg=el('div','mbg'); bg.id='move-day-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">🔧 Skuif ${d.name} se ${HIST.date}
+      <button class="mclose" onclick="document.getElementById('move-day-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Hierdie rekord het ${route.length} tuine (${done} klaar${invCount?', '+invCount+' fakture':''}). Dit word na die nuwe datum geskuif — fakture en die kliënt-rekening skuif saam. Die ${HIST.date}-skuiwe word dan leeg gelaat vir 'n vars lys.
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Regte datum / Correct date</div>
+      <input class="inp" id="md-target" type="date" value="${HIST.date}"></div>
+    <button class="btn" onclick="submitMoveDay()">Skuif / Move</button>
+    <button class="btn btn-sec" onclick="document.getElementById('move-day-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+
+async function submitMoveDay(){
+  const target=document.getElementById('md-target').value;
+  const fromKey=HIST.date, driverId=HIST.driverId;
+  if(!target){ alert('Kies \'n datum'); return; }
+  if(target===fromKey){ alert('Dis reeds daardie datum'); return; }
+
+  const src = await sGet('progress_'+driverId+'_'+fromKey, null);
+  if(!src || !src.route || !src.route.length){ alert('Geen rekord om te skuif nie'); return; }
+
+  const existing = await sGet('progress_'+driverId+'_'+target, null);
+  if(existing && existing.route && existing.route.length){
+    if(!confirm('Daar is reeds \'n rekord op '+target+' ('+existing.route.length+' tuine). Dit sal OORSKRYF word. Voortgaan?')) return;
+  }
+
+  const targetDateStr = new Date(target+'T12:00:00').toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
+  const invIds = src.route.filter(g=>g.invId).map(g=>g.invId);
+
+  if(invIds.length){
+    const newInvoices = await transactKV('invoices', current=>{
+      const invs = current || getInvoices();
+      return invs.map(i=> invIds.includes(i.id) ? {...i, dateKey:target, date:targetDateStr} : i);
+    });
+    CACHE.invoices=newInvoices;
+
+    const newLedger = await transactKV('ledger', current=>{
+      const led = current || getLedger();
+      Object.values(led).forEach(client=>{
+        (client.entries||[]).forEach(e=>{
+          if(e.invId && invIds.includes(e.invId)){ e.date=target; e.dateStr=targetDateStr; }
+        });
+      });
+      return led;
+    });
+    CACHE.ledger=newLedger;
+  }
+
+  await sSet('progress_'+driverId+'_'+target, src);
+  await sSet('progress_'+driverId+'_'+fromKey, {route:[], vehicle:{kmStart:'',kmEnd:'',diesel:''}, workers:{}, ts:Date.now()});
+
+  document.getElementById('move-day-modal')?.remove();
+  toast('✓ Geskuif na '+target);
+  await loadHistDates(driverId);
+  HIST.date=target;
+  await loadHistData();
+  drawHistory(document.getElementById('p-content'));
 }
 
 // Manager-only manual correction — drivers can't edit this, only Bestuur
