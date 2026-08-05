@@ -1053,7 +1053,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-54'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-57'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -4346,11 +4346,43 @@ function renderVorderingTab(ct){
 // month to month once added; only the visits are month-specific — matches
 // how the real paper worked (a fresh sheet each month, but the same
 // complex names carried over).
-let INSP_MONTH_OFFSET=0;
+let INSP_MONTH_OFFSET=0; // still used by "jump to this month" convenience
 let INSP_DATA_CACHE={};
+let INSP_OPEN_YEARS=new Set();
+let INSP_OPEN_MONTHS=new Set(); // keyed 'YYYY-MM'
+// Real complex names read directly off the two paper "Inspeksie lys"
+// sheets (Jan's and Pierre's) — only ever used as a one-time starting
+// point if the list in Firestore is genuinely empty, same pattern as the
+// driver roster's hardcoded fallback. Never overwrites anything already
+// added by hand.
+const DEFAULT_INSPECTION_COMPLEXES = [
+  'AJF Kantore',
+  'Arendsnes',
+  'Bluetides',
+  'Granny Mac',
+  'Harbour Lights',
+  'Harbourside',
+  'Keel Close 47',
+  'Kosmos',
+  'Maxi Drive 29',
+  'Northwest Village',
+  'Poma - Jasper',
+  'Poma - Nicky',
+  'Riviera Hotel',
+  'Soetdorings',
+  'Veldpark - Jasper',
+  'Vredezicht',
+  'Welgedaan Kompleks',
+];
 async function ensureInspectionComplexesSeeded(){
   if(CACHE.inspectionComplexes) return CACHE.inspectionComplexes;
-  CACHE.inspectionComplexes=await sGet('inspection_complexes', []);
+  const stored=await sGet('inspection_complexes', null);
+  if(stored && stored.length){
+    CACHE.inspectionComplexes=stored;
+  } else {
+    CACHE.inspectionComplexes=[...DEFAULT_INSPECTION_COMPLEXES].sort((a,b)=>a.localeCompare(b));
+    await sSet('inspection_complexes', CACHE.inspectionComplexes); // persist once — Firestore is the real source of truth from here on
+  }
   return CACHE.inspectionComplexes;
 }
 function inspMonthKey(offset){
@@ -4361,98 +4393,237 @@ function inspMonthLabel(offset){
   const d=sastNow(); d.setDate(1); d.setMonth(d.getMonth()+offset);
   return MONTHS_AF[d.getMonth()]+' '+d.getFullYear();
 }
+// Rebuilt as a year → month click-to-expand list (same pattern as
+// Statements), with each month showing every complex as one row: name,
+// then date+status for visit 1, then date+status for visit 2 — matching
+// how the paper version actually laid out, instead of a single flat
+// "this month only" view with visits stacked vertically underneath each
+// complex.
 async function renderInspeksiesTab(ct){
   ct.innerHTML='<div class="loadmsg">Laai... / Loading...</div>';
   const complexes=await ensureInspectionComplexesSeeded();
-  const monthKey=inspMonthKey(INSP_MONTH_OFFSET);
-  const monthLabel=inspMonthLabel(INSP_MONTH_OFFSET);
-  const monthData=await sGet('inspections_'+monthKey, {});
-  INSP_DATA_CACHE[monthKey]=monthData;
+
+  // Always include the current month even if it has no data yet, so
+  // there's always somewhere to log a new visit without hunting for it.
+  const monthsResult=await sList('inspections_');
+  const monthKeys=new Set(monthsResult.keys.map(k=>k.replace('inspections_','')));
+  monthKeys.add(inspMonthKey(0));
+  const sortedMonths=[...monthKeys].sort().reverse(); // 'YYYY-MM' sorts correctly as plain strings
+
+  const byYear={};
+  sortedMonths.forEach(mk=>{ (byYear[mk.slice(0,4)]=byYear[mk.slice(0,4)]||[]).push(mk); });
+  const years=Object.keys(byYear).sort().reverse();
+
+  if(INSP_OPEN_YEARS.size===0) INSP_OPEN_YEARS.add(String(sastNow().getFullYear()));
+  if(INSP_OPEN_MONTHS.size===0) INSP_OPEN_MONTHS.add(inspMonthKey(0));
 
   ct.innerHTML=`
     <div class="ovhdr">
       <h2>🔍 Inspeksie lys (komplekse)</h2>
-      <p>${monthLabel}</p>
+      <p>Twee besoeke per maand per kompleks — merk elkeen "Alles reg" of gee 'n opmerking.</p>
     </div>
-    <div style="display:flex;gap:8px;margin-bottom:10px">
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="INSP_MONTH_OFFSET--;renderInspeksiesTab(document.getElementById('d-content'))">← Vorige maand</button>
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="INSP_MONTH_OFFSET=0;renderInspeksiesTab(document.getElementById('d-content'))">Hierdie maand</button>
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem;${INSP_MONTH_OFFSET>=0?'opacity:.4;pointer-events:none':''}" onclick="INSP_MONTH_OFFSET++;renderInspeksiesTab(document.getElementById('d-content'))">Volgende →</button>
-    </div>
-    <div id="insp-list"></div>
-    <div style="display:flex;gap:8px;margin-top:10px">
+    <div id="insp-years"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;border-top:1px solid var(--brd);padding-top:12px">
       <input class="inp" id="insp-new-complex" placeholder="Nuwe kompleks se naam…" style="flex:1">
-      <button class="btn" style="flex-shrink:0" onclick="submitAddInspectionComplex()">＋ Voeg by</button>
+      <button class="btn" style="flex-shrink:0;width:auto;padding:10px 16px" onclick="submitAddInspectionComplex()">＋ Voeg by</button>
     </div>`;
 
-  const listEl=document.getElementById('insp-list');
-  if(complexes.length===0){
-    listEl.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Nog geen komplekse bygevoeg nie. Voeg een by hieronder.</p>';
-    return;
+  const yearsEl=document.getElementById('insp-years');
+
+  for(const year of years){
+    const isYearOpen=INSP_OPEN_YEARS.has(year);
+    const yHdr=el('div');
+    yHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;background:var(--g1);border:2px solid var(--g2);border-radius:var(--r);padding:12px 16px;margin-top:10px';
+    yHdr.innerHTML=`<div style="font-weight:800;font-size:1rem">${isYearOpen?'▾':'▸'} ${year}</div>`;
+    yHdr.onclick=()=>{ if(INSP_OPEN_YEARS.has(year)) INSP_OPEN_YEARS.delete(year); else INSP_OPEN_YEARS.add(year); renderInspeksiesTab(document.getElementById('d-content')); };
+    yearsEl.appendChild(yHdr);
+    if(!isYearOpen) continue;
+
+    for(const mk of byYear[year]){
+      const isMonthOpen=INSP_OPEN_MONTHS.has(mk);
+      const label=MONTHS_AF[parseInt(mk.slice(5,7))-1];
+      const mHdr=el('div');
+      mHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:9px 12px;margin:6px 0 0 14px';
+      mHdr.innerHTML=`<div style="font-size:.9rem;font-weight:700">${isMonthOpen?'▾':'▸'} ${label}</div>`;
+      mHdr.onclick=()=>{ if(INSP_OPEN_MONTHS.has(mk)) INSP_OPEN_MONTHS.delete(mk); else INSP_OPEN_MONTHS.add(mk); renderInspeksiesTab(document.getElementById('d-content')); };
+      yearsEl.appendChild(mHdr);
+      if(!isMonthOpen) continue;
+
+      const monthData=await sGet('inspections_'+mk, {});
+      INSP_DATA_CACHE[mk]=monthData;
+
+      const monthBox=el('div');
+      monthBox.style.cssText='margin:6px 0 0 14px;background:var(--card);border-radius:10px;border:1px solid var(--brd);overflow:hidden';
+      monthBox.innerHTML=`
+        <div style="display:grid;grid-template-columns:1.3fr .75fr 1.3fr .75fr 1.3fr;gap:4px;padding:8px 10px;background:var(--bg);font-size:.64rem;font-weight:800;color:var(--t2)">
+          <span>KOMPLEKS</span><span>DATUM 1</span><span>OPMERKING 1</span><span>DATUM 2</span><span>OPMERKING 2</span>
+        </div>
+        <div id="insp-body-${mk}"></div>
+        <div style="padding:8px 10px;display:flex;gap:8px;border-top:1px solid var(--brd)">
+          <button class="btn-sec btn" style="flex:1;font-size:.78rem" onclick="viewInspectionPDF('${mk}')">👁 Bekyk</button>
+          <button class="btn-sec btn" style="flex:1;font-size:.78rem" onclick="downloadInspectionPDF('${mk}')">⬇️ Laai af</button>
+          <button class="inv-wa" style="flex:1;font-size:.78rem;background:var(--g8)" onclick="shareInspectionPDF('${mk}')">📄 Stuur</button>
+        </div>`;
+      yearsEl.appendChild(monthBox);
+      const body=monthBox.querySelector('#insp-body-'+mk);
+
+      if(complexes.length===0){
+        body.innerHTML='<p style="color:var(--t2);font-size:.82rem;text-align:center;padding:16px 10px">Nog geen komplekse bygevoeg nie. Voeg een by heel onder.</p>';
+        continue;
+      }
+
+      complexes.forEach(name=>{
+        const rec=monthData[name]||{visits:[]};
+        const v1=(rec.visits&&rec.visits[0])||{date:'',status:'',comment:''};
+        const v2=(rec.visits&&rec.visits[1])||{date:'',status:'',comment:''};
+        const safeName=name.replace(/'/g,"\\'");
+        const row=el('div');
+        row.style.cssText='display:grid;grid-template-columns:1.3fr .75fr 1.3fr .75fr 1.3fr;gap:4px;padding:7px 10px;border-top:1px solid var(--brd);align-items:start;font-size:.8rem';
+        row.innerHTML=`
+          <span style="font-weight:700;padding-top:6px">${name}
+            <button onclick="confirmRemoveInspectionComplex('${safeName}')" title="Verwyder kompleks"
+              style="width:auto;flex-shrink:0;padding:1px 5px;font-size:.62rem;font-weight:700;color:var(--red);
+                     background:var(--bg);border:1px solid var(--brd);border-radius:100px;margin-left:4px">✕</button>
+          </span>
+          ${inspVisitDateHtml(safeName,mk,0,v1.date)}
+          ${inspVisitStatusHtml(safeName,mk,0,v1)}
+          ${inspVisitDateHtml(safeName,mk,1,v2.date)}
+          ${inspVisitStatusHtml(safeName,mk,1,v2)}
+        `;
+        body.appendChild(row);
+      });
+    }
   }
-  complexes.forEach((name,ci)=>{
-    const rec=monthData[name]||{visits:[]};
-    const visits=(rec.visits&&rec.visits.length)?rec.visits:[{date:'',note:''},{date:'',note:''}];
-    const safeName=name.replace(/'/g,"\\'");
-    const card=el('div','vcard');
-    card.style.marginBottom='10px';
-    card.innerHTML=`
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <div class="vtitle" style="margin:0">${name}</div>
-        <button class="btn-sec btn" style="width:auto;padding:3px 8px;font-size:.68rem;color:var(--red)" onclick="confirmRemoveInspectionComplex('${safeName}')">✕ Verwyder</button>
-      </div>
-      <div id="insp-visits-${ci}"></div>
-      <button class="btn-sec btn" style="width:100%;margin-top:6px;font-size:.76rem" onclick="addInspectionVisitSlot('${safeName}')">＋ Voeg besoek by</button>`;
-    listEl.appendChild(card);
-    const visitsHolder=card.querySelector('#insp-visits-'+ci);
-    visits.forEach((v,vi)=>{
-      const row=el('div');
-      row.style.cssText='display:flex;gap:6px;margin-bottom:6px;align-items:center';
-      row.innerHTML=`
-        <input class="inp" type="date" value="${v.date||''}" style="flex:1;padding:7px" onchange="saveInspectionVisit('${safeName}',${vi},'date',this.value)">
-        <input class="inp" placeholder="Opmerking…" value="${(v.note||'').replace(/"/g,'&quot;')}" style="flex:2;padding:7px" onchange="saveInspectionVisit('${safeName}',${vi},'note',this.value)">`;
-      visitsHolder.appendChild(row);
-    });
-  });
 }
+function inspVisitDateHtml(safeName, monthKey, idx, date){
+  return `<input class="inp" type="date" value="${date||''}" style="padding:5px;font-size:.72rem"
+    onchange="saveInspectionVisit('${safeName}','${monthKey}',${idx},'date',this.value)">`;
+}
+function inspVisitStatusHtml(safeName, monthKey, idx, v){
+  const status=v.status||'';
+  const comment=(v.comment||'').replace(/"/g,'&quot;');
+  return `<div style="display:flex;flex-direction:column;gap:3px">
+    <select class="inp" style="padding:5px;font-size:.7rem" onchange="saveInspectionVisitStatus('${safeName}','${monthKey}',${idx},this.value)">
+      <option value="" ${status===''?'selected':''}>—</option>
+      <option value="reg" ${status==='reg'?'selected':''}>✅ Alles reg</option>
+      <option value="nie_reg" ${status==='nie_reg'?'selected':''}>⚠️ Nie reg nie</option>
+    </select>
+    ${status==='nie_reg'?`<input class="inp" placeholder="Opmerking…" value="${comment}" style="padding:5px;font-size:.7rem"
+      onchange="saveInspectionVisit('${safeName}','${monthKey}',${idx},'comment',this.value)">`:''}
+  </div>`;
+}
+// Every save here now actually checks whether it worked — the "＋ Voeg
+// by" button used to just fire-and-forget the write, so a dropped
+// connection would make a newly added complex (or a logged visit) look
+// like it saved, only to have quietly never reached Firestore at all.
 async function submitAddInspectionComplex(){
   const inp=document.getElementById('insp-new-complex');
   const name=inp.value.trim();
   if(!name) return;
   const list=await ensureInspectionComplexesSeeded();
-  if(!list.includes(name)){
-    list.push(name);
-    list.sort((a,b)=>a.localeCompare(b));
-    CACHE.inspectionComplexes=list;
-    await sSet('inspection_complexes', list);
+  if(list.includes(name)){ inp.value=''; toast('Kompleks bestaan reeds'); return; }
+  const updated=[...list, name].sort((a,b)=>a.localeCompare(b));
+  const ok=await sSet('inspection_complexes', updated);
+  if(!ok){
+    alert('⚠️ Kon nie die kompleks stoor nie — kontroleer die internetverbinding en probeer weer.');
+    return;
   }
+  CACHE.inspectionComplexes=updated;
   inp.value='';
+  toast('✓ '+name+' bygevoeg');
   renderInspeksiesTab(document.getElementById('d-content'));
 }
 async function confirmRemoveInspectionComplex(name){
   if(!confirm(`Verwyder "${name}" van die inspeksie-lys? Dit verwyder nie geskiedenis wat reeds gestoor is nie — net die kompleks van toekomstige lyste.`)) return;
   const list=(await ensureInspectionComplexesSeeded()).filter(n=>n!==name);
+  const ok=await sSet('inspection_complexes', list);
+  if(!ok){ alert('⚠️ Kon nie stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
   CACHE.inspectionComplexes=list;
-  await sSet('inspection_complexes', list);
   renderInspeksiesTab(document.getElementById('d-content'));
 }
-async function saveInspectionVisit(name, idx, field, value){
-  const monthKey=inspMonthKey(INSP_MONTH_OFFSET);
+async function saveInspectionVisit(name, monthKey, idx, field, value){
   const monthData=INSP_DATA_CACHE[monthKey]||{};
   if(!monthData[name]) monthData[name]={visits:[]};
-  while(monthData[name].visits.length<=idx) monthData[name].visits.push({date:'',note:''});
+  while(monthData[name].visits.length<=idx) monthData[name].visits.push({date:'',status:'',comment:''});
   monthData[name].visits[idx][field]=value;
   INSP_DATA_CACHE[monthKey]=monthData;
-  await sSet('inspections_'+monthKey, monthData);
+  const ok=await sSet('inspections_'+monthKey, monthData);
+  if(!ok) alert('⚠️ Kon nie stoor nie — kontroleer die internetverbinding en probeer weer.');
 }
-async function addInspectionVisitSlot(name){
-  const monthKey=inspMonthKey(INSP_MONTH_OFFSET);
+async function saveInspectionVisitStatus(name, monthKey, idx, status){
   const monthData=INSP_DATA_CACHE[monthKey]||{};
-  if(!monthData[name]) monthData[name]={visits:[{date:'',note:''},{date:'',note:''}]};
-  monthData[name].visits.push({date:'',note:''});
+  if(!monthData[name]) monthData[name]={visits:[]};
+  while(monthData[name].visits.length<=idx) monthData[name].visits.push({date:'',status:'',comment:''});
+  monthData[name].visits[idx].status=status;
+  if(status!=='nie_reg') monthData[name].visits[idx].comment='';
   INSP_DATA_CACHE[monthKey]=monthData;
-  await sSet('inspections_'+monthKey, monthData);
-  renderInspeksiesTab(document.getElementById('d-content'));
+  const ok=await sSet('inspections_'+monthKey, monthData);
+  if(!ok) alert('⚠️ Kon nie stoor nie — kontroleer die internetverbinding en probeer weer.');
+  renderInspeksiesTab(document.getElementById('d-content')); // re-render so the comment box appears/disappears correctly
+}
+// PDF report — one per month, listing every complex with both visits'
+// dates and status/opmerking, viewable, downloadable, and shareable like
+// every other document type in the app.
+function buildInspectionPDF(monthKey, complexes, monthData){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF();
+  let y=pdfLetterhead(doc, 18);
+  const label=MONTHS_AF[parseInt(monthKey.slice(5,7))-1]+' '+monthKey.slice(0,4);
+  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(20,20,20);
+  doc.text('INSPEKSIE LYS — '+label,15,y); y+=10;
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(9);
+  doc.text('Kompleks',15,y); doc.text('Besoek 1',95,y); doc.text('Besoek 2',150,y); y+=6;
+  doc.setDrawColor(200,200,200); doc.line(15,y,195,y); y+=6;
+  doc.setFont('helvetica','normal'); doc.setFontSize(8.5);
+
+  const statusTxt=v=>{
+    if(!v) return '—';
+    if(v.status==='reg') return 'Alles reg';
+    if(v.status==='nie_reg') return 'Nie reg: '+(v.comment||'(geen opmerking)');
+    return '—';
+  };
+
+  if(complexes.length===0){
+    doc.setTextColor(140,140,140);
+    doc.text('Geen komplekse op die lys nie.',15,y);
+  }
+  complexes.forEach(name=>{
+    if(y>270){ doc.addPage(); y=20; }
+    const rec=monthData[name]||{visits:[]};
+    const v1=rec.visits&&rec.visits[0]; const v2=rec.visits&&rec.visits[1];
+    doc.setFont('helvetica','bold'); doc.setTextColor(20,20,20);
+    doc.text(doc.splitTextToSize(name,75),15,y);
+    doc.setFont('helvetica','normal');
+    doc.text((v1&&v1.date)||'—',95,y);
+    doc.text((v2&&v2.date)||'—',150,y);
+    y+=5;
+    const s1=doc.splitTextToSize(statusTxt(v1),50);
+    const s2=doc.splitTextToSize(statusTxt(v2),45);
+    doc.text(s1,95,y);
+    doc.text(s2,150,y);
+    y+=Math.max(s1.length,s2.length)*4.3+5;
+    doc.setDrawColor(230,230,230); doc.line(15,y-2,195,y-2);
+  });
+
+  return doc.output('blob');
+}
+async function getInspectionBlobFor(monthKey){
+  const complexes=await ensureInspectionComplexesSeeded();
+  const monthData=INSP_DATA_CACHE[monthKey] || await sGet('inspections_'+monthKey, {});
+  return buildInspectionPDF(monthKey, complexes, monthData);
+}
+async function viewInspectionPDF(monthKey){
+  viewPDFBlob(await getInspectionBlobFor(monthKey));
+}
+async function downloadInspectionPDF(monthKey){
+  downloadPDF(await getInspectionBlobFor(monthKey), 'Inspeksie_'+monthKey+'.pdf');
+}
+async function shareInspectionPDF(monthKey){
+  const blob=await getInspectionBlobFor(monthKey);
+  const label=MONTHS_AF[parseInt(monthKey.slice(5,7))-1]+' '+monthKey.slice(0,4);
+  await shareOrDownloadPDF(blob, 'Inspeksie_'+monthKey+'.pdf', 'Inspeksie lys — '+label, label);
+  toast('📄 Inspeksie PDF gereed');
 }
 
 // Equipment/machine fuel — Pierre's responsibility alone, and moved off
