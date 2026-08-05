@@ -686,11 +686,19 @@ async function collDelete(name, docId){
 // invoices/quotes/etc. created directly in the new collections (after the
 // Firestore rules were widened) was enough to make it look "already
 // migrated" and permanently skip copying over the real historical data.
-// This version instead checks each individual record from the old blob by
-// its own ID, and only writes the ones genuinely missing — so it can't
-// mistake "a few new records exist" for "nothing old needs copying," and
-// re-running it is always safe (it never overwrites a record that's
-// already present in the new collection).
+// This version instead compares every record from the old blob against
+// what's already in the new collection, and only writes the ones
+// genuinely missing — so it can't mistake "a few new records exist" for
+// "nothing old needs copying," and re-running it is always safe (it never
+// overwrites a record that's already present in the new collection).
+//
+// v2 also fixed a performance bug in its first cut: checking each record
+// with its own individual Firestore read (100+ sequential round trips for
+// a business this size) made the very first load after deploy look like
+// it was hanging forever. This version reads the whole target collection
+// ONCE to see what already exists, then writes only the missing records
+// in batches (Firestore's batch limit is 500 writes) — one read plus a
+// couple of batch commits, instead of hundreds of individual round trips.
 async function ensureCollectionMigrated(oldKey, collName, isKeyed){
   const flagKey='migrated_v2_'+collName;
   const already = await sGet(flagKey, false);
@@ -699,17 +707,20 @@ async function ensureCollectionMigrated(oldKey, collName, isKeyed){
     const old = await sGet(oldKey, isKeyed?{}:[]);
     const entries = isKeyed ? Object.entries(old) : old.map(r=>[r.id, r]);
     if(entries.length===0){ await sSet(flagKey, true); return; } // nothing to migrate
-    for(const [id, data] of entries){
-      if(!id) continue;
-      const doc = await withTimeout(collRef(collName).doc(String(id)).get(), STORAGE_TIMEOUT_MS, 'migrateCheck:'+collName+'/'+id);
-      if(!doc.exists){
-        await collRef(collName).doc(String(id)).set(data);
-      }
+    const existingSnap = await withTimeout(collRef(collName).get(), 10000, 'migrateExisting:'+collName);
+    const existingIds = new Set(existingSnap.docs.map(d=>d.id));
+    const missing = entries.filter(([id])=>id && !existingIds.has(String(id)));
+    for(let i=0; i<missing.length; i+=450){
+      const chunk = missing.slice(i, i+450);
+      const batch = FS_DB.batch();
+      chunk.forEach(([id, data])=>{ batch.set(collRef(collName).doc(String(id)), data); });
+      await withTimeout(batch.commit(), 10000, 'migrateBatch:'+collName+':'+i);
     }
     await sSet(flagKey, true);
   }catch(e){
     console.error('Kon nie', collName, 'migreer nie — sal weer probeer:', e);
     // deliberately don't set the flag — retried on next load
+
   }
 }
 
@@ -991,7 +1002,7 @@ let POLL_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-7'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-9'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -3814,8 +3825,8 @@ async function renderWorkers(ct){
       </div>`;
     }).join('')}
     <div style="display:flex;gap:8px;padding-top:8px">
-      <input class="inp" id="casual-name-in" placeholder="Naam van los werker vandag…" style="padding:9px 10px">
-      <button class="btn" style="flex-shrink:0;padding:9px 14px" onclick="addCasualWorker()">＋ Voeg by</button>
+      <input class="inp" id="casual-name-in" placeholder="Naam van los werker vandag…" style="flex:1;min-width:0;padding:9px 10px">
+      <button class="btn" style="width:auto;flex-shrink:0;padding:9px 14px" onclick="addCasualWorker()">＋ Voeg by</button>
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center;
                 padding-top:8px;border-top:1px solid var(--brd)">
@@ -3839,8 +3850,8 @@ async function renderWorkers(ct){
           <button class="btn btn-sec" style="padding:6px 8px;font-size:.75rem;color:var(--red)" onclick="driverRemovePermanentWorker('${w}')">✕ Verwyder permanent</button>
         </div>`).join('')}
       <div style="display:flex;gap:8px;padding-top:8px">
-        <input class="inp" id="perm-name-in" placeholder="Naam vir permanente span…" style="padding:9px 10px">
-        <button class="btn" style="flex-shrink:0;padding:9px 14px" onclick="driverAddPermanentWorker()">＋ Voeg permanent by</button>
+        <input class="inp" id="perm-name-in" placeholder="Naam vir permanente span…" style="flex:1;min-width:0;padding:9px 10px">
+        <button class="btn" style="width:auto;flex-shrink:0;padding:9px 14px" onclick="driverAddPermanentWorker()">＋ Voeg permanent by</button>
       </div>`;
     ct.appendChild(rc);
   }
