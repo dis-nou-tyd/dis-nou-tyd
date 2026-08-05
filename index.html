@@ -421,6 +421,9 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
     <button class="tab on" data-tab="route">🗺️ Route</button>
     <button class="tab" data-tab="quotes">💬 Kwotasies</button>
     <button class="tab" data-tab="workers">📋 Dagstaat</button>
+    <button class="tab pierre-only" data-tab="spanne" style="display:none">👷 Spanne</button>
+    <button class="tab pierre-only" data-tab="inspeksies" style="display:none">🔍 Inspeksies</button>
+    <button class="tab pierre-only" data-tab="masjiene" style="display:none">🔧 Masjiene</button>
     <button class="tab" data-tab="summary">📊 Opsomming</button>
   </div>
   <div class="content" id="d-content"></div>
@@ -466,7 +469,7 @@ const DRIVERS = {
   nickey: {name:'Nickey', icon:'🌾', color:'#6A1B9A', pin:'3',
     workers:['Wayne Jansen','Waydie','Lolla Jansen','Brandon','Will'],
     vehicle:'', rate:350},
-  gordon: {name:'Gordon', icon:'🍃', color:'#E65100', pin:'4',
+  gordon: {name:'Gordon', icon:'🍃', color:'#E65100', password:'72779673',
     workers:['Boeta Jagers','Poenkels','Reagan Jantjies','Emile'],
     vehicle:'', rate:370},
   pierre: {name:'Pierre (Terreinbestuurder)', icon:'🚗', color:'#00695C', password:'1975',
@@ -690,7 +693,6 @@ async function ensureWorkerRosterSeeded(){
   const merged = existing ? {...existing} : {};
   let changed = !existing;
   Object.entries(DRIVERS).forEach(([id,d])=>{
-    if(id==='pierre') return;
     if(merged[id]===undefined){ merged[id]=(d.workers||[]).slice(); changed=true; }
   });
   CACHE.workerRoster=merged;
@@ -1252,6 +1254,7 @@ async function loginDriver(id){
   document.getElementById('d-name').textContent=d.name;
   document.getElementById('d-date').textContent=formatToday();
   document.querySelectorAll('#d-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab==='route'));
+  applyDriverTabs();
   await Promise.all([
     !CACHE.ready ? hydrateCache() : Promise.resolve(),
     ensureSchedule(),
@@ -2794,10 +2797,22 @@ function renderDriverTab(tab){
   document.querySelectorAll('#d-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===tab));
   const c=document.getElementById('d-content');
   c.innerHTML='';
-  if(tab==='route')    renderRoute(c);
-  if(tab==='quotes')   renderQuotesDriver(c);
-  if(tab==='workers')  renderWorkers(c);
-  if(tab==='summary')  renderSummary(c);
+  if(tab==='route')       renderRoute(c);
+  if(tab==='quotes')      renderQuotesDriver(c);
+  if(tab==='workers')     renderWorkers(c);
+  if(tab==='spanne')      renderSpanneTab(c);
+  if(tab==='inspeksies')  renderPlaceholderTab(c,'🔍 Inspeksies','Kom binnekort.');
+  if(tab==='masjiene')    renderPlaceholderTab(c,'🔧 Masjiene','Kom binnekort.');
+  if(tab==='summary')     renderSummary(c);
+}
+// Toggles Pierre's extra tabs (Spanne, Inspeksies, Masjiene) — nobody
+// else needs these, so they stay hidden for every other driver.
+function applyDriverTabs(){
+  const isPierre = S.driver==='pierre';
+  document.querySelectorAll('#d-tabs .pierre-only').forEach(t=>{ t.style.display = isPierre ? '' : 'none'; });
+}
+function renderPlaceholderTab(ct,title,note){
+  ct.innerHTML=`<div class="empty"><div class="ei">🧰</div><h3>${title}</h3><p>${note}</p></div>`;
 }
 
 // ══════════════════ ROUTE ═════════════════════════════════════════════════════
@@ -3502,10 +3517,11 @@ async function renderWorkers(ct){
     </div>`;
   ct.appendChild(wc);
 
-  // Every driver (except Pierre, who has no bakkie of his own) can manage
-  // their OWN permanent team here — this edits the shared roster, so it's
-  // visible to Pierre and Bestuur too, not just today's list.
-  if(S.driver!=='pierre'){
+  // Every driver — Pierre included, since he now runs his own route too —
+  // can manage their OWN permanent team here. This edits the shared
+  // roster, so it's visible in Pierre's Spanne tab and to Bestuur too,
+  // not just today's list.
+  {
     const rc=el('div','vcard');
     rc.innerHTML=`<div class="vtitle">📌 My permanente span</div>
       <p style="font-size:.78rem;color:var(--t2);margin:0 0 8px">Werkers hier bly permanent op jou bakkie totdat jy hulle verwyder — anders as 'n los werker vandag.</p>
@@ -3520,12 +3536,12 @@ async function renderWorkers(ct){
       </div>`;
     ct.appendChild(rc);
   }
+}
 
-  // Pierre alone manages every bakkie's team — move workers between drivers
-  // or add casuals to any of them, permanent or just for today.
-  if(S.driver==='pierre'){
-    await renderPierreTeamAdmin(ct);
-  }
+// Pierre's dedicated tab for managing every bakkie's team — moved off his
+// own Dagstaat since that's for HIS day (his own gardens), not admin work.
+async function renderSpanneTab(ct){
+  await renderPierreTeamAdmin(ct);
 }
 
 async function renderPierreTeamAdmin(ct){
@@ -3586,7 +3602,7 @@ function pierreStartMove(name, fromDriverId){
 async function resetWorkerRosterToDefaults(){
   if(!confirm('Dit stel ALLE bestuurders se permanente spanlyste terug na die oorspronklike lyste. Enige onlangse skuiwe/toevoegings sal verlore gaan. Voortgaan?')) return;
   const seeded={};
-  Object.entries(DRIVERS).forEach(([id,d])=>{ if(id!=='pierre') seeded[id]=(d.workers||[]).slice(); });
+  Object.entries(DRIVERS).forEach(([id,d])=>{ seeded[id]=(d.workers||[]).slice(); });
   CACHE.workerRoster=seeded;
   await sSet('worker_roster', seeded);
   toast('✓ Alle spanne herstel na oorspronklike lyste');
