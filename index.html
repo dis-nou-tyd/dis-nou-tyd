@@ -1052,7 +1052,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-44'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-45'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -5050,15 +5050,43 @@ async function scanForMissingInvoices(){
 async function recoverInvoices(dateKey, missingByDriver){
   const results=document.getElementById('recover-results');
   results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Herstel besig…</p>';
-  let recovered=0, failed=0;
-  for(const [driverId, gardens] of Object.entries(missingByDriver)){
-    for(const g of gardens){
-      try{ await createInvoice(g, driverId, dateKey); recovered++; }
-      catch(e){ failed++; console.error('Kon nie faktuur herstel nie:', g.address, e); }
+  let recovered=0, failed=0, stoppedEarly=false;
+  const allItems=[];
+  Object.entries(missingByDriver).forEach(([driverId, gardens])=>{
+    gardens.forEach(g=>allItems.push({driverId, g}));
+  });
+
+  for(let i=0; i<allItems.length; i++){
+    const {driverId, g}=allItems[i];
+    try{
+      await createInvoice(g, driverId, dateKey);
+      recovered++;
+    }catch(e){
+      failed++;
+      console.error('Kon nie faktuur herstel nie:', g.address, e);
+      // A timed-out transaction doesn't actually stop running in the
+      // background — Firestore keeps retrying it on its own even after we
+      // give up waiting. Immediately starting another one for the next
+      // garden used to pile these abandoned retries on top of each other,
+      // which is exactly what was hammering the server with repeated
+      // requests and turning a handful of missing invoices into a wall of
+      // "Too Many Requests" errors. Stopping here instead of continuing
+      // through the rest of the list stops adding to that pile-up — the
+      // ones already recovered are safely saved either way.
+      const msg=String(e&&e.message||e);
+      if(msg.includes('resource-exhausted') || msg.includes('429') || msg.includes('Too Many Requests') || msg.includes('took too long')){
+        stoppedEarly=true;
+        break;
+      }
     }
+    if(i<allItems.length-1) await new Promise(r=>setTimeout(r, 400)); // give each attempt room to actually finish before starting the next
   }
-  results.innerHTML=`<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${recovered} faktu(u)r(e) herstel${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
-  toast(`✓ ${recovered} faktuur/fakture herstel`);
+
+  results.innerHTML = stoppedEarly
+    ? `<p style="color:var(--red);font-weight:700;padding:10px 0">⚠️ Gestop — die bediener het te veel versoeke ontvang (netwerk oorlaai). ${recovered} van ${allItems.length} is suksesvol herstel voor die stop.</p>
+       <p style="font-size:.82rem;color:var(--t2)">Wag 'n paar minute en probeer weer — die res sal steeds daar wees om te herstel.</p>`
+    : `<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${recovered} faktu(u)r(e) herstel${failed>0?` · ${failed} het misluk (probeer weer)`:''}.</p>`;
+  toast(stoppedEarly ? `⚠️ Gestop na ${recovered} — bediener oorlaai` : `✓ ${recovered} faktuur/fakture herstel`);
   // The recovery above genuinely works — createInvoice already updates
   // CACHE.invoices — but the Fakture list rendered behind this modal was
   // never told to rebuild, so it kept showing whatever it looked like
