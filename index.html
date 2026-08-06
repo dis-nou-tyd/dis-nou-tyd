@@ -1060,7 +1060,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-68'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-71'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1815,6 +1815,81 @@ function weekDateKeys(monday){
   return keys;
 }
 function payWeekKey(monday){ return dateKeyOf(monday); }
+
+// ══════════════════ EMPLOYEE PROFILES (recurring pay items) ═══════════════════
+// Set up once per person — a monthly rent/water/etc figure, an attendance
+// bonus amount, whether they're UIF-exempt — and every week's payslip
+// pulls the right WEEKLY slice from it automatically. Only that weekly
+// slice ever shows on a payslip; the full monthly figures live here, on
+// the profile, as the single source of truth (so nobody has to remember
+// what "Huur" was three months ago — it's always right here).
+let EMP_PROFILES=null;
+async function ensureEmpProfilesSeeded(){
+  if(EMP_PROFILES) return EMP_PROFILES;
+  let profiles=await sGet('employee_profiles', null);
+  if(!profiles){
+    // One-time seed from the actual figures given when this was built —
+    // everything here is fully editable afterward, this just avoids
+    // starting from a blank slate.
+    profiles={
+      'Jasper':{recurring:[{label:'Huur',monthly:5280},{label:'Water',monthly:500}], bonusAmount:250, uifExempt:false},
+      'Jan':{recurring:[{label:'Huur',monthly:4860},{label:'Creche',monthly:1100}], bonusAmount:250, uifExempt:false},
+      'Gordon':{recurring:[{label:'Huur',monthly:3700},{label:'Ander skuld',monthly:0}], bonusAmount:250, uifExempt:false},
+      'Pierre':{recurring:[{label:'Huur',monthly:2500}], bonusAmount:325, uifExempt:false},
+      'Nickey':{recurring:[], bonusAmount:250, uifExempt:false},
+      'Poenkels':{recurring:[{label:'Onderhoud',monthly:640}], bonusAmount:50, uifExempt:false},
+      'Lionel Pieterse':{recurring:[{label:'Onderhoud',monthly:1300}], bonusAmount:50, uifExempt:false},
+      'Darryl':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Gavin Rosant':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Cameron Schlimmert':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Pierre Jantjies':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Mervin Nero':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Wayne Jansen':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Waydie':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Lolla Jansen':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Reagan Jantjies':{recurring:[], bonusAmount:50, uifExempt:false},
+      'Ismael':{recurring:[], bonusAmount:0, uifExempt:true},
+      'Mannetjies':{recurring:[], bonusAmount:0, uifExempt:true},
+    };
+    await sSet('employee_profiles', profiles);
+  }
+  EMP_PROFILES=profiles;
+  return profiles;
+}
+function getEmpProfile(name){
+  return (EMP_PROFILES && EMP_PROFILES[name]) || {recurring:[], bonusAmount:0, uifExempt:false};
+}
+async function saveEmpProfile(name, profile){
+  const profiles=await ensureEmpProfilesSeeded();
+  profiles[name]=profile;
+  EMP_PROFILES=profiles;
+  await sSet('employee_profiles', profiles);
+}
+// How many Fridays fall in a given month — the divisor for turning a
+// monthly recurring amount into that month's weekly slice. Uses the
+// PAY WEEK's own Friday to decide which month's count applies, since
+// that's the day the deduction actually lands on.
+function fridaysInMonth(year, monthIdx){
+  let count=0;
+  const daysInMonth=new Date(year, monthIdx+1, 0).getDate();
+  for(let d=1; d<=daysInMonth; d++){
+    if(new Date(year, monthIdx, d).getDay()===5) count++;
+  }
+  return count;
+}
+// Sums a person's recurring monthly items into that week's total slice,
+// e.g. R5280 Huur in a 5-Friday month is R1056/week, R1320/week in a
+// 4-Friday month — same monthly total either way, just split correctly.
+function weeklyRecurringTotal(name, monday){
+  const profile=getEmpProfile(name);
+  if(!profile.recurring || !profile.recurring.length) return {items:[], total:0};
+  const fri=new Date(monday); fri.setDate(monday.getDate()+4);
+  const fridayCount=fridaysInMonth(fri.getFullYear(), fri.getMonth());
+  const items=profile.recurring.filter(r=>Number(r.monthly)>0).map(r=>({
+    label:r.label, weekly: Math.round((Number(r.monthly)/fridayCount)*100)/100
+  }));
+  return {items, total: items.reduce((s,i)=>s+i.weekly,0)};
+}
 
 // Pulls attendance for one employee across the 5 weekdays of the given week,
 // from the same daily "Werkers" records each driver already fills in.
@@ -3022,6 +3097,7 @@ async function renderWages(ct){
   // Build one group per driver-span, plus a standalone group for employees
   // with no driver route (e.g. Jan, paid as foreman/office).
   await ensureWorkerRosterSeeded();
+  await ensureEmpProfilesSeeded();
   const groups=Object.entries(DRIVERS).map(([id,d])=>({
     id, label:d.icon+' '+d.name, isDriver:true, driverId:id, rate:d.rate||0, members:getRoster(id)
   }));
@@ -3065,11 +3141,22 @@ async function renderWages(ct){
     for(const person of rowNames) flatPeople.push({g,person});
   }
   const attendanceData=await Promise.all(flatPeople.map(async ({person})=>{
-    if(!person.driverId) return {days:0,noRecordDays:0};
+    if(!person.driverId){
+      // Office staff (Jan, Mannetjies) have no route/Dagstaat to pull real
+      // attendance from — assumed present the full week by default, same
+      // as how the current week already works for everyone else; Bestuur
+      // adjusts the "Dae" field down manually on the rare day they're out.
+      return {days:dateKeys.length, noRecordDays:0};
+    }
     if(person.isLead){
-      const progs=await Promise.all(dateKeys.map(dk=>sGet('progress_'+person.driverId+'_'+dk,null)));
-      const d2=progs.filter(p=>p).length;
-      return {days:d2, noRecordDays:dateKeys.length-d2};
+      // A driver's own attendance is tracked exactly the same way as
+      // their crew's — they're already a row on their own Werkers list
+      // with the same present/absent checkbox — so this pulls from the
+      // real data instead of just checking whether they logged in at all
+      // that day (which said nothing about whether they were actually
+      // present and working, just whether the tablet was touched).
+      const att=await pullWeekAttendance(person.driverId, person.name, dateKeys);
+      return {days:att.days, noRecordDays:att.noRecordDays};
     }
     const att=await pullWeekAttendance(person.driverId, person.name, dateKeys);
     return {days:att.days, noRecordDays:att.noRecordDays};
@@ -3099,7 +3186,7 @@ async function renderWages(ct){
       // Past weeks still show real recorded attendance, since by then
       // every day has actually happened.
       const isCurrentWeek = PAY_WEEK_OFFSET===0;
-      if(days===undefined) days = person.driverId ? (isCurrentWeek ? dateKeys.length : fetchedDays) : 0;
+      if(days===undefined) days = person.driverId ? (isCurrentWeek ? dateKeys.length : fetchedDays) : dateKeys.length;
       // If a week was already saved with a predicted day count that turns
       // out to differ from what was actually recorded once those days
       // passed, this surfaces the mismatch instead of requiring anyone to
@@ -3113,29 +3200,58 @@ async function renderWages(ct){
       if(loanNew===undefined) loanNew=0;
       const rate = rec.rate!==undefined? rec.rate : person.rate;
       const totaal = (Number(days)||0)*(Number(rate)||0);
-      const uif = rec.uif!==undefined? rec.uif : Math.round(totaal*0.01*100)/100;
+      const profile = getEmpProfile(key);
+      // UIF-exempt people (casuals, and anyone specifically flagged on
+      // their profile) default to R0 instead of the usual 1% — still
+      // fully editable either way, this only changes the starting point.
+      const isCasualForUIF = !person.isLead && casualProgsByDriver[g.id] && casualProgsByDriver[g.id].includes(key);
+      const uifDefault = (profile.uifExempt || isCasualForUIF) ? 0 : Math.round(totaal*0.01*100)/100;
+      const uif = rec.uif!==undefined? rec.uif : uifDefault;
       PR_DEDUCTIONS[key] = rec.extraDeductions || (rec.ander?[{reason:'Ander',amount:rec.ander}]:[]);
       const ander = PR_DEDUCTIONS[key].reduce((s,d)=>s+(Number(d.amount)||0),0);
-      const aftrekkings = (Number(uif)||0)+(Number(loanNew)||0)+(Number(ander)||0);
-      const netto = totaal-aftrekkings;
+      // Recurring items (Huur, Water, etc.) set up once on this person's
+      // profile — this week's slice is computed automatically, never
+      // typed in by hand, and never shows the full monthly figure here.
+      const {items:recurringItems, total:recurringTotal} = weeklyRecurringTotal(key, monday);
+      // 5-day attendance bonus — pulled straight from this week's real Dae
+      // figure (whatever's showing above, including any manual correction),
+      // so it always matches what's actually being paid for.
+      const bonusEligible = Number(days)===dateKeys.length;
+      const bonusAmount = bonusEligible ? (Number(profile.bonusAmount)||0) : 0;
+      const kommissie = rec.kommissie!==undefined? Number(rec.kommissie)||0 : 0;
+      const kommissieNote = rec.kommissieNote!==undefined? rec.kommissieNote : '';
+      const aftrekkings = (Number(uif)||0)+(Number(loanNew)||0)+(Number(ander)||0)+recurringTotal;
+      const netto = totaal+bonusAmount+kommissie-aftrekkings;
       grandNetto+=netto; grandUIF+=Number(uif)||0; grandLeen+=Number(loanNew)||0;
       gNetto+=netto;
       PAYROLL_PAYSLIP_DATA.push({key, groupId:g.id, groupLabel:g.label, rate:Number(rate)||0, days:Number(days)||0,
-        uif:Number(uif)||0, leen:Number(loanNew)||0, deductions:PR_DEDUCTIONS[key].slice(), totaal, netto});
+        uif:Number(uif)||0, leen:Number(loanNew)||0, deductions:PR_DEDUCTIONS[key].slice(),
+        recurringItems, recurringTotal, bonusAmount, kommissie, kommissieNote, totaal, netto});
       const paid=!!rec.paid;
       const isCasual=!person.isLead && casualProgsByDriver[g.id] && casualProgsByDriver[g.id].includes(key);
-      groupRows+=`<div class="pr-row" data-emp="${encodeURIComponent(key)}">
-        <div class="pr-name">${key}${person.isLead?' <span style="color:var(--t3);font-weight:400">(bestuurder)</span>':''}${isCasual?' <span style="background:#FFF3CD;color:#856404;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:100px">Los werker hierdie week</span>':''}</div>
+      groupRows+=`<div class="pr-row" data-emp="${encodeURIComponent(key)}" data-recurring="${recurringTotal}" data-bonusamount="${Number(profile.bonusAmount)||0}" data-fulldays="${dateKeys.length}" data-grouplabel="${g.label.replace(/"/g,'&quot;')}">
+        <div class="pr-name">${key}${person.isLead?' <span style="color:var(--t3);font-weight:400">(bestuurder)</span>':''}${isCasual?' <span style="background:#FFF3CD;color:#856404;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:100px">Los werker hierdie week</span>':''}
+          <button class="btn-sec btn" style="width:auto;padding:2px 8px;font-size:.66rem;margin-left:6px" onclick="showEmpProfileModal('${encodeURIComponent(key)}')">⚙️ Profiel</button>
+        </div>
         <div class="pr-fields">
           <label>Koers/dag<input class="inp pr-rate" type="number" value="${rate}" style="padding:6px" oninput="prRecalc(this)"></label>
           <label>Dae<input class="inp pr-days" type="number" value="${days}" style="padding:6px" oninput="prRecalc(this)">
             ${daysMismatch?`<span style="display:block;font-size:.66rem;color:#C62828;font-weight:700;margin-top:2px">⚠️ Werklik ${fetchedDays} dae (was ${rec.days})</span>`:''}
           </label>
           <label>Totaal<input class="inp pr-totaal" value="R${totaal.toFixed(2)}" disabled style="padding:6px;background:var(--bg)"></label>
+          <label>Bywoning bonus${bonusEligible?'':' (nie hierdie week nie)'}<input class="inp pr-bonus-display" value="R${bonusAmount.toFixed(2)}" disabled style="padding:6px;background:var(--bg);${bonusEligible&&bonusAmount>0?'color:var(--g8);font-weight:700':''}"></label>
+          <label>Kommissie<input class="inp pr-kommissie" type="number" value="${kommissie}" style="padding:6px" oninput="prRecalc(this)"></label>
+          <label>Kommissie — watter tuin(e)<input class="inp pr-kommissienote" value="${kommissieNote.replace(/"/g,'&quot;')}" placeholder="bv. Kosmos 12" style="padding:6px" oninput="prRecalc(this)"></label>
           <label>UIF<input class="inp pr-uif" type="number" value="${uif}" style="padding:6px" oninput="prRecalc(this)"></label>
           <label>Leen afbetaal<input class="inp pr-leen" type="number" value="${loanNew}" style="padding:6px" oninput="prRecalc(this)"></label>
           <label>Netto<input class="inp pr-netto" value="R${netto.toFixed(2)}" disabled style="padding:6px;background:var(--bg);font-weight:800"></label>
         </div>
+        ${recurringItems.length?`<div style="margin-top:6px">
+          <div style="font-size:.72rem;font-weight:700;color:var(--t2);margin-bottom:3px">Vaste aftrekkings (van profiel)</div>
+          ${recurringItems.map(it=>`<div style="display:flex;justify-content:space-between;font-size:.78rem;padding:2px 0;color:var(--t2)">
+            <span>${it.label} (weekliks)</span><span>R${it.weekly.toFixed(2)}</span>
+          </div>`).join('')}
+        </div>`:''}
         <div class="pr-deductions" style="margin-top:6px">
           <div style="font-size:.72rem;font-weight:700;color:var(--t2);margin-bottom:3px">Ander aftrekkings</div>
           <div id="ded-list-${encodeURIComponent(key)}">
@@ -3192,9 +3308,7 @@ async function renderWages(ct){
       <p>${rangeLbl}</p>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:10px">
-      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET--;PAY_OPEN_GROUP=null;renderWagesInto()">← Vorige week</button>
-      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET=0;PAY_OPEN_GROUP=null;renderWagesInto()">Hierdie week</button>
-      <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET++;PAY_OPEN_GROUP=null;renderWagesInto()">Volgende week →</button>
+      <button class="btn-sec btn" style="flex:1;color:var(--blue)" onclick="showPayrollHistoryBrowser()">📅 Vorige loonstrokies / Past payslips</button>
     </div>
     <div style="display:flex;gap:8px;margin-bottom:6px">
       <button onclick="viewAllPayslipsCombined('${wkKey}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
@@ -3232,12 +3346,83 @@ function prRecalc(el){
   const days=parseFloat(row.querySelector('.pr-days').value)||0;
   const uif=parseFloat(row.querySelector('.pr-uif').value)||0;
   const leen=parseFloat(row.querySelector('.pr-leen').value)||0;
+  const kommEl=row.querySelector('.pr-kommissie');
+  const kommissie=kommEl?(parseFloat(kommEl.value)||0):0;
   const ander=(PR_DEDUCTIONS[key]||[]).reduce((s,d)=>s+(Number(d.amount)||0),0);
+  const recurringTotal=Number(row.dataset.recurring)||0;
+  const bonusAmount=Number(row.dataset.bonusamount)||0;
+  const fullDays=Number(row.dataset.fulldays)||5;
+  const bonusEligible=days===fullDays;
+  const bonus=bonusEligible?bonusAmount:0;
   const totaal=rate*days;
-  const netto=totaal-(uif+leen+ander);
+  const netto=totaal+bonus+kommissie-(uif+leen+ander+recurringTotal);
   row.querySelector('.pr-totaal').value='R'+totaal.toFixed(2);
   row.querySelector('.pr-netto').value='R'+netto.toFixed(2);
+  const bonusField=row.querySelector('.pr-bonus-display');
+  if(bonusField){
+    bonusField.value='R'+bonus.toFixed(2);
+    bonusField.style.color=(bonusEligible&&bonusAmount>0)?'var(--g8)':'';
+    bonusField.style.fontWeight=(bonusEligible&&bonusAmount>0)?'700':'';
+  }
 }
+// Where the recurring monthly items (Huur, Water, etc.), attendance bonus
+// amount, and UIF exemption live — set up once here, and every week's
+// payslip automatically pulls the right weekly slice from it. Only ever
+// shows the full monthly figure here; the payslip itself only ever shows
+// the computed weekly amount.
+function showEmpProfileModal(encKey){
+  const key=decodeURIComponent(encKey);
+  const profile=getEmpProfile(key);
+  document.getElementById('emp-profile-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='emp-profile-modal';
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">⚙️ Profiel — ${key}
+      <button class="mclose" onclick="document.getElementById('emp-profile-modal').remove()">✕</button>
+    </div>
+    <div><div class="flbl" style="margin-bottom:5px">Bywoning bonus (R, vir 'n volle week)</div>
+      <input class="inp" id="ep-bonus" type="number" value="${Number(profile.bonusAmount)||0}"></div>
+    <div style="display:flex;align-items:center;gap:8px;margin:8px 0">
+      <input type="checkbox" id="ep-uifexempt" ${profile.uifExempt?'checked':''}>
+      <label for="ep-uifexempt" style="font-size:.85rem">Nie UIF betaalbaar nie (bv. los werkers)</label>
+    </div>
+    <div class="flbl" style="margin:10px 0 5px">Vaste maandelikse aftrekkings</div>
+    <p style="font-size:.76rem;color:var(--t2);margin:0 0 8px">Voer die volle MAANDELIKSE bedrag in — die weeklikse loonstrokie wys outomaties net die regte week se deel, gebaseer op hoeveel Vrydae daai maand het.</p>
+    <div id="ep-recurring-list"></div>
+    <button class="btn-sec btn" style="width:100%;margin-top:6px" onclick="_addEmpRecurringRow()">＋ Voeg item by</button>
+    <button class="btn" style="margin-top:14px" onclick="submitEmpProfile('${encKey}')">✓ Stoor profiel / Save profile</button>
+    <button class="btn btn-sec" onclick="document.getElementById('emp-profile-modal').remove()">Kanselleer</button>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+  const list=document.getElementById('ep-recurring-list');
+  (profile.recurring||[]).forEach(item=>_addEmpRecurringRow(item.label, item.monthly));
+  if(!profile.recurring || profile.recurring.length===0) _addEmpRecurringRow();
+}
+function _addEmpRecurringRow(label='', monthly=''){
+  const list=document.getElementById('ep-recurring-list');
+  if(!list) return;
+  const row=el('div');
+  row.style.cssText='display:flex;gap:6px;margin-bottom:6px';
+  row.innerHTML=`
+    <input class="inp ep-rec-label" placeholder="bv. Huur" value="${label.replace(/"/g,'&quot;')}" style="flex:2">
+    <input class="inp ep-rec-monthly" type="number" placeholder="Maandeliks R" value="${monthly}" style="flex:1">
+    <button class="btn-sec btn" style="padding:0 12px;flex-shrink:0;color:var(--red)" onclick="this.parentElement.remove()">✕</button>`;
+  list.appendChild(row);
+}
+async function submitEmpProfile(encKey){
+  const key=decodeURIComponent(encKey);
+  const bonusAmount=parseFloat(document.getElementById('ep-bonus').value)||0;
+  const uifExempt=document.getElementById('ep-uifexempt').checked;
+  const recurring=Array.from(document.querySelectorAll('#ep-recurring-list > div')).map(row=>({
+    label: row.querySelector('.ep-rec-label').value.trim()||'Aftrekking',
+    monthly: parseFloat(row.querySelector('.ep-rec-monthly').value)||0,
+  })).filter(r=>r.monthly>0 || r.label!=='Aftrekking');
+  await saveEmpProfile(key, {recurring, bonusAmount, uifExempt});
+  document.getElementById('emp-profile-modal')?.remove();
+  toast('✓ Profiel gestoor — '+key);
+  renderWagesInto();
+}
+
 function showAddDeduction(encKey){
   const key=decodeURIComponent(encKey);
   document.getElementById('ded-modal')?.remove();
@@ -3284,23 +3469,121 @@ function refreshDeductionList(encKey){
   if(row) prRecalc(row.querySelector('.pr-rate'));
 }
 
+// ── History browser: past weeks are done, not editable — just a place to
+// find and open the already-generated payslips. Reads one small index doc
+// plus, once a week is picked, that one week's own saved record — nothing
+// close to the ~140 attendance reads the live editable view needs.
+let PAYHIST_OPEN_YEAR=null, PAYHIST_OPEN_MONTH=null;
+async function showPayrollHistoryBrowser(){
+  document.getElementById('payhist-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='payhist-modal';
+  bg.innerHTML=`<div class="modal"><div id="payhist-body"><div class="loadmsg">Laai... / Loading...</div></div></div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+  await renderPayrollHistoryBody();
+}
+async function renderPayrollHistoryBody(){
+  const body=document.getElementById('payhist-body');
+  if(!body) return;
+  const idx=(await sGet('payroll_weeks_index', [])).slice().sort().reverse(); // newest first
+  const byYear={};
+  idx.forEach(wkKey=>{
+    const d=new Date(wkKey+'T12:00:00');
+    const y=d.getFullYear(), m=d.getMonth();
+    (byYear[y]=byYear[y]||{})[m]=(byYear[y][m]||[]);
+    byYear[y][m].push(wkKey);
+  });
+  const years=Object.keys(byYear).sort((a,b)=>b-a);
+  body.innerHTML=`
+    <div class="mhdr">📅 Vorige loonstrokies
+      <button class="mclose" onclick="document.getElementById('payhist-modal').remove()">✕</button>
+    </div>
+    ${years.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Nog geen gestoorde weke nie.</p>':''}
+    <div style="max-height:70vh;overflow-y:auto">
+      ${years.map(y=>`
+        <div style="margin-bottom:6px">
+          <button class="btn-sec btn" style="width:100%;text-align:left;font-weight:700"
+                  onclick="PAYHIST_OPEN_YEAR=PAYHIST_OPEN_YEAR===${y}?null:${y};PAYHIST_OPEN_MONTH=null;renderPayrollHistoryBody()">
+            ${PAYHIST_OPEN_YEAR===Number(y)?'▾':'▸'} ${y}
+          </button>
+          ${PAYHIST_OPEN_YEAR===Number(y)?Object.keys(byYear[y]).sort((a,b)=>b-a).map(m=>`
+            <div style="margin:4px 0 4px 14px">
+              <button class="btn-sec btn" style="width:100%;text-align:left;font-size:.85rem"
+                      onclick="PAYHIST_OPEN_MONTH=PAYHIST_OPEN_MONTH===${m}?null:${m};renderPayrollHistoryBody()">
+                ${PAYHIST_OPEN_MONTH===Number(m)?'▾':'▸'} ${MONTHS_AF[m]}
+              </button>
+              ${PAYHIST_OPEN_MONTH===Number(m)?byYear[y][m].map(wkKey=>{
+                const monday=new Date(wkKey+'T12:00:00');
+                const fri=new Date(monday); fri.setDate(monday.getDate()+4);
+                return `<div style="display:flex;gap:6px;margin:4px 0 4px 14px">
+                  <button class="btn-sec btn" style="flex:1;text-align:left;font-size:.8rem;color:var(--blue)"
+                          onclick="viewSavedWeekPayslips('${wkKey}')">
+                    📄 ${monday.getDate()} – ${fri.getDate()} ${MONTHS_AF[fri.getMonth()].slice(0,3)}
+                  </button>
+                </div>`;
+              }).join(''):''}
+            </div>`).join(''):''}
+        </div>`).join('')}
+    </div>`;
+}
+// Rebuilds the payslip PDFs purely from what was saved that week — the
+// recurring items and bonus are already frozen in the saved record
+// (see savePayrollWeek), so this never touches attendance data or the
+// live employee profiles, and is accurate even if those change later.
+async function viewSavedWeekPayslips(wkKey){
+  const saved=await sGet('payroll_'+wkKey, {});
+  const people=Object.entries(saved).map(([key,rec])=>{
+    const totaal=(Number(rec.rate)||0)*(Number(rec.days)||0);
+    const bonusAmount=Number(rec.bonusAmount)||0;
+    const kommissie=Number(rec.kommissie)||0;
+    const recurringItems=rec.recurringItems||[];
+    const recurringTotal=recurringItems.reduce((s,i)=>s+(Number(i.weekly)||0),0);
+    const deductions=rec.extraDeductions||[];
+    const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
+    const netto=totaal+bonusAmount+kommissie-((Number(rec.uif)||0)+(Number(rec.leenNew)||0)+anderTotal+recurringTotal);
+    return {key, groupLabel:rec.groupLabel||'', rate:Number(rec.rate)||0, days:Number(rec.days)||0,
+      uif:Number(rec.uif)||0, leen:Number(rec.leenNew)||0, deductions, recurringItems, bonusAmount, kommissie, totaal, netto};
+  });
+  if(people.length===0){ toast('Geen gestoorde loonstrokies vir hierdie week nie'); return; }
+  const blob=buildPayslipsGridPDF(people, wkKey);
+  viewPDFBlob(blob);
+}
+
 async function savePayrollWeek(wkKey){
   const existing=await sGet('payroll_'+wkKey, {});
   const data={...existing};
+  const monday=mondayOfWeek(PAY_WEEK_OFFSET);
   document.querySelectorAll('#pr-body .pr-row').forEach(row=>{
     const name=decodeURIComponent(row.dataset.emp);
     const extraDeductions=PR_DEDUCTIONS[name]||[];
+    // Recurring items and the bonus are snapshotted here, frozen exactly
+    // as they were the day this week was saved — a rent increase next
+    // month shouldn't silently rewrite what an old, already-paid payslip
+    // says it was.
+    const {items:recurringItems}=weeklyRecurringTotal(name, monday);
+    const days=parseFloat(row.querySelector('.pr-days').value)||0;
+    const fullDays=Number(row.dataset.fulldays)||5;
+    const bonusAmount=days===fullDays?(Number(row.dataset.bonusamount)||0):0;
     data[name]={
       rate: parseFloat(row.querySelector('.pr-rate').value)||0,
-      days: parseFloat(row.querySelector('.pr-days').value)||0,
+      days,
       uif: parseFloat(row.querySelector('.pr-uif').value)||0,
       leenNew: parseFloat(row.querySelector('.pr-leen').value)||0,
+      kommissie: parseFloat(row.querySelector('.pr-kommissie')?.value)||0,
+      kommissieNote: row.querySelector('.pr-kommissienote')?.value.trim()||'',
       extraDeductions,
       ander: extraDeductions.reduce((s,d)=>s+(Number(d.amount)||0),0),
+      recurringItems, bonusAmount,
+      groupLabel: row.dataset.grouplabel || '',
       paid: row.querySelector('.pr-paid').checked,
     };
   });
   await sSet('payroll_'+wkKey, data);
+  // Lightweight index of which weeks actually have saved payroll — lets
+  // the history browser list real weeks without probing/guessing every
+  // possible week that might exist.
+  const idx=await sGet('payroll_weeks_index', []);
+  if(!idx.includes(wkKey)){ idx.push(wkKey); idx.sort(); await sSet('payroll_weeks_index', idx); }
   // Any loan repayment entered this week reduces that person's running balance.
   for(const [name,rec] of Object.entries(data)){
     if(rec.leenNew>0) await adjustLoanBalance(name, -rec.leenNew, `Afbetaal week ${wkKey}`);
@@ -3329,10 +3612,17 @@ async function sharePayslipPDF(encKey, wkKey){
   const days=parseFloat(row.querySelector('.pr-days').value)||0;
   const uif=parseFloat(row.querySelector('.pr-uif').value)||0;
   const leen=parseFloat(row.querySelector('.pr-leen').value)||0;
+  const kommissie=parseFloat(row.querySelector('.pr-kommissie')?.value)||0;
+  const kommissieNote=row.querySelector('.pr-kommissienote')?.value.trim()||'';
   const deductions=PR_DEDUCTIONS[key]||[];
   const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
+  const recurringTotal=Number(row.dataset.recurring)||0;
+  const {items:recurringItems}=weeklyRecurringTotal(key, mondayOfWeek(PAY_WEEK_OFFSET));
+  const fullDays=Number(row.dataset.fulldays)||5;
+  const bonusAmount=Number(row.dataset.bonusamount)||0;
+  const bonus=days===fullDays?bonusAmount:0;
   const totaal=rate*days;
-  const netto=totaal-(uif+leen+anderTotal);
+  const netto=totaal+bonus+kommissie-(uif+leen+anderTotal+recurringTotal);
 
   const {jsPDF}=window.jspdf;
   const doc=new jsPDF();
@@ -3347,13 +3637,20 @@ async function sharePayslipPDF(encKey, wkKey){
   doc.setFont('helvetica','normal');
   doc.text('Koers per dag',15,y); doc.text('R'+rate.toFixed(2),195,y,{align:'right'}); y+=6;
   doc.text('Dae gewerk',15,y); doc.text(String(days),195,y,{align:'right'}); y+=6;
+  if(bonus>0){ doc.text('Bywoning bonus',15,y); doc.text('R'+bonus.toFixed(2),195,y,{align:'right'}); y+=6; }
+  if(kommissie>0){
+    doc.text('Kommissie'+(kommissieNote?' ('+kommissieNote+')':''),15,y); doc.text('R'+kommissie.toFixed(2),195,y,{align:'right'}); y+=6;
+  }
   doc.setFont('helvetica','bold');
-  doc.text('Bruto',15,y); doc.text('R'+totaal.toFixed(2),195,y,{align:'right'}); y+=10;
+  doc.text('Bruto',15,y); doc.text('R'+(totaal+bonus+kommissie).toFixed(2),195,y,{align:'right'}); y+=10;
 
   doc.setFont('helvetica','bold'); doc.text('Aftrekkings',15,y); y+=6;
   doc.setFont('helvetica','normal');
   doc.text('UIF',15,y); doc.text('R'+uif.toFixed(2),195,y,{align:'right'}); y+=6;
   if(leen>0){ doc.text('Leen afbetaal',15,y); doc.text('R'+leen.toFixed(2),195,y,{align:'right'}); y+=6; }
+  recurringItems.forEach(it=>{
+    doc.text(it.label,15,y); doc.text('R'+it.weekly.toFixed(2),195,y,{align:'right'}); y+=6;
+  });
   deductions.forEach(d=>{
     doc.text(d.reason||'Ander',15,y); doc.text('R'+(Number(d.amount)||0).toFixed(2),195,y,{align:'right'}); y+=6;
   });
@@ -3403,12 +3700,18 @@ function buildPayslipsGridPDF(people, wkKey){
     doc.text('Koers/dag',x,y); doc.text('R'+p.rate.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
     doc.setFont('helvetica','normal');
     doc.text('Dae gewerk',x,y); doc.text(String(p.days),xRight,y,{align:'right'}); y+=4.5;
+    if(p.bonusAmount>0){ doc.text('Bywoning bonus',x,y); doc.text('R'+p.bonusAmount.toFixed(2),xRight,y,{align:'right'}); y+=4.5; }
+    if(p.kommissie>0){ doc.text('Kommissie',x,y); doc.text('R'+p.kommissie.toFixed(2),xRight,y,{align:'right'}); y+=4.5; }
     doc.setFont('helvetica','bold');
-    doc.text('Bruto',x,y); doc.text('R'+p.totaal.toFixed(2),xRight,y,{align:'right'}); y+=6;
+    doc.text('Bruto',x,y); doc.text('R'+(p.totaal+p.bonusAmount+p.kommissie).toFixed(2),xRight,y,{align:'right'}); y+=6;
 
     doc.setFont('helvetica','normal');
     doc.text('UIF',x,y); doc.text('-R'+p.uif.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
     if(p.leen>0){ doc.text('Leen afbetaal',x,y); doc.text('-R'+p.leen.toFixed(2),xRight,y,{align:'right'}); y+=4.5; }
+    (p.recurringItems||[]).forEach(it=>{
+      if(y>y0+cellH-14) return;
+      doc.text(it.label.slice(0,22),x,y); doc.text('-R'+it.weekly.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
+    });
     p.deductions.forEach(d=>{
       if(y>y0+cellH-14) return;
       doc.text((d.reason||'Ander').slice(0,22),x,y); doc.text('-R'+(Number(d.amount)||0).toFixed(2),xRight,y,{align:'right'}); y+=4.5;
@@ -8171,6 +8474,12 @@ async function renderScheduleEditor(forceScroll){
   const nextDate=nextOccurrenceDate(week,day);
   let skippedIds=[];
   try{ skippedIds=await getSkipList(driverId, nextDate); }catch(e){ console.error('Kon nie skip-lys laai nie:', e); }
+  // A whole-day or single-garden Transfer lands here — this is the exact
+  // same "extra" data the receiving driver's own route already reads, but
+  // this screen never checked it before, so a transfer that had genuinely
+  // saved correctly still looked like nothing had happened from here.
+  let borrowedExtra=[];
+  try{ borrowedExtra=await getExtraForDate(driverId, nextDate); }catch(e){ console.error('Kon nie geleende kliënte laai nie:', e); }
 
   // This used to be two separate things — a "👁️ Status" popup for
   // today's live progress, and this editor for the recurring
@@ -8208,11 +8517,11 @@ async function renderScheduleEditor(forceScroll){
       ${DAY_ORDER.map(k=>`<button class="badge ${day===k?'bt':'bc'}" style="cursor:pointer;padding:5px 10px;font-size:.76rem;white-space:nowrap"
         onclick="schedSetDay('${k}')">${DAYS_AF[k].slice(0,2)}</button>`).join('')}
     </div>
-    <p style="font-size:.7rem;color:var(--t3);margin:0">Volgende: ${nextDate} · ${list.length} kliënte · R${list.reduce((s,c)=>s+(Number(c.cost)||0),0).toFixed(0)}
+    <p style="font-size:.7rem;color:var(--t3);margin:0">Volgende: ${nextDate} · ${list.length+borrowedExtra.length} kliënte · R${(list.reduce((s,c)=>s+(Number(c.cost)||0),0)+borrowedExtra.reduce((s,c)=>s+(Number(c.cost)||0),0)).toFixed(0)}
       ${isToday?` · <span style="color:var(--g8);font-weight:700">📍 Vandag — ${todayDoneCount} klaar${todaySkipCount>0?', '+todaySkipCount+' geskip':''}</span>`:''}
     </p>
     <div id="sched-client-list" style="flex:1 1 auto;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px">
-      ${list.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen kliënte op hierdie dag nie.</p>':''}
+      ${list.length===0&&borrowedExtra.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen kliënte op hierdie dag nie.</p>':''}
       ${list.map((c,idx)=>{
         const lastDone=getLastDoneDate(c.pastelCode, c.address);
         const isSkipped=skippedIds.includes(c.id);
@@ -8242,10 +8551,23 @@ async function renderScheduleEditor(forceScroll){
           </div>
         </div>
       </div>`;}).join('')}
+      ${borrowedExtra.length?`
+        <div class="divlbl" style="margin:6px 0 2px">🔀 GELEEN — EENMALIG</div>
+        ${borrowedExtra.map((c,idx)=>`<div style="border:1px solid var(--blue);background:var(--bluep);border-radius:8px;padding:6px 10px">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+            <div style="min-width:0;flex:1">
+              <div style="font-weight:700;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.address}${c.name?' · '+c.name:''}</div>
+              <div style="font-size:.68rem;color:var(--blue);margin-top:1px">Van ${c.borrowedFrom||'\'n ander bestuurder'} se lys — wys net hier op ${nextDate}, kom nie weer terug nie</div>
+            </div>
+            <div style="font-weight:700;font-size:.82rem;flex-shrink:0">R${c.cost||0}</div>
+            <button class="btn btn-sec" style="padding:4px 8px;font-size:.76rem;color:var(--red);flex-shrink:0" onclick="schedRemoveBorrowedClient('${driverId}','${nextDate}',${idx})">✕</button>
+          </div>
+        </div>`).join('')}
+      `:''}
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 4px;border-top:1px solid var(--brd);flex-shrink:0">
       <span style="font-size:.82rem;font-weight:700;color:var(--t2)">Totaal begroot vir hierdie lys</span>
-      <span style="font-size:1rem;font-weight:800;color:var(--g8)">R${list.reduce((s,c)=>s+(Number(c.cost)||0),0).toFixed(0)}</span>
+      <span style="font-size:1rem;font-weight:800;color:var(--g8)">R${(list.reduce((s,c)=>s+(Number(c.cost)||0),0)+borrowedExtra.reduce((s,c)=>s+(Number(c.cost)||0),0)).toFixed(0)}</span>
     </div>
     <div style="display:flex;gap:8px;flex-shrink:0">
       <button class="btn btn-blue" style="flex:1;padding:11px;font-size:.85rem" onclick="schedShowForm(null)">＋ Voeg kliënt</button>
@@ -8358,6 +8680,17 @@ async function schedRemoveClient(clientId){
   if(idx>-1) arr.splice(idx,1);
   await saveSchedule();
   await schedPatchLiveIfToday(driverId,week,day,clientId,null,'remove');
+  renderScheduleEditor();
+  toast('✓ Verwyder / Removed');
+}
+// Undoes a Transfer — pulls one client back out of a driver's one-time
+// "borrowed" list for that specific date. Doesn't touch the recurring
+// schedule at all, since a transfer never did either.
+async function schedRemoveBorrowedClient(driverId, dateKey, idx){
+  const extra=await getExtraForDate(driverId, dateKey).catch(()=>[]);
+  extra.splice(idx,1);
+  const ok=await setExtraForDate(driverId, dateKey, extra);
+  if(!ok){ alert('⚠️ Kon nie verwyder nie — kontroleer die internetverbinding en probeer weer.'); return; }
   renderScheduleEditor();
   toast('✓ Verwyder / Removed');
 }
