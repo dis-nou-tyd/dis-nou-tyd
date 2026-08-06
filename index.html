@@ -1060,7 +1060,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-66'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-68'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1275,6 +1275,17 @@ document.addEventListener('visibilitychange', ()=>{
   if(S.screen==='parent') renderParentTab(S.parentTab);
   else if(S.screen==='driver' && S.driver) renderDriverTab(S.driverTab);
 });
+// Chrome (and others) will silently bump a focused number input's value up
+// or down when the mouse wheel scrolls over it — completely standard
+// browser behavior, but it means just scrolling past a price field (on
+// quotes, or anywhere else) can quietly change the number without anyone
+// touching the keyboard at all. Blurring the field the instant a wheel
+// event reaches it stops the browser from ever applying that change,
+// while still letting the page itself scroll normally underneath.
+document.addEventListener('wheel', ()=>{
+  const el=document.activeElement;
+  if(el && el.tagName==='INPUT' && el.type==='number') el.blur();
+}, {passive:true});
 
 // ══════════════════ WEEK / DAY ════════════════════════════════════════════════
 function getWeekNum(d){
@@ -3146,27 +3157,11 @@ async function renderWages(ct){
     groupNetto[g.id]=gNetto;
   }
 
-  // Aggregate outstanding loan balances across every employee — answers
-  // "who owes what" at a glance instead of having to open each person's
-  // individual Leen-boek one at a time. Fetched in parallel, same reason
-  // as the attendance data above.
-  const allEmployeeNames=[];
-  for(const g of groups){
-    if(g.isDriver) allEmployeeNames.push(g.label.replace(/^\S+\s/,''));
-    allEmployeeNames.push(...g.members);
-  }
-  const loanLedgers=await Promise.all(allEmployeeNames.map(name=>getLoanLedger(name)));
-  const loanBalances=allEmployeeNames.map((name,i)=>({name, balance:loanLedgers[i].balance})).filter(l=>l.balance>0);
-  loanBalances.sort((a,b)=>b.balance-a.balance);
-  const totalLoans=loanBalances.reduce((s,l)=>s+l.balance,0);
-
-  const loanSummaryHtml=loanBalances.length?`
-    <div class="divlbl" style="margin-top:10px">🏦 UITSTAANDE LENINGS (R${totalLoans.toFixed(0)})</div>
-    ${loanBalances.map(l=>`<div style="display:flex;justify-content:space-between;font-size:.82rem;padding:5px 0;border-bottom:1px solid var(--brd);cursor:pointer"
-        onclick="openLoanLedger('${encodeURIComponent(l.name)}')">
-      <span>${l.name}</span><b style="color:#C62828">R${l.balance.toFixed(2)}</b>
-    </div>`).join('')}
-    ` : '';
+  // Outstanding loan balances are only ever shown inside each person's own
+  // Leen-boek now — this used to also aggregate everyone's balance into
+  // one big list right on the main payroll screen, which wasn't wanted.
+  // Removed, along with the extra fetch of every single employee's loan
+  // ledger that building it required.
 
   // ── A group is open: show just that group's rows, drilled in ──
   if(PAY_OPEN_GROUP && groupHtml[PAY_OPEN_GROUP]!==undefined){
@@ -3201,7 +3196,6 @@ async function renderWages(ct){
       <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET=0;PAY_OPEN_GROUP=null;renderWagesInto()">Hierdie week</button>
       <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET++;PAY_OPEN_GROUP=null;renderWagesInto()">Volgende week →</button>
     </div>
-    ${loanSummaryHtml}
     <div style="display:flex;gap:8px;margin-bottom:6px">
       <button onclick="viewAllPayslipsCombined('${wkKey}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
               border-radius:100px;padding:10px;font-size:.82rem;font-weight:700;color:var(--t2)">👁 Bekyk almal (4/bladsy)</button>
@@ -3439,6 +3433,12 @@ async function viewPayslipsForGroup(groupId, wkKey){
 }
 async function printAllPayslipsForGroup(groupId, wkKey){
   const blob=await getPayslipsGroupBlob(groupId, wkKey);
+  // Opens in a new tab either way — a plain download used to silently
+  // save the file with no visible confirmation on a computer (no share
+  // support there), which just looked like nothing had happened. Opening
+  // it lets her use the browser's own Print/Save controls from a PDF
+  // she can actually see.
+  viewPDFBlob(blob);
   await shareOrDownloadPDF(blob, `Loonstrokies_${(groupId||'span').replace(/[^a-z0-9]+/gi,'_')}_${wkKey}.pdf`,
     'Loonstrokies', 'Week '+wkKey);
   toast('🖨️ Loonstrokies PDF gereed — druk en sny volgens die kolle');
@@ -3448,6 +3448,7 @@ async function viewAllPayslipsCombined(wkKey){
 }
 async function printAllPayslipsCombined(wkKey){
   const blob=await getPayslipsAllBlob(wkKey);
+  viewPDFBlob(blob);
   await shareOrDownloadPDF(blob, `Loonstrokies_almal_${wkKey}.pdf`, 'Loonstrokies — almal', 'Week '+wkKey);
   toast('🖨️ Loonstrokies PDF gereed — druk en sny volgens die kolle');
 }
@@ -8469,6 +8470,7 @@ async function schedPatchLiveIfToday(driverId,week,day,schedId,newItem,mode){
 // straight into a driver's recurring schedule (and the client ledger) in one
 // step, or decline it. Nothing here touches the schedule until accepted.
 function quoteStatusBadge(q){
+  if(q.status==='scheduled') return `<span class="badge" style="background:var(--g1);color:var(--g8)">📅 Ingesorteer</span>`;
   if(q.status==='accepted') return `<span class="badge" style="background:var(--g1);color:var(--g8)">✓ Aanvaar</span>`;
   if(q.status==='declined') return `<span class="badge" style="background:var(--brd);color:var(--t2)">✕ Verwerp</span>`;
   if(q.status==='assigned'){
@@ -8657,6 +8659,9 @@ function quoteCardHtml(q,canFinalize,hidePrice){
           ${canFinalize&&q.status==='declined'?`<button onclick="event.stopPropagation();unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
               style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
                      background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
+          ${canFinalize&&q.status==='accepted'?`<button onclick="event.stopPropagation();unAcceptQuote('${q.id}')" title="Terug na wag op besluit / Undo"
+              style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
+                     background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
         </div>
       </div>
     </div>
@@ -8671,8 +8676,11 @@ function quoteCardHtml(q,canFinalize,hidePrice){
     </div>`:''}
     ${canFinalize&&priceKnown&&q.status==='pending'?`<div style="display:flex;gap:6px;margin-top:8px">
       <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:12px;font-size:.78rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig prys</button>
-      <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="openClientForm({fromQuote:'${q.id}'})">✓ Aanvaar</button>
+      <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="acceptQuote('${q.id}')">✓ Aanvaar</button>
       <button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800;color:var(--red)" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
+    </div>`:''}
+    ${canFinalize&&q.status==='accepted'?`<div style="display:flex;gap:6px;margin-top:8px">
+      <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="openClientForm({fromQuote:'${q.id}'})">📅 Sorteer in / Voeg by rooster</button>
     </div>`:''}
   </div>`;
 }
@@ -8704,7 +8712,8 @@ function renderQuotesParent(ct){
   const all=getQuotes();
   const assigned=all.filter(q=>q.status==='assigned');
   const pending=all.filter(q=>q.status==='pending');
-  const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned');
+  const accepted=all.filter(q=>q.status==='accepted');
+  const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned'&&q.status!=='accepted');
   const canFinalize=!S.isOffice; // only Bestuur prices/decides — Jan can send drivers for quotes but not price them
   const hidePrice=!!S.isOffice;
   ct.innerHTML=`
@@ -8714,6 +8723,8 @@ function renderQuotesParent(ct){
     ${assigned.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen versoeke wat wag nie.</p>':assigned.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
     <div class="divlbl">WAG OP BESLUIT (${pending.length})</div>
     ${pending.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen kwotasies wat wag nie.</p>':pending.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
+    <div class="divlbl">✓ AANVAARDE KWOTASIES (${accepted.length}) <span style="font-weight:400;color:var(--t3)">· werk wat gedoen moet word — nog nie ingesorteer nie</span></div>
+    ${accepted.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen aanvaarde kwotasies wat wag om ingesorteer te word nie.</p>':accepted.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
     ${rest.length?`<div class="divlbl">VERLEDE</div>${rest.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}`:''}`;
 }
 
@@ -8820,6 +8831,26 @@ async function unDeclineQuote(id){
   document.getElementById('quote-detail-modal')?.remove();
   refreshQuotesScreen();
 }
+// Accepting a quote used to immediately force picking a driver/week/day
+// right there on the spot — meaning the person accepting had to already
+// know exactly where this job was going, in the same breath as deciding
+// the client said yes. Now it just marks it accepted and moves it into
+// its own "Aanvaarde kwotasies" list, where it waits until whoever's
+// actually building the schedules has time to sort it in properly.
+async function acceptQuote(id){
+  await collUpdate('quotes', id, {status:'accepted'});
+  CACHE.quotes=getQuotes().map(q=>q.id===id?{...q,status:'accepted'}:q);
+  toast('✓ Aanvaar — wag nou om ingesorteer te word');
+  document.getElementById('quote-detail-modal')?.remove();
+  refreshQuotesScreen();
+}
+async function unAcceptQuote(id){
+  await collUpdate('quotes', id, {status:'pending'});
+  CACHE.quotes=getQuotes().map(q=>q.id===id?{...q,status:'pending'}:q);
+  toast('↩️ Terug na wag op besluit');
+  document.getElementById('quote-detail-modal')?.remove();
+  refreshQuotesScreen();
+}
 
 // ══════════════════ NEW CLIENT (parents) — links schedule + ledger ════════════
 // Used both for "add a brand-new client" and "accept a quote": picks which
@@ -8908,8 +8939,8 @@ async function submitNewClient(){
   await collSet('ledger', key, clientDoc);
   CACHE.ledger={...CACHE.ledger, [key]:clientDoc};
   if(fromQuote){
-    await collUpdate('quotes', fromQuote, {status:'accepted'});
-    CACHE.quotes=getQuotes().map(q=>q.id===fromQuote?{...q,status:'accepted'}:q);
+    await collUpdate('quotes', fromQuote, {status:'scheduled'});
+    CACHE.quotes=getQuotes().map(q=>q.id===fromQuote?{...q,status:'scheduled'}:q);
   }
   document.getElementById('newclient-modal')?.remove();
   if(S.screen==='driver') renderQuotesDriver(document.getElementById('d-content'));
