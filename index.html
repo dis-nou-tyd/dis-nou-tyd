@@ -1116,7 +1116,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-73'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-06-75'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1563,6 +1563,13 @@ async function addSkipForDate(driverId, schedId, dateKey){
   if(!list.includes(schedId)) list.push(schedId);
   return await sSet('skip_'+driverId+'_'+dateKey, list);
 }
+async function removeSkipForDate(driverId, schedId, dateKey){
+  const list=await getSkipList(driverId, dateKey);
+  const idx=list.indexOf(schedId);
+  if(idx===-1) return true; // already not skipped — nothing to undo
+  list.splice(idx,1);
+  return await sSet('skip_'+driverId+'_'+dateKey, list);
+}
 
 // "Edit once" — changes a client's notes/price/etc for one specific date
 // only, without touching the recurring template. Stored separately from
@@ -1893,6 +1900,7 @@ async function ensureEmpProfilesSeeded(){
       'Gordon':{recurring:[{label:'Huur',monthly:3700},{label:'Ander skuld',monthly:0}], bonusAmount:250, uifExempt:false},
       'Pierre':{recurring:[{label:'Huur',monthly:2500}], bonusAmount:325, uifExempt:false},
       'Nickey':{recurring:[], bonusAmount:250, uifExempt:false},
+      'Johan':{recurring:[], bonusAmount:250, uifExempt:false},
       'Poenkels':{recurring:[{label:'Onderhoud',monthly:640}], bonusAmount:50, uifExempt:false},
       'Lionel Pieterse':{recurring:[{label:'Onderhoud',monthly:1300}], bonusAmount:50, uifExempt:false},
       'Darryl':{recurring:[], bonusAmount:50, uifExempt:false},
@@ -8799,7 +8807,10 @@ async function renderScheduleEditor(forceScroll){
         <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
           <div style="min-width:0;flex:1">
             <div style="font-weight:700;font-size:.86rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.address}
-              ${isSkipped&&!isToday?` <span style="background:#FFE0B2;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">⏭️ ${nextDate}</span>`:''}
+              ${isSkipped&&!isToday?` <span style="background:#FFE0B2;color:#856404;font-size:.62rem;font-weight:700;padding:1px 6px;border-radius:100px">⏭️ ${nextDate}</span>
+                <button onclick="event.stopPropagation();undoSkipOnce('${c.id}','${nextDate}')" title="Herstel — moenie oorslaan nie"
+                  style="width:auto;flex-shrink:0;padding:1px 6px;font-size:.62rem;font-weight:700;color:var(--blue);
+                         background:var(--bg);border:1px solid var(--brd);border-radius:100px;margin-left:2px">↩</button>`:''}
               ${liveBadge?' '+liveBadge:''}
             </div>
             <div style="font-size:.7rem;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${c.name?c.name+' · ':''}Laaste: ${lastDone||'nooit'}</div>
@@ -9030,6 +9041,37 @@ async function submitSkipOnce(clientId){
   // specifically — matching by exact date, not just the week/day pattern,
   // since that pattern could also match a different, future occurrence.
   if(date===todayKey()) await schedPatchLiveIfToday(driverId,week,day,clientId,null,'remove');
+}
+// There was previously no way to undo a one-off schedule skip at all —
+// including the one a Transfer creates on the original driver's side,
+// which is exactly the case this was reported for. No confirm dialog,
+// since undoing is low-stakes and should be quick.
+async function undoSkipOnce(clientId, dateKey){
+  const {driverId,week,day}=SCHED_ED;
+  const ok=await removeSkipForDate(driverId, clientId, dateKey);
+  if(!ok){ alert('⚠️ Kon nie herstel nie — kontroleer die internetverbinding en probeer weer.'); return; }
+  toast('↩️ Nie meer oorgeslaan nie');
+  renderScheduleEditor(SCHED_SCROLL_CAPTURE);
+  // If today's list was already generated before this undo (driver
+  // already logged in), the skipped item was filtered out at generation
+  // time and simply isn't sitting in their live route at all — unlike a
+  // normal edit to an existing item, there's nothing there yet to update,
+  // so this pushes it back in directly instead.
+  if(dateKey===todayKey() && week===currentWeekKey() && day===todayWeekday()){
+    const list=(SCHEDULE||ALL_ROUTES)[driverId]?.[week]?.[day]||[];
+    const item=list.find(c=>c.id===clientId);
+    if(item){
+      const ck=driverId+'_'+dateKey;
+      let prog=CACHE.progress[ck]||await fetchDriverProgress(driverId);
+      if(prog && prog.route && !prog.route.some(g=>g.schedId===clientId)){
+        const route=[...prog.route, makeFresh(driverId,[item],false)[0]];
+        const payload={...prog, route, ts:Date.now()};
+        CACHE.progress[ck]=payload;
+        await sSet('progress_'+driverId+'_'+dateKey, payload);
+        if(S.screen==='driver'&&S.driver===driverId&&S.driverTab==='route') refresh();
+      }
+    }
+  }
 }
 
 // Only touches TODAY's live list for that driver, and only for jobs not yet
