@@ -628,6 +628,7 @@ async function sGetCritical(key, fallback, retries=2){
 // A write failing is a real problem — Firestore unreachable, blocked by
 // security rules, or no internet connection.
 async function sSet(key, value){
+  markWriteHappened();
   try{ await withTimeout(FS_KV.doc(key).set({value: JSON.stringify(value)}), STORAGE_TIMEOUT_MS, 'sSet:'+key); STORAGE_OK=true; return true; }
   catch(e){ STORAGE_OK=false; console.error('Storage sync mislukt / sync failed:',e); return false; }
   finally { updateSyncBadge(); }
@@ -701,16 +702,19 @@ async function collGetAllKeyedCritical(name, retries=2){
   }
 }
 async function collSet(name, docId, data){
+  markWriteHappened();
   try{ await withTimeout(collRef(name).doc(docId).set(data), STORAGE_TIMEOUT_MS, 'collSet:'+name+'/'+docId); STORAGE_OK=true; }
   catch(e){ STORAGE_OK=false; console.error('Storage sync mislukt / sync failed:',e); throw e; }
   finally{ updateSyncBadge(); }
 }
 async function collUpdate(name, docId, patch){
+  markWriteHappened();
   try{ await withTimeout(collRef(name).doc(docId).set(patch,{merge:true}), STORAGE_TIMEOUT_MS, 'collUpdate:'+name+'/'+docId); STORAGE_OK=true; }
   catch(e){ STORAGE_OK=false; console.error('Storage sync mislukt / sync failed:',e); throw e; }
   finally{ updateSyncBadge(); }
 }
 async function collDelete(name, docId){
+  markWriteHappened();
   try{ await withTimeout(collRef(name).doc(docId).delete(), STORAGE_TIMEOUT_MS, 'collDelete:'+name+'/'+docId); STORAGE_OK=true; }
   catch(e){ STORAGE_OK=false; console.error('Storage delete mislukt / delete failed:',e); throw e; }
   finally{ updateSyncBadge(); }
@@ -846,7 +850,7 @@ function dateKeyOf(d){
 // before writing, so the mutation always applies to the latest data,
 // never a stale local snapshot — same guarantee createInvoice already had.
 async function transactKV(key, mutatorFn){
-  const result = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+  const result = await withTimeout(FSTransaction(async (transaction)=>{
     const doc = await transaction.get(FS_KV.doc(key));
     const current = doc.exists ? JSON.parse(doc.data().value) : undefined;
     const next = mutatorFn(current);
@@ -909,7 +913,58 @@ function applyRosterAndMoves(driverId, moves){
   return workers;
 }
 
+// ── Local snapshot cache for the heavy per-record collections ──
+// invoices/ledger/quotes/credit_notes are read in FULL on every app open
+// (hydrateCache below) — that read cost only ever grows as the business
+// racks up years of invoices. This keeps a short-lived copy on-device so
+// re-opening the app (phone lock/unlock, switching apps, a parent just
+// checking numbers again a minute later) doesn't re-pay that full read
+// every single time. Any write in this session immediately clears the
+// snapshot, so this device's own next load always sees its own changes —
+// staleness is capped at CACHE_TTL_MS and only possible from a DIFFERENT
+// device's edits landing inside that short window.
+const CACHE_LS_KEY='dnt_bundle_cache_v1';
+const CACHE_TTL_MS=3*60*1000; // 3 minutes
+function markWriteHappened(){ try{ localStorage.removeItem(CACHE_LS_KEY); }catch(e){} }
+function loadPersistedBundle(){
+  try{
+    const raw=localStorage.getItem(CACHE_LS_KEY);
+    if(!raw) return null;
+    const obj=JSON.parse(raw);
+    if(!obj||!obj.ts||(Date.now()-obj.ts)>CACHE_TTL_MS) return null;
+    return obj;
+  }catch(e){ return null; }
+}
+function persistBundle(){
+  try{
+    localStorage.setItem(CACHE_LS_KEY, JSON.stringify({
+      ts:Date.now(), invoices:CACHE.invoices, ledger:CACHE.ledger, invSeq:CACHE.invSeq,
+      quotes:CACHE.quotes, creditNotes:CACHE.creditNotes
+    }));
+  }catch(e){ /* storage full/unavailable — silently skip, no functional impact */ }
+}
+// Thin pass-through so every existing transaction call site (invoice
+// create/edit/delete, ledger updates, quote/credit-note flows) also
+// invalidates the local snapshot without having to touch each one.
+function FSTransaction(updateFn){ markWriteHappened(); return FS_DB.runTransaction(updateFn); }
+// Forces a full, fresh reload from Firestore — used by the manual
+// "🔄 Verfris" controls when a parent wants certainty right now (e.g.
+// straight after a driver finishes their route).
+async function refreshAllData(){
+  markWriteHappened();
+  CACHE.ready=false;
+  await hydrateCache();
+}
+
 async function hydrateCache(){
+  const cached=loadPersistedBundle();
+  if(cached){
+    CACHE.invoices=cached.invoices||[]; CACHE.ledger=cached.ledger||{}; CACHE.invSeq=cached.invSeq||1000;
+    CACHE.quotes=cached.quotes||[]; CACHE.creditNotes=cached.creditNotes||[];
+    const [expenses, bankTxns, kleinkas] = await Promise.all([sGet('expenses', []), sGet('bank_txns', []), sGet('kleinkas', [])]);
+    CACHE.expenses=expenses; CACHE.bankTxns=bankTxns; CACHE.kleinkas=kleinkas; CACHE.ready=true;
+    return;
+  }
   await Promise.all([
     ensureCollectionMigrated('invoices', 'invoices', false),
     ensureCollectionMigrated('ledger', 'ledger', true),
@@ -920,6 +975,7 @@ async function hydrateCache(){
     collGetAllCritical('invoices'), collGetAllKeyedCritical('ledger'), sGet('inv_seq', 1000), collGetAllCritical('quotes'), sGet('expenses', []), sGet('bank_txns', []), collGetAllCritical('credit_notes'), sGet('kleinkas', []),
   ]);
   CACHE.invoices=invoices||[]; CACHE.ledger=ledger||{}; CACHE.invSeq=invSeq; CACHE.quotes=quotes||[]; CACHE.expenses=expenses; CACHE.bankTxns=bankTxns; CACHE.creditNotes=creditNotes||[]; CACHE.kleinkas=kleinkas||[]; CACHE.ready=true;
+  persistBundle();
 }
 
 async function loadProgress(dId, dateKey){
@@ -1919,6 +1975,81 @@ let EXP_FILTER={from:'',to:'',category:'',driverId:''};
 let INC_FILTER={from:'',to:'',clientKey:'',driverId:''};
 let INC_OPEN_DATES=new Set(); // which days are expanded in Inkomste's invoice list
 let EXP_OPEN_DATES=new Set(); // which days are expanded in Uitgawes' per-category transaction list
+
+// ── Year → Month accordion (replaces the old prev/next month pager) ──
+// Lets a parent tap a year to reveal its months, then a month to jump
+// straight to it, instead of paging one month at a time through history.
+let INC_OPEN_YEARS=new Set([String(sastNow().getFullYear())]);
+let EXP_OPEN_YEARS=new Set([String(sastNow().getFullYear())]);
+function offsetForYM(year,month){ // month is 1-12
+  const now=sastNow();
+  return (year-now.getFullYear())*12 + (month-1-now.getMonth());
+}
+function ymForOffset(offset){
+  const now=sastNow();
+  const d=new Date(now.getFullYear(), now.getMonth()+offset, 1);
+  return {year:d.getFullYear(), month:d.getMonth()+1};
+}
+// Builds {year:{month:{count,amt}}} from a flat list of dated items.
+function buildYMTree(items, dateGetter, amountGetter){
+  const tree={};
+  items.forEach(it=>{
+    const d=dateGetter(it); if(!d||d.length<7) return;
+    const y=d.slice(0,4), m=parseInt(d.slice(5,7),10);
+    if(!m||m<1||m>12) return;
+    tree[y]=tree[y]||{};
+    tree[y][m]=tree[y][m]||{count:0,amt:0};
+    tree[y][m].count++;
+    tree[y][m].amt+=(amountGetter?amountGetter(it):0)||0;
+  });
+  return tree;
+}
+// Renders the accordion into `host` (a DOM node). `openYears` is the Set
+// tracking which years are expanded. `selYear`/`selMonth` mark the active
+// month. `onPick(year,month)` fires when a month row is tapped.
+function renderYMAccordion(host, items, dateGetter, amountGetter, openYears, selYear, selMonth, onPick, accent){
+  accent=accent||'var(--g7)';
+  const tree=buildYMTree(items, dateGetter, amountGetter);
+  const now=sastNow(); const curY=now.getFullYear(), curM=now.getMonth()+1;
+  const years=new Set(Object.keys(tree).map(Number));
+  years.add(curY); years.add(selYear);
+  const yearList=[...years].sort((a,b)=>b-a);
+  const wrap=el('div'); wrap.style.cssText='border:1px solid var(--brd);border-radius:var(--r);overflow:hidden;margin-bottom:12px';
+  yearList.forEach(y=>{
+    const yStr=String(y);
+    const months=tree[y]||{};
+    const yTotal=Object.values(months).reduce((s,m)=>s+m.amt,0);
+    const yCount=Object.values(months).reduce((s,m)=>s+m.count,0);
+    const isOpen=openYears.has(yStr);
+    const yHdr=el('div');
+    yHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
+      +'padding:12px 14px;background:var(--bg);border-bottom:1px solid var(--brd)';
+    yHdr.innerHTML=`<div style="font-weight:800;font-size:.92rem">${isOpen?'▾':'▸'} ${y}${y===curY?' <span style="font-weight:600;color:var(--t3);font-size:.7rem">· hierdie jaar</span>':''}</div>
+      <div style="font-size:.78rem;color:var(--t2)">${yCount?`${yCount} · R${yTotal.toFixed(0)}`:''}</div>`;
+    yHdr.onclick=()=>{ if(openYears.has(yStr)) openYears.delete(yStr); else openYears.add(yStr); onPick(null,null,true); };
+    wrap.appendChild(yHdr);
+    if(!isOpen) return;
+    const monthNums=new Set(Object.keys(months).map(Number));
+    if(y===curY) monthNums.add(curM);
+    if(y===selYear) monthNums.add(selMonth);
+    const monthList=[...monthNums].sort((a,b)=>b-a);
+    const mGrid=el('div'); mGrid.style.cssText='display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:8px';
+    monthList.forEach(m=>{
+      const info=months[m]||{count:0,amt:0};
+      const isSel=y===selYear&&m===selMonth;
+      const isCur=y===curY&&m===curM;
+      const mBtn=el('div');
+      mBtn.style.cssText=`cursor:pointer;border-radius:10px;padding:9px 10px;border:2px solid ${isSel?accent:'var(--brd)'};`
+        +`background:${isSel?accent:'var(--card)'};color:${isSel?'#fff':'var(--text)'}`;
+      mBtn.innerHTML=`<div style="font-weight:700;font-size:.8rem">${MONTHS_AF[m-1].slice(0,3)}${isCur&&!isSel?' •':''}</div>
+        <div style="font-size:.72rem;${isSel?'color:rgba(255,255,255,.85)':'color:var(--t2)'}">${info.count?`${info.count} · R${info.amt.toFixed(0)}`:'geen'}</div>`;
+      mBtn.onclick=()=>onPick(y,m,false);
+      mGrid.appendChild(mBtn);
+    });
+    wrap.appendChild(mGrid);
+  });
+  host.innerHTML=''; host.appendChild(wrap);
+}
 async function renderPayroll(ct){
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
               ['uitgawes','🧾','Uitgawes'],['kleinkas','💵','Kleinkas'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
@@ -2139,14 +2270,15 @@ async function renderIncome(ct){
   const incCatRows=Object.entries(byIncCat).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
 
   ct.innerHTML=`
-    <div class="ovhdr"><h2>📈 Inkomste / Income</h2><p>${rangeLbl}</p></div>
-    <div style="border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-bottom:12px">
-      <div style="display:flex;gap:8px;margin-bottom:8px">
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="INC_MONTH_OFFSET--;INC_FILTER.from='';INC_FILTER.to='';renderIncomeInto()">← Vorige maand</button>
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="INC_MONTH_OFFSET=0;INC_FILTER.from='';INC_FILTER.to='';renderIncomeInto()">Hierdie maand</button>
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem;${INC_MONTH_OFFSET>=0&&!isCustom?'opacity:.4;pointer-events:none':''}" onclick="INC_MONTH_OFFSET++;INC_FILTER.from='';INC_FILTER.to='';renderIncomeInto()">Volgende →</button>
-      </div>
-      <div class="divlbl" style="margin:6px 0">OF FILTREER SPESIFIEK</div>
+    <div class="ovhdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+      <div><h2>📈 Inkomste / Income</h2><p>${rangeLbl}</p></div>
+      <button onclick="refreshAllData().then(renderIncomeInto)" title="Verfris data / Refresh" style="background:rgba(255,255,255,.18);color:#fff;border-radius:8px;padding:7px 10px;font-size:.8rem;flex-shrink:0">🔄</button>
+    </div>
+    <div id="inc-ym-accordion"></div>
+    <details style="margin-bottom:12px">
+      <summary style="cursor:pointer;font-size:.8rem;color:var(--t2);font-weight:700;padding:6px 0">🔍 Filtreer op kliënt, voertuig of spesifieke datums</summary>
+      <div style="border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-top:6px">
+      <div class="divlbl" style="margin:6px 0">FILTREER SPESIFIEK</div>
       <div style="display:flex;gap:6px;margin-bottom:6px">
         <input class="inp" type="date" id="inc-f-from" value="${INC_FILTER.from}" style="flex:1;padding:7px;font-size:.8rem">
         <input class="inp" type="date" id="inc-f-to" value="${INC_FILTER.to}" style="flex:1;padding:7px;font-size:.8rem">
@@ -2165,7 +2297,8 @@ async function renderIncome(ct){
         <button class="btn" style="flex:1;background:var(--g8);font-size:.8rem" onclick="applyIncFilter()">Filtreer</button>
         <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="resetIncFilter()">Herstel</button>
       </div>
-    </div>
+      </div>
+    </details>
     <div style="background:#FFF8E1;border:1px solid #FFE082;border-radius:10px;padding:10px 12px;margin-bottom:10px;font-size:.78rem;color:#856404">
       💡 'n Faktuur is nie inkomste totdat dit werklik betaal is nie — via kontant op die dag, of deur bankstate te verwerk (Boekhouding → Bank).
     </div>
@@ -2186,6 +2319,12 @@ async function renderIncome(ct){
     <button class="btn-sec btn" style="margin-bottom:10px" onclick="shareIncomeReportPDF()">📄 Genereer PDF-verslag</button>
     <div class="divlbl">FAKTURE (${filtered.length})</div>
     <div id="inc-list"></div>`;
+
+  {
+    const selYM=isCustom?ymForOffset(0):ymForOffset(INC_MONTH_OFFSET);
+    renderYMAccordion(document.getElementById('inc-ym-accordion'), getInvoices(),
+      i=>i.dateKey, i=>i.amount, INC_OPEN_YEARS, selYM.year, selYM.month, pickIncMonth, 'var(--g7)');
+  }
 
   if(incCatRows.length){
     const icc=document.getElementById('inc-cat-breakdown');
@@ -2261,18 +2400,35 @@ async function renderIncome(ct){
     list.appendChild(hdr);
 
     if(!isOpen) return;
+    // Group this day's invoices by client — a client with more than one
+    // job invoiced the same day gets one card, not several duplicate
+    // lines just sitting there.
+    const byClientDay={};
     dayInvs.forEach(i=>{
+      const gk=(i.pastelCode||i.address)+'|'+(i.driverId||'');
+      (byClientDay[gk]=byClientDay[gk]||{invs:[]}).invs.push(i);
+    });
+    Object.values(byClientDay).forEach(({invs})=>{
+      const first=invs[0];
+      const amt=invs.reduce((s,i)=>s+(i.amount||0),0);
       const card=el('div');
       card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin:6px 0 0 10px;display:flex;justify-content:space-between;align-items:start;gap:8px';
       card.innerHTML=`
         <div>
-          <div style="font-weight:700">${i.address}${i.driverId&&DRIVERS[i.driverId]?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${DRIVERS[i.driverId].name}</span>`:''}</div>
-          <div style="font-size:.78rem;color:var(--t2)">${i.id}</div>
+          <div style="font-weight:700">${first.address}${first.driverId&&DRIVERS[first.driverId]?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${DRIVERS[first.driverId].name}</span>`:''}</div>
+          <div style="font-size:.78rem;color:var(--t2)">${invs.map(i=>i.id).join(', ')}</div>
         </div>
-        <div style="font-weight:800;color:var(--g7)">R${(i.amount||0).toFixed(2)}</div>`;
+        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          <button onclick="viewInvoicePDF('${first.id}')" title="Bekyk faktuur PDF" style="background:var(--bg);border:1px solid var(--brd);border-radius:8px;padding:5px 8px;font-size:.8rem">📄</button>
+          <div style="font-weight:800;color:var(--g7)">R${amt.toFixed(2)}</div>
+        </div>`;
       list.appendChild(card);
     });
   });
+}
+function pickIncMonth(year,month,justToggled){
+  if(!justToggled){ INC_MONTH_OFFSET=offsetForYM(year,month); INC_FILTER.from=''; INC_FILTER.to=''; INC_OPEN_YEARS.add(String(year)); }
+  renderIncomeInto();
 }
 function applyIncFilter(){
   INC_FILTER.from=document.getElementById('inc-f-from').value;
@@ -2284,6 +2440,7 @@ function applyIncFilter(){
 function resetIncFilter(){
   INC_FILTER={from:'',to:'',clientKey:'',driverId:''};
   INC_MONTH_OFFSET=0;
+  INC_OPEN_YEARS=new Set([String(sastNow().getFullYear())]);
   renderIncomeInto();
 }
 
@@ -2345,12 +2502,11 @@ async function renderExpenses(ct){
   const chartData=catRows.slice(0,8).map(([cat,amt])=>({label:cat, value:amt, color:'#C62828'}));
 
   ct.innerHTML=`
-    <div class="ovhdr"><h2>🧾 Uitgawes / Expenses</h2><p>${rangeLbl}</p></div>
-    <div style="display:flex;gap:8px;margin-bottom:10px">
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="EXP_MONTH_OFFSET--;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">← Vorige maand</button>
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="EXP_MONTH_OFFSET=0;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">Hierdie maand</button>
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem;${EXP_MONTH_OFFSET>=0&&!isCustom?'opacity:.4;pointer-events:none':''}" onclick="EXP_MONTH_OFFSET++;EXP_FILTER.from='';EXP_FILTER.to='';renderExpensesInto()">Volgende →</button>
+    <div class="ovhdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+      <div><h2>🧾 Uitgawes / Expenses</h2><p>${rangeLbl}</p></div>
+      <button onclick="refreshAllData().then(renderExpensesInto)" title="Verfris data / Refresh" style="background:rgba(255,255,255,.18);color:#fff;border-radius:8px;padding:7px 10px;font-size:.8rem;flex-shrink:0">🔄</button>
     </div>
+    <div id="exp-ym-accordion"></div>
     <details style="margin-bottom:12px">
       <summary style="cursor:pointer;font-size:.8rem;color:var(--t2);font-weight:700;padding:6px 0">🔍 Spesifieke datums of voertuig filtreer</summary>
       <div style="border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-top:6px">
@@ -2384,6 +2540,12 @@ async function renderExpenses(ct){
     <div id="exp-cat-folders" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px"></div>
     <button class="btn btn-blue" style="margin:10px 0" onclick="showAddExpense()">＋ Voeg uitgawe by / Add expense</button>
     <button class="btn-sec btn" style="margin-bottom:10px" onclick="shareExpenseReportPDF()">📄 Genereer PDF-verslag</button>`;
+
+  {
+    const selYM=isCustom?ymForOffset(0):ymForOffset(EXP_MONTH_OFFSET);
+    renderYMAccordion(document.getElementById('exp-ym-accordion'), getExpenses(),
+      e=>e.date, e=>e.amount, EXP_OPEN_YEARS, selYM.year, selYM.month, pickExpMonth, '#C62828');
+  }
 
   const cc=document.getElementById('exp-cat-folders');
   if(catRows.length===0){
@@ -2465,6 +2627,10 @@ function renderExpenseList(items){
     });
   });
 }
+function pickExpMonth(year,month,justToggled){
+  if(!justToggled){ EXP_MONTH_OFFSET=offsetForYM(year,month); EXP_FILTER.from=''; EXP_FILTER.to=''; EXP_OPEN_YEARS.add(String(year)); }
+  renderExpensesInto();
+}
 function applyExpFilter(){
   EXP_FILTER.from=document.getElementById('exp-f-from').value;
   EXP_FILTER.to=document.getElementById('exp-f-to').value;
@@ -2474,6 +2640,7 @@ function applyExpFilter(){
 function resetExpFilter(){
   EXP_FILTER={from:'',to:'',category:'',driverId:''};
   EXP_MONTH_OFFSET=0;
+  EXP_OPEN_YEARS=new Set([String(sastNow().getFullYear())]);
   renderExpensesInto();
 }
 
@@ -4434,7 +4601,7 @@ async function deleteInvoiceAndReverseLedger(invId){
 
   const key = Object.keys(getLedger()).find(k=>invoiceMatchesClient(removedInv, getLedger()[k]));
   if(key){
-    const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    const client = await withTimeout(FSTransaction(async (transaction)=>{
       const ref=FS_DB.collection('ledger').doc(key);
       const doc=await transaction.get(ref);
       if(!doc.exists) return null;
@@ -4621,7 +4788,7 @@ async function createManualInvoice(fields){
   const dateStrToUse=new Date(fields.dateKey+'T12:00:00').toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
   const lineItems=fields.lineItems||[];
   const amount=lineItems.reduce((s,l)=>s+(l.amount||0),0);
-  const inv=await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+  const inv=await withTimeout(FSTransaction(async (transaction)=>{
     const seqDoc=await transaction.get(FS_KV.doc('inv_seq'));
     const n=(seqDoc.exists?JSON.parse(seqDoc.data().value):1000)||1000;
     const newInv={
@@ -4752,7 +4919,7 @@ async function createInvoice(garden, overrideDriverId, overrideDateKey){
   // invoice ever created, which is what used to make this slower (and
   // more failure-prone) the more invoices existed — and what capped the
   // business at whatever fits in a single 1MB Firestore document.
-  const inv=await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+  const inv=await withTimeout(FSTransaction(async (transaction)=>{
     const seqDoc=await transaction.get(FS_KV.doc('inv_seq'));
     const n=(seqDoc.exists?JSON.parse(seqDoc.data().value):1000)||1000;
     const newInv={
@@ -4794,7 +4961,7 @@ async function createInvoice(garden, overrideDriverId, overrideDateKey){
 async function addLedgerEntry(inv){
   const found=findLedgerClientIn(getLedger(),inv.pastelCode,inv.address,inv.name);
   const key=found?found.key:safeLedgerKey(inv.pastelCode||inv.address);
-  const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+  const client = await withTimeout(FSTransaction(async (transaction)=>{
     const ref=FS_DB.collection('ledger').doc(key);
     const doc=await transaction.get(ref);
     const c = doc.exists ? doc.data() : {code:inv.pastelCode, name:inv.name||inv.address, address:inv.address, balance:0, entries:[]};
@@ -4820,7 +4987,7 @@ async function addLedgerEntry(inv){
 
 async function addPayment(clientKey,amount,date,method,driverId){
   const dateStr=new Date(date).toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+  const client = await withTimeout(FSTransaction(async (transaction)=>{
     const ref=FS_DB.collection('ledger').doc(clientKey);
     const doc=await transaction.get(ref);
     if(!doc.exists) return null;
@@ -6522,7 +6689,7 @@ async function submitCreditNote(invId){
   // Reduce the client's ledger balance, same mechanism as a payment.
   const found=findLedgerClient(inv.pastelCode, inv.address, inv.name);
   const key=found?found.key:safeLedgerKey(inv.pastelCode||inv.address);
-  const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+  const client = await withTimeout(FSTransaction(async (transaction)=>{
     const ref=FS_DB.collection('ledger').doc(key);
     const doc=await transaction.get(ref);
     if(!doc.exists) return null;
@@ -7002,7 +7169,7 @@ async function submitEditInvoice(invId){
   // though the invoice's own amount was saved correctly.
   const key=Object.keys(getLedger()).find(k=>invoiceMatchesClient(editedInv, getLedger()[k]));
   if(key){
-    const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    const client = await withTimeout(FSTransaction(async (transaction)=>{
       const ref=FS_DB.collection('ledger').doc(key);
       const doc=await transaction.get(ref);
       if(!doc.exists) return null;
@@ -7217,7 +7384,7 @@ async function submitMoveDay(){
     const led=getLedger();
     const affectedKeys=Object.keys(led).filter(k=>(led[k].entries||[]).some(e=>e.invId && invIds.includes(e.invId)));
     await Promise.all(affectedKeys.map(async key=>{
-      const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+      const client = await withTimeout(FSTransaction(async (transaction)=>{
         const ref=FS_DB.collection('ledger').doc(key);
         const doc=await transaction.get(ref);
         if(!doc.exists) return null;
@@ -7301,7 +7468,7 @@ async function submitEditTime(gardenId){
 
       const key=Object.keys(getLedger()).find(k=>invoiceMatchesClient(editedInv, getLedger()[k]));
       if(key){
-        const client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+        const client = await withTimeout(FSTransaction(async (transaction)=>{
           const ref=FS_DB.collection('ledger').doc(key);
           const doc=await transaction.get(ref);
           if(!doc.exists) return null;
@@ -7525,7 +7692,7 @@ async function submitMergeClients(){
 
   let mergedTo=null;
   try{
-    mergedTo = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    mergedTo = await withTimeout(FSTransaction(async (transaction)=>{
       const fromRef=FS_DB.collection('ledger').doc(fromKey);
       const toRef=FS_DB.collection('ledger').doc(toKey);
       const [fromDoc,toDoc]=await Promise.all([transaction.get(fromRef), transaction.get(toRef)]);
@@ -7662,7 +7829,7 @@ async function reconcileClientLedger(key){
   const liveInvIds=new Set(getInvoices().map(i=>i.id));
   let client;
   try{
-    client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    client = await withTimeout(FSTransaction(async (transaction)=>{
       const ref=FS_DB.collection('ledger').doc(key);
       const doc=await transaction.get(ref);
       if(!doc.exists) return null;
@@ -7722,7 +7889,7 @@ async function submitLedgerCorrection(key){
   const dateStr=now.toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
   let client;
   try{
-    client = await withTimeout(FS_DB.runTransaction(async (transaction)=>{
+    client = await withTimeout(FSTransaction(async (transaction)=>{
       const ref=FS_DB.collection('ledger').doc(key);
       const doc=await transaction.get(ref);
       if(!doc.exists) return null;
@@ -7800,6 +7967,8 @@ let STMT_MONTH_OFFSET=0;
 let STMT_SEARCH='';
 let STMT_OPEN_MONTHS=new Set(); // which month groups are expanded
 let STMT_OPEN_DAYS=new Set();   // which day groups (within an expanded month) are expanded, keyed 'YYYY-MM_YYYY-MM-DD'
+let STMT_OPEN_YEARS=new Set([String(sastNow().getFullYear())]); // which years are expanded
+let STMT_FILTER='all'; // 'all' | 'owing' | 'unsent'
 
 // Previously this was "one month at a time" via Prev/This/Next buttons,
 // with a flat list of clients underneath. Replaced with a proper
@@ -7852,12 +8021,35 @@ async function renderStatements(ct){
     }
   }
 
+  const srchRow=el('div');
+  srchRow.style.cssText='display:flex;gap:6px;margin-bottom:8px';
   const srch=el('input','inp');
   srch.placeholder='Soek kliënt / Search client…';
-  srch.style.marginBottom='10px';
+  srch.style.flex='1';
   srch.value=STMT_SEARCH;
   srch.oninput=()=>{ STMT_SEARCH=srch.value; renderParentTab('statements'); };
-  ct.appendChild(srch);
+  srchRow.appendChild(srch);
+  const refreshBtn=el('button');
+  refreshBtn.textContent='🔄';
+  refreshBtn.title='Verfris data / Refresh';
+  refreshBtn.style.cssText='background:var(--bg);border:2px solid var(--brd);border-radius:10px;padding:0 14px;font-size:.9rem;flex-shrink:0';
+  refreshBtn.onclick=()=>refreshAllData().then(()=>renderParentTab('statements'));
+  srchRow.appendChild(refreshBtn);
+  ct.appendChild(srchRow);
+
+  const filterRow=el('div');
+  filterRow.style.cssText='display:flex;gap:6px;margin-bottom:10px';
+  const filterOpts=[['all','Almal'],['owing','Uitstaande saldo'],['unsent','Nog nie gestuur nie']];
+  filterOpts.forEach(([val,lbl])=>{
+    const chip=el('button');
+    const isOn=STMT_FILTER===val;
+    chip.className='tab'+(isOn?' on':'');
+    chip.style.cssText='flex:1;padding:8px 6px;font-size:.72rem';
+    chip.textContent=lbl;
+    chip.onclick=()=>{ STMT_FILTER=val; renderParentTab('statements'); };
+    filterRow.appendChild(chip);
+  });
+  ct.appendChild(filterRow);
 
   const q=STMT_SEARCH.trim().toLowerCase();
   const matchesClient=(inv)=>{
@@ -7876,7 +8068,29 @@ async function renderStatements(ct){
 
   let anyMonthShown=false;
 
-  for(const ym of monthKeys){
+  // Group months by year so a business with several years of statements
+  // doesn't dump every month flat — click a year to reveal its months.
+  const byYear={};
+  monthKeys.forEach(ym=>{ const y=ym.slice(0,4); (byYear[y]=byYear[y]||[]).push(ym); });
+  const yearKeys=Object.keys(byYear).sort((a,b)=>b.localeCompare(a));
+
+  for(const yk of yearKeys){
+    const yearMonthKeys=byYear[yk];
+    const yearInvsAll=yearMonthKeys.flatMap(ym=>Object.values(byMonth[ym]).flat());
+    const yearInvsMatch=yearInvsAll.filter(matchesClient);
+    if(q && yearInvsMatch.length===0) continue;
+    const isYearOpen=STMT_OPEN_YEARS.has(yk) || !!q;
+
+    const yHdr=el('div');
+    yHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
+      +'background:var(--bg);border:1px solid var(--brd);border-radius:var(--r);padding:11px 16px;margin-top:12px';
+    yHdr.innerHTML=`<div style="font-weight:800;font-size:.9rem">${isYearOpen?'▾':'▸'} ${yk}</div>
+      <div style="font-size:.78rem;color:var(--t2)">${yearInvsMatch.length} fakture · R${yearInvsMatch.reduce((s,i)=>s+i.amount,0).toFixed(0)}</div>`;
+    yHdr.onclick=()=>{ if(STMT_OPEN_YEARS.has(yk)) STMT_OPEN_YEARS.delete(yk); else STMT_OPEN_YEARS.add(yk); renderParentTab('statements'); };
+    ct.appendChild(yHdr);
+    if(!isYearOpen) continue;
+
+  for(const ym of yearMonthKeys){
     const dayMap=byMonth[ym];
     const allMonthInvs=Object.values(dayMap).flat();
     const filteredMonthInvs=allMonthInvs.filter(matchesClient);
@@ -7911,12 +8125,33 @@ async function renderStatements(ct){
     const dayKeys=Object.keys(dayMap).sort((a,b)=>b.localeCompare(a));
 
     for(const dk of dayKeys){
-      const dayInvs=dayMap[dk].filter(matchesClient);
-      if(dayInvs.length===0) continue;
+      const dayInvsAll=dayMap[dk].filter(matchesClient);
+      if(dayInvsAll.length===0) continue;
+
+      // Group this day's invoices by client, so one client with 2 jobs
+      // the same day still gets a single card, not two duplicates. Grouped
+      // up front (even while collapsed) so the 'owing'/'unsent' filter can
+      // hide whole days that have nothing matching, not just cards inside.
+      const byClientAll={};
+      dayInvsAll.forEach(inv=>{
+        const key=Object.keys(led).find(k=>invoiceMatchesClient(inv,led[k]));
+        const gk=key||('__nomatch__'+inv.address);
+        (byClientAll[gk]=byClientAll[gk]||{key,invs:[]}).invs.push(inv);
+      });
+      const sentSetForFilter=STMT_FILTER==='unsent'?sentSet:null;
+      const clientGroups=Object.values(byClientAll).filter(({key})=>{
+        if(STMT_FILTER==='all') return true;
+        const c=key?led[key]:null;
+        if(STMT_FILTER==='owing') return !!c && (c.balance||0)>0;
+        if(STMT_FILTER==='unsent') return !!c && !sentSetForFilter.has(key);
+        return true;
+      });
+      if(clientGroups.length===0) continue;
+      const dayInvs=clientGroups.flatMap(g=>g.invs);
 
       const dayKeyFull=ym+'_'+dk;
       const isDayOpen=STMT_OPEN_DAYS.has(dayKeyFull) || !!q;
-      const dayLbl=dayInvs[0].date||dk;
+      const dayLbl=dayInvsAll[0].date||dk;
 
       const dHdr=el('div');
       dHdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;background:var(--card);border:1px solid var(--brd);border-radius:8px;padding:9px 12px;margin:6px 0 0 10px';
@@ -7927,16 +8162,7 @@ async function renderStatements(ct){
 
       if(!isDayOpen) continue;
 
-      // Group this day's invoices by client, so one client with 2 jobs
-      // the same day still gets a single card, not two duplicates.
-      const byClient={};
-      dayInvs.forEach(inv=>{
-        const key=Object.keys(led).find(k=>invoiceMatchesClient(inv,led[k]));
-        const gk=key||('__nomatch__'+inv.address);
-        (byClient[gk]=byClient[gk]||{key,invs:[]}).invs.push(inv);
-      });
-
-      Object.values(byClient).forEach(({key,invs:clientInvs})=>{
+      clientGroups.forEach(({key,invs:clientInvs})=>{
         const c=key?led[key]:null;
         const addr=c?c.address:clientInvs[0].address;
         const nm=c?.name?' ('+c.name+')':'';
@@ -7961,6 +8187,7 @@ async function renderStatements(ct){
       });
     }
   }
+  } // end year loop
 
   if(!anyMonthShown){
     const empty=el('p'); empty.style.cssText='color:var(--t2);text-align:center;padding:20px 0';
