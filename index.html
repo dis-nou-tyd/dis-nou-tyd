@@ -1060,7 +1060,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-65'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-66'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1782,6 +1782,12 @@ function formatToday(){
 // person so a repayment this week automatically reduces what they still owe.
 let PAY_WEEK_OFFSET=0; // 0 = current week, -1 = last week, etc.
 let PAY_OPEN_GROUP=null; // null = folder view; a group id = drilled into that bakkie/office group
+// Every person's computed payslip numbers, captured once during the same
+// pass that builds the on-screen rows — this is what the PDF generators
+// read from, rather than scraping whichever group happens to be open in
+// the DOM right now. That's what makes a single combined PDF across every
+// bakkie possible, not just one bakkie at a time.
+let PAYROLL_PAYSLIP_DATA=[];
 let PR_DEDUCTIONS={}; // { [employeeKey]: [{reason, amount}, ...] } — itemized "other" deductions per week
 
 function mondayOfWeek(offsetWeeks){
@@ -3033,6 +3039,7 @@ async function renderWages(ct){
 
   let bodyHtml='', grandNetto=0, grandUIF=0, grandLeen=0;
   PR_DEDUCTIONS={};
+  PAYROLL_PAYSLIP_DATA=[];
 
   // Phase 1: flatten every person across every group, then fetch every
   // single one's attendance data AT THE SAME TIME instead of one after
@@ -3102,6 +3109,8 @@ async function renderWages(ct){
       const netto = totaal-aftrekkings;
       grandNetto+=netto; grandUIF+=Number(uif)||0; grandLeen+=Number(loanNew)||0;
       gNetto+=netto;
+      PAYROLL_PAYSLIP_DATA.push({key, groupId:g.id, groupLabel:g.label, rate:Number(rate)||0, days:Number(days)||0,
+        uif:Number(uif)||0, leen:Number(loanNew)||0, deductions:PR_DEDUCTIONS[key].slice(), totaal, netto});
       const paid=!!rec.paid;
       const isCasual=!person.isLead && casualProgsByDriver[g.id] && casualProgsByDriver[g.id].includes(key);
       groupRows+=`<div class="pr-row" data-emp="${encodeURIComponent(key)}">
@@ -3171,7 +3180,11 @@ async function renderWages(ct){
       <div id="pr-body">${groupHtml[g.id]}</div>
       <div style="display:flex;gap:8px;margin-top:12px">
         <button class="btn" style="flex:1" onclick="savePayrollWeek('${wkKey}')">💾 Stoor week / Save week</button>
-        <button class="btn-sec btn" style="flex:1;background:var(--g8);color:#fff" onclick="printAllPayslipsForGroup('${g.id}','${wkKey}')">🖨️ Druk almal (4/bladsy)</button>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button onclick="viewPayslipsForGroup('${g.id}','${wkKey}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
+                border-radius:100px;padding:10px;font-size:.82rem;font-weight:700;color:var(--t2)">👁 Bekyk (4/bladsy)</button>
+        <button class="btn-sec btn" style="flex:1;background:var(--g8);color:#fff" onclick="printAllPayslipsForGroup('${g.id}','${wkKey}')">🖨️ Stuur/Laai af</button>
       </div>
     `;
     return;
@@ -3189,6 +3202,11 @@ async function renderWages(ct){
       <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET++;PAY_OPEN_GROUP=null;renderWagesInto()">Volgende week →</button>
     </div>
     ${loanSummaryHtml}
+    <div style="display:flex;gap:8px;margin-bottom:6px">
+      <button onclick="viewAllPayslipsCombined('${wkKey}')" style="flex:1;background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:10px;font-size:.82rem;font-weight:700;color:var(--t2)">👁 Bekyk almal (4/bladsy)</button>
+      <button class="btn-sec btn" style="flex:1;background:var(--g8);color:#fff" onclick="printAllPayslipsCombined('${wkKey}')">🖨️ Almal — Stuur/Laai af</button>
+    </div>
     <div class="divlbl" style="margin-top:12px">BAKKIES <span style="font-weight:400;color:var(--t3)">· tik om oop te maak</span></div>
     <div id="pr-folders" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
     <button class="btn-sec btn" style="width:100%;margin-top:8px;background:#FFF3CD;border-color:#FFE082;color:#856404" onclick="showFixMissingLoanEntries()">🔧 Herstel ontbrekende leen-inskrywings</button>
@@ -3358,26 +3376,10 @@ async function sharePayslipPDF(encKey, wkKey){
     'Loonstrokie', key+' — R'+netto.toFixed(2));
   toast('🖨️ Loonstrokie PDF gereed');
 }
-// Every person currently drilled into (one bakkie/office group) gets their
-// own compact payslip, 4 to a page in a 2×2 grid with a dashed cut-line
-// around each one — meant to be printed, cut along the dashed lines, and
-// dropped straight into envelopes, instead of one full page per person.
-async function printAllPayslipsForGroup(groupId, wkKey){
-  const rows=[...document.querySelectorAll('#pr-body .pr-row')];
-  if(rows.length===0){ toast('Geen ry gevind nie'); return; }
-  const people=rows.map(row=>{
-    const key=decodeURIComponent(row.dataset.emp);
-    const rate=parseFloat(row.querySelector('.pr-rate').value)||0;
-    const days=parseFloat(row.querySelector('.pr-days').value)||0;
-    const uif=parseFloat(row.querySelector('.pr-uif').value)||0;
-    const leen=parseFloat(row.querySelector('.pr-leen').value)||0;
-    const deductions=PR_DEDUCTIONS[key]||[];
-    const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
-    const totaal=rate*days;
-    const netto=totaal-(uif+leen+anderTotal);
-    return {key, rate, days, uif, leen, deductions, totaal, netto};
-  });
-
+// Shared layout builder — 4 payslips per page, 2×2 grid, dashed cut-line
+// around each one. Used both for one bakkie's payslips and for every
+// single person across every group combined into one PDF.
+function buildPayslipsGridPDF(people, wkKey){
   const {jsPDF}=window.jspdf;
   const doc=new jsPDF();
   const pageW=210, pageH=297, marginOuter=8;
@@ -3414,7 +3416,7 @@ async function printAllPayslipsForGroup(groupId, wkKey){
     doc.text('UIF',x,y); doc.text('-R'+p.uif.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
     if(p.leen>0){ doc.text('Leen afbetaal',x,y); doc.text('-R'+p.leen.toFixed(2),xRight,y,{align:'right'}); y+=4.5; }
     p.deductions.forEach(d=>{
-      if(y>y0+cellH-14) return; // out of room in this cell — keep the netto line safe rather than overflow into the next payslip
+      if(y>y0+cellH-14) return;
       doc.text((d.reason||'Ander').slice(0,22),x,y); doc.text('-R'+(Number(d.amount)||0).toFixed(2),xRight,y,{align:'right'}); y+=4.5;
     });
     y+=2;
@@ -3423,9 +3425,30 @@ async function printAllPayslipsForGroup(groupId, wkKey){
     doc.text('NETTO',x,y); doc.text('R'+p.netto.toFixed(2),xRight,y,{align:'right'});
   });
 
-  const blob=doc.output('blob');
+  return doc.output('blob');
+}
+async function getPayslipsGroupBlob(groupId, wkKey){
+  const people=PAYROLL_PAYSLIP_DATA.filter(p=>p.groupId===groupId);
+  return buildPayslipsGridPDF(people, wkKey);
+}
+async function getPayslipsAllBlob(wkKey){
+  return buildPayslipsGridPDF(PAYROLL_PAYSLIP_DATA, wkKey);
+}
+async function viewPayslipsForGroup(groupId, wkKey){
+  viewPDFBlob(await getPayslipsGroupBlob(groupId, wkKey));
+}
+async function printAllPayslipsForGroup(groupId, wkKey){
+  const blob=await getPayslipsGroupBlob(groupId, wkKey);
   await shareOrDownloadPDF(blob, `Loonstrokies_${(groupId||'span').replace(/[^a-z0-9]+/gi,'_')}_${wkKey}.pdf`,
     'Loonstrokies', 'Week '+wkKey);
+  toast('🖨️ Loonstrokies PDF gereed — druk en sny volgens die kolle');
+}
+async function viewAllPayslipsCombined(wkKey){
+  viewPDFBlob(await getPayslipsAllBlob(wkKey));
+}
+async function printAllPayslipsCombined(wkKey){
+  const blob=await getPayslipsAllBlob(wkKey);
+  await shareOrDownloadPDF(blob, `Loonstrokies_almal_${wkKey}.pdf`, 'Loonstrokies — almal', 'Week '+wkKey);
   toast('🖨️ Loonstrokies PDF gereed — druk en sny volgens die kolle');
 }
 
