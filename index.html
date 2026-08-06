@@ -965,6 +965,7 @@ function FSTransaction(updateFn){ markWriteHappened(); return FS_DB.runTransacti
 async function refreshAllData(){
   markWriteHappened();
   CACHE.ready=false;
+  DIESEL_SUGG_CACHE={ts:0, data:null}; // manual refresh should bypass the diesel-suggestion cache too, not just wait it out
   await hydrateCache();
 }
 
@@ -1128,7 +1129,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-06-81'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-06-82'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1174,9 +1175,29 @@ function startPolling(){
         const dk=todayKey(), ck=S.driver+'_'+dk;
         const remote = await sGet('progress_'+S.driver+'_'+dk, null);
         if(remote && remote.ts && (!CACHE.progress[ck] || remote.ts>CACHE.progress[ck].ts) && remote.ts>(S._lastLocalSave||0)){
+          // Nothing local is newer than this — a genuinely newer save from
+          // elsewhere (another tablet, or the parent screen) wins outright.
           S.route=remote.route; S.vehicle=remote.vehicle||S.vehicle; S.workers=remote.workers||S.workers;
           CACHE.progress[ck]=remote;
           if(S.driverTab==='route') refresh();
+        } else if(remote && remote.route && remote.route.length){
+          // This device may have a "newer" local timestamp simply because
+          // the driver's been actively working — which used to mean a
+          // garden Bestuur/Jan pushed onto this list in the meantime got
+          // silently discarded the next time this device saved, since a
+          // full overwrite from local state has no way to know it exists.
+          // An entry present on the server but missing here can only ever
+          // be a genuine addition (nothing locally ever removes one by
+          // id), so it's always safe to fold in, regardless of which
+          // timestamp is "newer." Re-saving immediately makes the merge
+          // stick, closing the gap rather than leaving it to be rediscovered.
+          const haveIds=new Set(S.route.map(g=>g.id).filter(Boolean));
+          const missing=remote.route.filter(g=>g.id && !haveIds.has(g.id));
+          if(missing.length){
+            S.route=[...S.route, ...missing];
+            saveProgress();
+            if(S.driverTab==='route') refresh();
+          }
         }
       }
     }catch(e){ /* stay silent, retry next tick */ }
@@ -2120,6 +2141,10 @@ function monthRange(offset){
   const label=MONTHS_AF[base.getMonth()]+' '+base.getFullYear();
   return {from,to,label};
 }
+function monthLabelForYM(ym){ // ym like "2026-08"
+  const [y,m]=ym.split('-');
+  return (MONTHS_AF[parseInt(m,10)-1]||m)+' '+y;
+}
 
 const EXPENSE_CATEGORIES=[
   'Diesel/Petrol','Olie','Gif/Chemikalieë','Tuintoerusting',
@@ -2256,7 +2281,6 @@ async function renderIncome(ct){
   let filtered=getInvoices().filter(i=>dateInRange(i.dateKey,from,to));
   if(INC_FILTER.driverId) filtered=filtered.filter(i=>i.driverId===INC_FILTER.driverId);
   if(INC_FILTER.clientKey) filtered=filtered.filter(i=>(i.pastelCode||i.address)===INC_FILTER.clientKey);
-  filtered=filtered.slice().sort((a,b)=>b.dateKey.localeCompare(a.dateKey));
 
   const total=filtered.reduce((s,i)=>s+(i.amount||0),0);
 
@@ -2268,27 +2292,13 @@ async function renderIncome(ct){
        && (!INC_FILTER.driverId||e.driverId===INC_FILTER.driverId)) paidTotal+=e.credit||0;
   }));
 
-  const byClient={};
-  filtered.forEach(i=>{ const k=i.pastelCode||i.address; byClient[k]=byClient[k]||{label:i.address,amt:0}; byClient[k].amt+=i.amount||0; });
-  const clientRows=Object.entries(byClient).map(([k,v])=>({key:k,...v})).sort((a,b)=>b.amt-a.amt);
-
-  const byDrv={};
-  filtered.forEach(i=>{ byDrv[i.driverId]=(byDrv[i.driverId]||0)+(i.amount||0); });
-  const drvRows=Object.entries(byDrv).map(([id,amt])=>({id, name:DRIVERS[id]?DRIVERS[id].name:id, amt})).sort((a,b)=>b.amt-a.amt);
-
-  // Income category — recurring garden service vs once-off jobs vs extra work
-  // billed on top of a normal visit, so a parent can see the income mix, not
-  // just who paid and which driver did it.
-  const byIncCat={'Tuindiens (herhalend)':0,'Eenmalige werk':0,'Ekstra werk':0};
-  filtered.forEach(i=>{
-    if(i.isOnceOff) byIncCat['Eenmalige werk']+=i.amount||0;
-    else{
-      byIncCat['Tuindiens (herhalend)']+=(i.baseAmount!=null?i.baseAmount:i.amount)||0;
-      if(i.extraWorkAmount) byIncCat['Ekstra werk']+=i.extraWorkAmount;
-    }
-  });
-  const incCatRows=Object.entries(byIncCat).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]);
-
+  // This tab used to lay out every invoice for the month as a long list of
+  // bubbles/breakdowns to scroll through — but the actual invoice PDFs are
+  // already reviewable per-client elsewhere, so all that data sitting here
+  // too was just duplicate clutter. This screen now stays close to empty:
+  // the headline numbers for a quick glance, and a report generator below
+  // that produces an actual PDF (sorted however it's asked to be) to open,
+  // view, or download from — nothing else lives on the tab itself.
   ct.innerHTML=`
     <div class="ovhdr" style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
       <div><h2>📈 Inkomste / Income</h2><p>${rangeLbl}</p></div>
@@ -2327,124 +2337,21 @@ async function renderIncome(ct){
       <div class="ovc"><div class="v" style="color:var(--t3)">R${total.toFixed(0)}</div><div class="l">Gefaktureer <span style="font-weight:400">(nog nie betaal nie)</span></div></div>
       <div class="ovc"><div class="v">${filtered.length}</div><div class="l">Aantal fakture</div></div>
     </div>
-    ${incCatRows.length?`
-    <div class="divlbl" style="margin-top:12px">GEFAKTUREER PER KATEGORIE <span style="font-weight:400;color:var(--t3)">(nie almal betaal nie)</span></div>
-    <div id="inc-cat-breakdown" style="margin-bottom:12px"></div>`:''}
-    ${clientRows.length?`
-    <div class="divlbl" style="margin-top:12px">GEFAKTUREER PER KLIËNT <span style="font-weight:400;color:var(--t3)">(nie almal betaal nie)</span></div>
-    <div id="inc-client-breakdown" style="margin-bottom:12px"></div>`:''}
-    ${drvRows.length?`
-    <div class="divlbl" style="margin-top:12px">GEFAKTUREER PER VOERTUIG / BESTUURDER <span style="font-weight:400;color:var(--t3)">(nie almal betaal nie)</span></div>
-    <div id="inc-driver-breakdown" style="margin-bottom:12px"></div>`:''}
-    <button class="btn-sec btn" style="margin-bottom:10px" onclick="shareIncomeReportPDF()">📄 Genereer PDF-verslag</button>
-    <div class="divlbl">FAKTURE (${filtered.length})</div>
-    <div id="inc-list"></div>`;
+    <div class="divlbl" style="margin-top:14px">TREK 'N VERSLAG / PULL A REPORT</div>
+    <div style="border:1px solid var(--brd);border-radius:var(--r);padding:12px;margin-bottom:12px">
+      <p style="font-size:.78rem;color:var(--t2);margin:0 0 8px">'n PDF-verslag vir bogenoemde periode (${rangeLbl}) wat u kan oopmaak, bekyk of aflaai — kies hoe dit gesorteer moet wees.</p>
+      <div class="flbl" style="margin-bottom:5px">Sorteer volgens / Sort by</div>
+      <select class="inp" id="inc-report-sort" style="margin-bottom:10px">
+        <option value="driver">Bestuurder / Driver</option>
+        <option value="month">Maand / Month</option>
+        <option value="client">Kliënt / Client</option>
+      </select>
+      <button class="btn" style="background:var(--g8)" onclick="shareIncomeReportPDF()">📄 Genereer PDF-verslag</button>
+    </div>`;
 
-  {
-    const selYM=isCustom?ymForOffset(0):ymForOffset(INC_MONTH_OFFSET);
-    renderYMAccordion(document.getElementById('inc-ym-accordion'), getInvoices(),
-      i=>i.dateKey, i=>i.amount, INC_OPEN_YEARS, selYM.year, selYM.month, pickIncMonth, 'var(--g7)');
-  }
-
-  if(incCatRows.length){
-    const icc=document.getElementById('inc-cat-breakdown');
-    const maxIncCat=incCatRows[0][1];
-    incCatRows.forEach(([cat,amt])=>{
-      const pct=Math.round((amt/maxIncCat)*100);
-      const row=el('div');
-      row.style.cssText='margin-bottom:8px';
-      row.innerHTML=`
-        <div style="display:flex;justify-content:space-between;font-size:.82rem;margin-bottom:3px">
-          <span style="font-weight:600">${cat}</span><span style="font-weight:700">R${amt.toFixed(0)}</span>
-        </div>
-        <div style="background:var(--bg);border-radius:100px;height:7px;overflow:hidden">
-          <div style="background:var(--g7);width:${pct}%;height:100%"></div>
-        </div>`;
-      icc.appendChild(row);
-    });
-  }
-
-  if(clientRows.length){
-    const cc=document.getElementById('inc-client-breakdown');
-    clientRows.forEach(r=>{
-      const row=el('div');
-      row.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:9px 12px;margin-bottom:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
-      row.onclick=()=>{ INC_FILTER.clientKey=r.key; renderIncomeInto(); };
-      row.innerHTML=`<div style="font-weight:700;font-size:.85rem">${r.label}</div><b style="color:var(--g7)">R${r.amt.toFixed(0)}</b>`;
-      cc.appendChild(row);
-    });
-  }
-
-  if(drvRows.length){
-    const dc=document.getElementById('inc-driver-breakdown');
-    drvRows.forEach(r=>{
-      const row=el('div');
-      row.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:9px 12px;margin-bottom:6px;cursor:pointer;display:flex;justify-content:space-between;align-items:center';
-      row.onclick=()=>showDriverBookDetail(r.id, from, to, rangeLbl);
-      row.innerHTML=`<div style="font-weight:700;font-size:.85rem">${r.name}</div>
-        <div style="display:flex;align-items:center;gap:8px"><b style="color:var(--g7)">R${r.amt.toFixed(0)}</b><span style="color:var(--t3)">›</span></div>`;
-      dc.appendChild(row);
-    });
-  }
-
-  const list=document.getElementById('inc-list');
-  if(filtered.length===0){
-    list.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen fakture in hierdie periode nie.</p>';
-    return;
-  }
-  // Grouped by day, click to expand — this list covers a whole month (or
-  // a custom range) of every invoice at once, which was just one long
-  // unbroken scroll before. Newest day first; today's date (if it's in
-  // range) starts open so the tab isn't a wall of collapsed rows the
-  // moment it's most likely to be checked.
-  const byDate={};
-  filtered.forEach(i=>{ (byDate[i.dateKey]=byDate[i.dateKey]||[]).push(i); });
-  const dateKeys=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
-  if(INC_OPEN_DATES.size===0 && dateKeys.includes(todayKey())) INC_OPEN_DATES.add(todayKey());
-
-  dateKeys.forEach(dk=>{
-    const dayInvs=byDate[dk];
-    const dayTotal=dayInvs.reduce((s,i)=>s+(i.amount||0),0);
-    const isOpen=INC_OPEN_DATES.has(dk);
-    const label=dateKeyToAfLabel(dk);
-
-    const hdr=el('div');
-    hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
-      +'background:var(--card);border:1px solid var(--brd);border-radius:10px;padding:11px 14px;margin-top:8px';
-    hdr.innerHTML=`
-      <div style="font-weight:700;font-size:.86rem">${isOpen?'▾':'▸'} ${label}
-        <span style="font-weight:400;color:var(--t2);font-size:.76rem">· ${dayInvs.length} faktu${dayInvs.length===1?'ur':'re'}</span>
-      </div>
-      <div style="font-weight:800;color:var(--g7)">R${dayTotal.toFixed(0)}</div>`;
-    hdr.onclick=()=>{ if(INC_OPEN_DATES.has(dk)) INC_OPEN_DATES.delete(dk); else INC_OPEN_DATES.add(dk); renderIncomeInto(); };
-    list.appendChild(hdr);
-
-    if(!isOpen) return;
-    // Group this day's invoices by client — a client with more than one
-    // job invoiced the same day gets one card, not several duplicate
-    // lines just sitting there.
-    const byClientDay={};
-    dayInvs.forEach(i=>{
-      const gk=(i.pastelCode||i.address)+'|'+(i.driverId||'');
-      (byClientDay[gk]=byClientDay[gk]||{invs:[]}).invs.push(i);
-    });
-    Object.values(byClientDay).forEach(({invs})=>{
-      const first=invs[0];
-      const amt=invs.reduce((s,i)=>s+(i.amount||0),0);
-      const card=el('div');
-      card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin:6px 0 0 10px;display:flex;justify-content:space-between;align-items:start;gap:8px';
-      card.innerHTML=`
-        <div>
-          <div style="font-weight:700">${first.address}${first.driverId&&DRIVERS[first.driverId]?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${DRIVERS[first.driverId].name}</span>`:''}</div>
-          <div style="font-size:.78rem;color:var(--t2)">${invs.map(i=>i.id).join(', ')}</div>
-        </div>
-        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
-          <button onclick="viewInvoicePDF('${first.id}')" title="Bekyk faktuur PDF" style="background:var(--bg);border:1px solid var(--brd);border-radius:8px;padding:5px 8px;font-size:.8rem">📄</button>
-          <div style="font-weight:800;color:var(--g7)">R${amt.toFixed(2)}</div>
-        </div>`;
-      list.appendChild(card);
-    });
-  });
+  const selYM=isCustom?ymForOffset(0):ymForOffset(INC_MONTH_OFFSET);
+  renderYMAccordion(document.getElementById('inc-ym-accordion'), getInvoices(),
+    i=>i.dateKey, i=>i.amount, INC_OPEN_YEARS, selYM.year, selYM.month, pickIncMonth, 'var(--g7)');
 }
 function pickIncMonth(year,month,justToggled){
   if(!justToggled){ INC_MONTH_OFFSET=offsetForYM(year,month); INC_FILTER.from=''; INC_FILTER.to=''; INC_OPEN_YEARS.add(String(year)); }
@@ -2773,6 +2680,7 @@ async function shareIncomeReportPDF(){
   const from=isCustom?INC_FILTER.from:mr.from;
   const to=isCustom?INC_FILTER.to:mr.to;
   const rangeLbl=isCustom?`${INC_FILTER.from||'…'} tot ${INC_FILTER.to||'…'}`:mr.label;
+  const sortBy=document.getElementById('inc-report-sort')?.value || 'driver';
 
   let filtered=getInvoices().filter(i=>dateInRange(i.dateKey,from,to));
   if(INC_FILTER.driverId) filtered=filtered.filter(i=>i.driverId===INC_FILTER.driverId);
@@ -2787,9 +2695,28 @@ async function shareIncomeReportPDF(){
        && (!INC_FILTER.driverId||e.driverId===INC_FILTER.driverId)) paidTotal+=e.credit||0;
   }));
 
-  const byClient={};
-  filtered.forEach(i=>{ const k=i.pastelCode||i.address; byClient[k]=byClient[k]||{label:i.address,amt:0}; byClient[k].amt+=i.amount||0; });
-  const clientRows=Object.entries(byClient).map(([,v])=>v).sort((a,b)=>b.amt-a.amt);
+  // Groups the filtered invoices however Bestuur/Jan asked for — per
+  // driver, per month, or per client — each group getting its own
+  // subtotal and its own list of invoices underneath, so the report
+  // itself is what's actually sorted the requested way rather than just
+  // being a flat dump with a breakdown bolted on top.
+  const groups={};
+  const groupOrder=[];
+  filtered.forEach(i=>{
+    let key, label;
+    if(sortBy==='driver'){ key=i.driverId||'__geen__'; label=DRIVERS[i.driverId]?DRIVERS[i.driverId].name:'Geen bestuurder'; }
+    else if(sortBy==='month'){ key=i.dateKey.slice(0,7); label=monthLabelForYM(key); }
+    else { key=i.pastelCode||i.address; label=i.address; }
+    if(!groups[key]){ groups[key]={label, amt:0, invs:[]}; groupOrder.push(key); }
+    groups[key].amt+=i.amount||0;
+    groups[key].invs.push(i);
+  });
+  // Biggest contributor first for driver/client views; chronological for month.
+  const orderedKeys = sortBy==='month'
+    ? groupOrder.slice().sort()
+    : groupOrder.slice().sort((a,b)=>groups[b].amt-groups[a].amt);
+
+  const sortLbl={driver:'Bestuurder', month:'Maand', client:'Kliënt'}[sortBy]||'Bestuurder';
 
   const {jsPDF}=window.jspdf;
   const doc=new jsPDF();
@@ -2797,7 +2724,7 @@ async function shareIncomeReportPDF(){
   doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(20,20,20);
   doc.text('INKOMSTE-VERSLAG / INCOME REPORT',15,y); y+=7;
   doc.setFont('helvetica','normal'); doc.setFontSize(10);
-  doc.text('Periode: '+rangeLbl,15,y); y+=10;
+  doc.text('Periode: '+rangeLbl+'  ·  Gesorteer volgens: '+sortLbl,15,y); y+=10;
 
   doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(46,125,50);
   doc.text('Inkomste (werklik ontvang)',15,y); doc.text('R'+paidTotal.toFixed(2),195,y,{align:'right'}); y+=8;
@@ -2806,20 +2733,22 @@ async function shareIncomeReportPDF(){
   doc.setTextColor(20,20,20);
   doc.text(filtered.length+' faktu(u)r(e)',15,y); y+=10;
 
-  doc.setFont('helvetica','bold'); doc.text('Per kliënt',15,y); y+=6;
-  doc.setFont('helvetica','normal');
-  clientRows.forEach(r=>{
-    if(y>270){ doc.addPage(); y=20; }
-    doc.text(r.label,15,y); doc.text('R'+r.amt.toFixed(2),195,y,{align:'right'}); y+=6;
-  });
-  y+=6;
-  if(y>260){ doc.addPage(); y=20; }
-  doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=10;
-  doc.setFont('helvetica','bold'); doc.text('Alle fakture',15,y); y+=6;
-  doc.setFont('helvetica','normal'); doc.setFontSize(9);
-  filtered.forEach(i=>{
-    if(y>275){ doc.addPage(); y=20; }
-    doc.text(i.date+' · '+i.address,15,y); doc.text('R'+i.amount.toFixed(2),195,y,{align:'right'}); y+=5.5;
+  orderedKeys.forEach(key=>{
+    const grp=groups[key];
+    if(y>265){ doc.addPage(); y=20; }
+    doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=8;
+    doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(20,20,20);
+    doc.text(grp.label,15,y); doc.text('R'+grp.amt.toFixed(2),195,y,{align:'right'}); y+=7;
+    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(90,90,90);
+    grp.invs.forEach(i=>{
+      if(y>275){ doc.addPage(); y=20; }
+      const line = sortBy==='client' ? (i.date+' · '+(DRIVERS[i.driverId]?DRIVERS[i.driverId].name:''))
+                 : sortBy==='month' ? (i.date+' · '+i.address)
+                 : (i.date+' · '+i.address);
+      doc.text(line,17,y); doc.text('R'+i.amount.toFixed(2),195,y,{align:'right'}); y+=5;
+    });
+    doc.setTextColor(20,20,20);
+    y+=3;
   });
 
   const blob=doc.output('blob');
@@ -2958,29 +2887,56 @@ function deleteExpense(id){
 // Scans the last month of driver fuel logs for diesel spend not yet turned
 // into a confirmed (or dismissed) expense, so parents just tap to accept
 // instead of retyping numbers drivers already entered.
-async function getDieselSuggestions(){
-  const done=new Set(await sGet('diesel_exp_done', []));
-  const out=[];
-  const now=sastNow();
-  for(let i=0;i<31;i++){
-    const d=new Date(now); d.setDate(d.getDate()-i);
-    const dk=dateKeyOf(d);
-    for(const driverId of Object.keys(DRIVERS)){
-      const prog=await sGet('progress_'+driverId+'_'+dk, null);
-      const vKey=driverId+'_'+dk+'_veh';
-      const dieselR=parseFloat(prog?.vehicle?.diesel)||0;
-      if(dieselR>0 && !done.has(vKey)) out.push({driverId, date:dk, amount:dieselR, liters:parseFloat(prog?.vehicle?.dieselLiters)||0, source:'veh'});
-      const eKey=driverId+'_'+dk+'_equip';
-      const equipR=parseFloat(prog?.vehicle?.equipDiesel)||0;
-      if(equipR>0 && !done.has(eKey)) out.push({driverId, date:dk, amount:equipR, liters:parseFloat(prog?.vehicle?.equipLiters)||0, source:'equip'});
-    }
+// This used to fetch one progress document at a time, sequentially
+// awaited, for 31 days × every driver — up to 150+ round trips in a row
+// before the Uitgawes tab could even render, which is exactly why it felt
+// "awfully long" to open. Two changes fix that without changing what's
+// shown: (1) every read is fired off together and awaited as a batch, so
+// the wait is one round trip's worth of latency instead of the sum of
+// 150+, and (2) the result is cached for a few minutes, since these
+// suggestions don't need to be perfectly real-time and re-scanning on
+// every single render/re-render (including background polling) was
+// needlessly burning through Firestore reads too.
+let DIESEL_SUGG_CACHE={ts:0, data:null};
+const DIESEL_SUGG_TTL_MS=5*60*1000;
+async function getDieselSuggestions(force){
+  if(!force && DIESEL_SUGG_CACHE.data && (Date.now()-DIESEL_SUGG_CACHE.ts)<DIESEL_SUGG_TTL_MS){
+    return DIESEL_SUGG_CACHE.data;
   }
+  const done=new Set(await sGet('diesel_exp_done', []));
+  const now=sastNow();
+  const dateKeys=[];
+  for(let i=0;i<31;i++){ const d=new Date(now); d.setDate(d.getDate()-i); dateKeys.push(dateKeyOf(d)); }
+
+  const reads=[];
+  dateKeys.forEach(dk=>{
+    Object.keys(DRIVERS).forEach(driverId=>{
+      reads.push(
+        sGet('progress_'+driverId+'_'+dk, null)
+          .then(prog=>({driverId, dk, prog}))
+          .catch(()=>({driverId, dk, prog:null}))
+      );
+    });
+  });
+  const results=await Promise.all(reads);
+
+  const out=[];
+  results.forEach(({driverId, dk, prog})=>{
+    const vKey=driverId+'_'+dk+'_veh';
+    const dieselR=parseFloat(prog?.vehicle?.diesel)||0;
+    if(dieselR>0 && !done.has(vKey)) out.push({driverId, date:dk, amount:dieselR, liters:parseFloat(prog?.vehicle?.dieselLiters)||0, source:'veh'});
+    const eKey=driverId+'_'+dk+'_equip';
+    const equipR=parseFloat(prog?.vehicle?.equipDiesel)||0;
+    if(equipR>0 && !done.has(eKey)) out.push({driverId, date:dk, amount:equipR, liters:parseFloat(prog?.vehicle?.equipLiters)||0, source:'equip'});
+  });
+  DIESEL_SUGG_CACHE={ts:Date.now(), data:out};
   return out;
 }
 async function markDieselHandled(driverId,date,source){
   const done=await sGet('diesel_exp_done', []);
   done.push(driverId+'_'+date+'_'+(source||'veh'));
   await sSet('diesel_exp_done', done);
+  DIESEL_SUGG_CACHE={ts:0, data:null}; // this one just got actioned — don't let the cache keep showing it
 }
 async function confirmDieselSuggestion(driverId,date,amount,source){
   const list=getExpenses();
@@ -3903,7 +3859,11 @@ function buildPayslipsGridPDF(people, wkKey){
     doc.rect(x0+2, y0+2, cellW-4, cellH-4);
     doc.setLineDashPattern([], 0);
 
-    let y=y0+11;
+    // Small company logo at the top of each loonstrokie — layout below is
+    // otherwise unchanged, just shifted down a little to make room.
+    try{ doc.addImage(LOGO_PDF_B64,'PNG', x0+cellW/2-4, y0+3, 8, 8); }catch(e){}
+
+    let y=y0+11+8;
     const x=x0+8, xRight=x0+cellW-8;
     doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(20,20,20);
     doc.text('LOONSTROKIE',x,y); y+=6;
@@ -5974,7 +5934,13 @@ function renderOfficeOverview(ct,now,dayEn,week){
     const prog=CACHE.progress[id+'_'+todayKey()];
     const hasRealProgress = prog && prog.route && prog.route.length>0;
     const route=hasRealProgress? prog.route : getTodayRoute(id);
-    const total=route.reduce((s,g)=>s+(Number(g.cost)||0)+(Number(g.extraWorkAmount)||0),0);
+    // A skipped garden was still being added into today's total here, even
+    // though it contributes no income today — Bestuur/Jan would see a
+    // budget figure that didn't match what was actually going to be done.
+    // Excluding anything with a skipReason set means the total also
+    // corrects itself automatically the moment a skip is undone, since
+    // that just clears skipReason and this recalculates live from route.
+    const total=route.filter(g=>!g.skipReason).reduce((s,g)=>s+(Number(g.cost)||0)+(Number(g.extraWorkAmount)||0),0);
     const doneToday=hasRealProgress? prog.route.filter(g=>g.completed).length : 0;
     const skippedToday=hasRealProgress? prog.route.filter(g=>g.skipReason).length : 0;
     const totalCount=route.length;
@@ -8647,18 +8613,24 @@ async function submitOO(){
   if(isParent){
     // Parent adding a job for a driver who may not be logged in right now:
     // write straight into that driver's shared progress for today.
+    //
+    // This always re-fetches from the server rather than trusting
+    // CACHE.progress — that cache can be several minutes stale here (it's
+    // only refreshed on Bestuur/Jan's slow poll tier), and building the new
+    // route from a stale copy would silently revert any progress the
+    // driver made in the meantime (completions, cash, notes). This is a
+    // rare, deliberate button press, so the extra read is worth it for
+    // correctness.
     const dId=document.getElementById('oo-driver').value;
     const dk=todayKey(), ck=dId+'_'+dk;
-    let target=CACHE.progress[ck];
-    if(!target){
-      target=await fetchDriverProgress(dId);
-    }
+    let target=await fetchDriverProgress(dId).catch(()=>null);
     if(!target||!target.route){
       target={route:getTodayRoute(dId), vehicle:{kmStart:'',kmEnd:'',diesel:''}, workers:{}};
     }
     target={...target, route:[...target.route,g], ts:Date.now()};
     CACHE.progress[ck]=target;
-    await sSet('progress_'+dId+'_'+dk, target);
+    const ok=await sSet('progress_'+dId+'_'+dk, target);
+    if(!ok){ alert('⚠️ Kon nie die kliënt stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
     toast('✓ Kliënt bygevoeg vir '+DRIVERS[dId].name+' / Client added');
   } else {
     S.route.push(g);
