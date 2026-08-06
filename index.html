@@ -1060,7 +1060,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-71'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-73'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -3526,34 +3526,45 @@ async function renderPayrollHistoryBody(){
         </div>`).join('')}
     </div>`;
 }
-// Rebuilds the payslip PDFs purely from what was saved that week — the
-// recurring items and bonus are already frozen in the saved record
-// (see savePayrollWeek), so this never touches attendance data or the
-// live employee profiles, and is accurate even if those change later.
+// The one place a saved payroll_<wkKey> record gets turned into payslip
+// line items — used by every payslip path (individual, per-group,
+// combined, and history) so they can never quietly disagree with each
+// other or with the loan ledger.
+function reconstructPayslipPeople(saved, filterFn){
+  return Object.entries(saved)
+    .filter(([key,rec])=>!filterFn||filterFn(key,rec))
+    .map(([key,rec])=>{
+      const totaal=(Number(rec.rate)||0)*(Number(rec.days)||0);
+      const bonusAmount=Number(rec.bonusAmount)||0;
+      const kommissie=Number(rec.kommissie)||0;
+      const recurringItems=rec.recurringItems||[];
+      const recurringTotal=recurringItems.reduce((s,i)=>s+(Number(i.weekly)||0),0);
+      const deductions=rec.extraDeductions||[];
+      const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
+      const netto=totaal+bonusAmount+kommissie-((Number(rec.uif)||0)+(Number(rec.leenNew)||0)+anderTotal+recurringTotal);
+      return {key, groupLabel:rec.groupLabel||'', rate:Number(rec.rate)||0, days:Number(rec.days)||0,
+        uif:Number(rec.uif)||0, leen:Number(rec.leenNew)||0, deductions, recurringItems, bonusAmount, kommissie, totaal, netto};
+    });
+}
 async function viewSavedWeekPayslips(wkKey){
   const saved=await sGet('payroll_'+wkKey, {});
-  const people=Object.entries(saved).map(([key,rec])=>{
-    const totaal=(Number(rec.rate)||0)*(Number(rec.days)||0);
-    const bonusAmount=Number(rec.bonusAmount)||0;
-    const kommissie=Number(rec.kommissie)||0;
-    const recurringItems=rec.recurringItems||[];
-    const recurringTotal=recurringItems.reduce((s,i)=>s+(Number(i.weekly)||0),0);
-    const deductions=rec.extraDeductions||[];
-    const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
-    const netto=totaal+bonusAmount+kommissie-((Number(rec.uif)||0)+(Number(rec.leenNew)||0)+anderTotal+recurringTotal);
-    return {key, groupLabel:rec.groupLabel||'', rate:Number(rec.rate)||0, days:Number(rec.days)||0,
-      uif:Number(rec.uif)||0, leen:Number(rec.leenNew)||0, deductions, recurringItems, bonusAmount, kommissie, totaal, netto};
-  });
+  const people=reconstructPayslipPeople(saved);
   if(people.length===0){ toast('Geen gestoorde loonstrokies vir hierdie week nie'); return; }
   const blob=buildPayslipsGridPDF(people, wkKey);
   viewPDFBlob(blob);
 }
 
-async function savePayrollWeek(wkKey){
+// Does the actual persisting — pulled out on its own so every payslip
+// button (not just the explicit "Stoor week" one) can guarantee its data
+// is saved and the loan ledger is correctly updated before generating
+// anything, instead of relying on someone remembering to hit Save first.
+async function saveCurrentGroupRows(wkKey){
+  const rows=document.querySelectorAll('#pr-body .pr-row');
+  if(rows.length===0) return null; // nothing live to save (e.g. viewing the folder screen)
   const existing=await sGet('payroll_'+wkKey, {});
   const data={...existing};
   const monday=mondayOfWeek(PAY_WEEK_OFFSET);
-  document.querySelectorAll('#pr-body .pr-row').forEach(row=>{
+  rows.forEach(row=>{
     const name=decodeURIComponent(row.dataset.emp);
     const extraDeductions=PR_DEDUCTIONS[name]||[];
     // Recurring items and the bonus are snapshotted here, frozen exactly
@@ -3579,15 +3590,27 @@ async function savePayrollWeek(wkKey){
     };
   });
   await sSet('payroll_'+wkKey, data);
-  // Lightweight index of which weeks actually have saved payroll — lets
-  // the history browser list real weeks without probing/guessing every
-  // possible week that might exist.
   const idx=await sGet('payroll_weeks_index', []);
   if(!idx.includes(wkKey)){ idx.push(wkKey); idx.sort(); await sSet('payroll_weeks_index', idx); }
-  // Any loan repayment entered this week reduces that person's running balance.
+  // Only adjust the loan ledger by however much the "Leen afbetaal" figure
+  // actually CHANGED since last save — comparing against the full amount
+  // every single time meant saving the same week twice (which happens
+  // constantly — editing one field and saving again, generating a payslip
+  // a second time, etc.) silently deducted the same repayment from the
+  // ledger over and over. Comparing against what was already saved fixes
+  // that at the source, whether this ever ran once or fifty times on the
+  // same week.
   for(const [name,rec] of Object.entries(data)){
-    if(rec.leenNew>0) await adjustLoanBalance(name, -rec.leenNew, `Afbetaal week ${wkKey}`);
+    const prevLeen=Number(existing[name]?.leenNew)||0;
+    const newLeen=Number(rec.leenNew)||0;
+    const delta=newLeen-prevLeen;
+    if(delta!==0) await adjustLoanBalance(name, -delta, `Afbetaal week ${wkKey}`);
   }
+  return data;
+}
+async function savePayrollWeek(wkKey){
+  const data=await saveCurrentGroupRows(wkKey);
+  if(!data){ toast('Niks om te stoor nie'); return; }
   toast('✓ Personeel week gestoor / Payroll week saved');
   renderWagesInto();
 }
@@ -3608,19 +3631,24 @@ async function sharePayslipPDF(encKey, wkKey){
   const key=decodeURIComponent(encKey);
   const row=[...document.querySelectorAll('#pr-body .pr-row')].find(r=>decodeURIComponent(r.dataset.emp)===key);
   if(!row){ toast('Kon nie ry vind nie'); return; }
-  const rate=parseFloat(row.querySelector('.pr-rate').value)||0;
-  const days=parseFloat(row.querySelector('.pr-days').value)||0;
-  const uif=parseFloat(row.querySelector('.pr-uif').value)||0;
-  const leen=parseFloat(row.querySelector('.pr-leen').value)||0;
-  const kommissie=parseFloat(row.querySelector('.pr-kommissie')?.value)||0;
-  const kommissieNote=row.querySelector('.pr-kommissienote')?.value.trim()||'';
-  const deductions=PR_DEDUCTIONS[key]||[];
+  // Saves first — this is what actually updates the loan ledger. Without
+  // this, a "Leen afbetaal" amount typed in but never explicitly saved
+  // could produce a payslip PDF that shows it, while the ledger never
+  // moved — the payslip and the real balance silently disagreeing.
+  const saved=await saveCurrentGroupRows(wkKey);
+  const rec=saved?.[key];
+  if(!rec){ toast('Kon nie stoor nie — probeer weer'); return; }
+  const rate=Number(rec.rate)||0;
+  const days=Number(rec.days)||0;
+  const uif=Number(rec.uif)||0;
+  const leen=Number(rec.leenNew)||0;
+  const kommissie=Number(rec.kommissie)||0;
+  const kommissieNote=rec.kommissieNote||'';
+  const deductions=rec.extraDeductions||[];
   const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
-  const recurringTotal=Number(row.dataset.recurring)||0;
-  const {items:recurringItems}=weeklyRecurringTotal(key, mondayOfWeek(PAY_WEEK_OFFSET));
-  const fullDays=Number(row.dataset.fulldays)||5;
-  const bonusAmount=Number(row.dataset.bonusamount)||0;
-  const bonus=days===fullDays?bonusAmount:0;
+  const recurringItems=rec.recurringItems||[];
+  const recurringTotal=recurringItems.reduce((s,it)=>s+(Number(it.weekly)||0),0);
+  const bonus=Number(rec.bonusAmount)||0;
   const totaal=rate*days;
   const netto=totaal+bonus+kommissie-(uif+leen+anderTotal+recurringTotal);
 
@@ -3725,11 +3753,20 @@ function buildPayslipsGridPDF(people, wkKey){
   return doc.output('blob');
 }
 async function getPayslipsGroupBlob(groupId, wkKey){
-  const people=PAYROLL_PAYSLIP_DATA.filter(p=>p.groupId===groupId);
-  return buildPayslipsGridPDF(people, wkKey);
+  await saveCurrentGroupRows(wkKey); // no-op if there's no live group open to save
+  const saved=await sGet('payroll_'+wkKey, {});
+  // Which employees belong to this specific group — taken from this
+  // render's own grouping (built fresh every time renderWages runs), then
+  // matched against the just-saved record so the actual payslip contents
+  // always come from what's really persisted, not from memory.
+  const idsInGroup=new Set(PAYROLL_PAYSLIP_DATA.filter(p=>p.groupId===groupId).map(p=>p.key));
+  const filtered=Object.fromEntries(Object.entries(saved).filter(([key])=>idsInGroup.has(key)));
+  return buildPayslipsGridPDF(reconstructPayslipPeople(filtered), wkKey);
 }
 async function getPayslipsAllBlob(wkKey){
-  return buildPayslipsGridPDF(PAYROLL_PAYSLIP_DATA, wkKey);
+  await saveCurrentGroupRows(wkKey); // no-op if there's no live group open to save
+  const saved=await sGet('payroll_'+wkKey, {});
+  return buildPayslipsGridPDF(reconstructPayslipPeople(saved), wkKey);
 }
 async function viewPayslipsForGroup(groupId, wkKey){
   viewPDFBlob(await getPayslipsGroupBlob(groupId, wkKey));
@@ -8560,7 +8597,7 @@ async function renderScheduleEditor(forceScroll){
               <div style="font-size:.68rem;color:var(--blue);margin-top:1px">Van ${c.borrowedFrom||'\'n ander bestuurder'} se lys — wys net hier op ${nextDate}, kom nie weer terug nie</div>
             </div>
             <div style="font-weight:700;font-size:.82rem;flex-shrink:0">R${c.cost||0}</div>
-            <button class="btn btn-sec" style="padding:4px 8px;font-size:.76rem;color:var(--red);flex-shrink:0" onclick="schedRemoveBorrowedClient('${driverId}','${nextDate}',${idx})">✕</button>
+            <button style="width:auto;flex-shrink:0;padding:4px 8px;font-size:.76rem;border-radius:8px;background:var(--bg);color:var(--red);border:2px solid var(--brd);font-weight:700;cursor:pointer" onclick="schedRemoveBorrowedClient('${driverId}','${nextDate}',${idx})">✕</button>
           </div>
         </div>`).join('')}
       `:''}
