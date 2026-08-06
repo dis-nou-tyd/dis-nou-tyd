@@ -492,7 +492,7 @@ const DRIVERS = {
 // 'Jan' is kept as a standalone entry: he's paid as foreman/office but has
 // no driver route of his own, so his days worked are entered manually.
 const EMPLOYEE_RATES = {
-  'Jan':458,
+  'Jan':458,'Mannetjies':230,
   'Pierre Jantjies':230,'Mervin Nero':230,'Lionel Pieterse':230,'Dawid Faro':230,'Ismael':230,
   'Boeta Jagers':230,'Sergio':230,'Poenkels':230,'Will':230,'Reagan Jantjies':230,'Emile':230,
   'Wayne Jansen':230,'Waydie':230,'Lolla Jansen':230,'Brandon':230,'Ruben':230,
@@ -1060,7 +1060,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-05-59'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-05-65'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1825,6 +1825,8 @@ let EXP_MONTH_OFFSET=0; // 0 = current month, -1 = last month, etc. — lets par
 let INC_MONTH_OFFSET=0;
 let EXP_FILTER={from:'',to:'',category:'',driverId:''};
 let INC_FILTER={from:'',to:'',clientKey:'',driverId:''};
+let INC_OPEN_DATES=new Set(); // which days are expanded in Inkomste's invoice list
+let EXP_OPEN_DATES=new Set(); // which days are expanded in Uitgawes' per-category transaction list
 async function renderPayroll(ct){
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
               ['uitgawes','🧾','Uitgawes'],['kleinkas','💵','Kleinkas'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
@@ -2139,16 +2141,45 @@ async function renderIncome(ct){
     list.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen fakture in hierdie periode nie.</p>';
     return;
   }
-  filtered.forEach(i=>{
-    const card=el('div');
-    card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:start;gap:8px';
-    card.innerHTML=`
-      <div>
-        <div style="font-weight:700">${i.address}${i.driverId&&DRIVERS[i.driverId]?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${DRIVERS[i.driverId].name}</span>`:''}</div>
-        <div style="font-size:.78rem;color:var(--t2)">${i.date} · ${i.id}</div>
+  // Grouped by day, click to expand — this list covers a whole month (or
+  // a custom range) of every invoice at once, which was just one long
+  // unbroken scroll before. Newest day first; today's date (if it's in
+  // range) starts open so the tab isn't a wall of collapsed rows the
+  // moment it's most likely to be checked.
+  const byDate={};
+  filtered.forEach(i=>{ (byDate[i.dateKey]=byDate[i.dateKey]||[]).push(i); });
+  const dateKeys=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+  if(INC_OPEN_DATES.size===0 && dateKeys.includes(todayKey())) INC_OPEN_DATES.add(todayKey());
+
+  dateKeys.forEach(dk=>{
+    const dayInvs=byDate[dk];
+    const dayTotal=dayInvs.reduce((s,i)=>s+(i.amount||0),0);
+    const isOpen=INC_OPEN_DATES.has(dk);
+    const label=dayInvs[0].date||dk;
+
+    const hdr=el('div');
+    hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
+      +'background:var(--card);border:1px solid var(--brd);border-radius:10px;padding:11px 14px;margin-top:8px';
+    hdr.innerHTML=`
+      <div style="font-weight:700;font-size:.86rem">${isOpen?'▾':'▸'} ${label}
+        <span style="font-weight:400;color:var(--t2);font-size:.76rem">· ${dayInvs.length} faktu${dayInvs.length===1?'ur':'re'}</span>
       </div>
-      <div style="font-weight:800;color:var(--g7)">R${(i.amount||0).toFixed(2)}</div>`;
-    list.appendChild(card);
+      <div style="font-weight:800;color:var(--g7)">R${dayTotal.toFixed(0)}</div>`;
+    hdr.onclick=()=>{ if(INC_OPEN_DATES.has(dk)) INC_OPEN_DATES.delete(dk); else INC_OPEN_DATES.add(dk); renderIncomeInto(); };
+    list.appendChild(hdr);
+
+    if(!isOpen) return;
+    dayInvs.forEach(i=>{
+      const card=el('div');
+      card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin:6px 0 0 10px;display:flex;justify-content:space-between;align-items:start;gap:8px';
+      card.innerHTML=`
+        <div>
+          <div style="font-weight:700">${i.address}${i.driverId&&DRIVERS[i.driverId]?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${DRIVERS[i.driverId].name}</span>`:''}</div>
+          <div style="font-size:.78rem;color:var(--t2)">${i.id}</div>
+        </div>
+        <div style="font-weight:800;color:var(--g7)">R${(i.amount||0).toFixed(2)}</div>`;
+      list.appendChild(card);
+    });
   });
 }
 function applyIncFilter(){
@@ -2303,20 +2334,43 @@ function renderExpenseList(items){
     list.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen uitgawes in hierdie periode nie.</p>';
     return;
   }
-  items.forEach(e=>{
-    const card=el('div');
-    card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:start;gap:8px';
-    const drvName=e.driverId&&DRIVERS[e.driverId]?DRIVERS[e.driverId].name:'';
-    card.innerHTML=`
-      <div>
-        <div style="font-weight:700">${e.category}${drvName?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${drvName}</span>`:''}</div>
-        <div style="font-size:.78rem;color:var(--t2)">${e.date}${e.note?' · '+e.note:''}</div>
+  const byDate={};
+  items.forEach(e=>{ (byDate[e.date]=byDate[e.date]||[]).push(e); });
+  const dateKeys=Object.keys(byDate).sort((a,b)=>b.localeCompare(a));
+  if(EXP_OPEN_DATES.size===0 && dateKeys.includes(todayKey())) EXP_OPEN_DATES.add(todayKey());
+
+  dateKeys.forEach(dk=>{
+    const dayItems=byDate[dk];
+    const dayTotal=dayItems.reduce((s,e)=>s+(e.amount||0),0);
+    const isOpen=EXP_OPEN_DATES.has(dk);
+
+    const hdr=el('div');
+    hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;'
+      +'background:var(--card);border:1px solid var(--brd);border-radius:10px;padding:11px 14px;margin-top:8px';
+    hdr.innerHTML=`
+      <div style="font-weight:700;font-size:.86rem">${isOpen?'▾':'▸'} ${dk}
+        <span style="font-weight:400;color:var(--t2);font-size:.76rem">· ${dayItems.length} item${dayItems.length===1?'':'s'}</span>
       </div>
-      <div style="display:flex;align-items:center;gap:10px;flex-shrink:0">
-        <div style="font-weight:800">R${(e.amount||0).toFixed(2)}</div>
-        <button onclick="deleteExpense('${e.id}')" style="background:none;border:none;color:#C62828;font-size:1rem;cursor:pointer">✕</button>
-      </div>`;
-    list.appendChild(card);
+      <div style="font-weight:800;color:#C62828">R${dayTotal.toFixed(0)}</div>`;
+    hdr.onclick=()=>{ if(EXP_OPEN_DATES.has(dk)) EXP_OPEN_DATES.delete(dk); else EXP_OPEN_DATES.add(dk); renderExpenseList(items); };
+    list.appendChild(hdr);
+
+    if(!isOpen) return;
+    dayItems.forEach(e=>{
+      const card=el('div');
+      card.style.cssText='border:1px solid var(--brd);border-radius:10px;padding:10px 12px;margin:6px 0 0 10px;display:flex;justify-content:space-between;align-items:start;gap:8px';
+      const drvName=e.driverId&&DRIVERS[e.driverId]?DRIVERS[e.driverId].name:'';
+      card.innerHTML=`
+        <div>
+          <div style="font-weight:700">${e.category}${drvName?` <span style="font-weight:600;color:var(--g8);font-size:.72rem;background:var(--g1);padding:2px 7px;border-radius:100px;margin-left:4px">${drvName}</span>`:''}</div>
+          ${e.note?`<div style="font-size:.78rem;color:var(--t2)">${e.note}</div>`:''}
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;flex-shrink:0">
+          <div style="font-weight:800">R${(e.amount||0).toFixed(2)}</div>
+          <button onclick="deleteExpense('${e.id}')" style="background:none;border:none;color:#C62828;font-size:1rem;cursor:pointer">✕</button>
+        </div>`;
+      list.appendChild(card);
+    });
   });
 }
 function applyExpFilter(){
@@ -2955,7 +3009,7 @@ async function renderWages(ct){
     id, label:d.icon+' '+d.name, isDriver:true, driverId:id, rate:d.rate||0, members:getRoster(id)
   }));
   groups.push({id:'_office', label:'🗂️ Kantoor / Toesig', isDriver:false, driverId:null, rate:0,
-    members:['Jan']});
+    members:['Jan','Mannetjies']});
 
   // Casual workers never sit on the permanent roster (DRIVERS[id].workers)
   // — they only ever exist inside a specific day's saved Dagstaat record,
@@ -3018,7 +3072,26 @@ async function renderWages(ct){
       const rec=saved[key]||{};
       let days=rec.days, loanNew=rec.leenNew;
       const {days:fetchedDays}=attendanceData[flatIdx]; flatIdx++;
-      if(days===undefined) days=person.driverId?fetchedDays:0;
+      // The current week is normally being processed Thursday, before
+      // Friday has actually happened — so "confirmed attendance" would
+      // always be one day short of the real week. Rather than showing 4
+      // and relying on someone remembering to bump it to 5 every single
+      // week, the current week just assumes the full 5-day week by
+      // default (same as if this were being done on the Friday itself).
+      // Past weeks still show real recorded attendance, since by then
+      // every day has actually happened.
+      const isCurrentWeek = PAY_WEEK_OFFSET===0;
+      if(days===undefined) days = person.driverId ? (isCurrentWeek ? dateKeys.length : fetchedDays) : 0;
+      // If a week was already saved with a predicted day count that turns
+      // out to differ from what was actually recorded once those days
+      // passed, this surfaces the mismatch instead of requiring anyone to
+      // remember to double-check it — the "easy way to correct it
+      // afterward" that was asked for. Only applies once the prediction
+      // has had a chance to be tested against real data (not the current,
+      // still-in-progress week), and only when it's actually saved,
+      // meaning it was a real prediction someone acted on, not just
+      // today's still-open default.
+      const daysMismatch = !isCurrentWeek && rec.days!==undefined && person.driverId && fetchedDays!==rec.days;
       if(loanNew===undefined) loanNew=0;
       const rate = rec.rate!==undefined? rec.rate : person.rate;
       const totaal = (Number(days)||0)*(Number(rate)||0);
@@ -3035,7 +3108,9 @@ async function renderWages(ct){
         <div class="pr-name">${key}${person.isLead?' <span style="color:var(--t3);font-weight:400">(bestuurder)</span>':''}${isCasual?' <span style="background:#FFF3CD;color:#856404;font-size:.68rem;font-weight:700;padding:1px 7px;border-radius:100px">Los werker hierdie week</span>':''}</div>
         <div class="pr-fields">
           <label>Koers/dag<input class="inp pr-rate" type="number" value="${rate}" style="padding:6px" oninput="prRecalc(this)"></label>
-          <label>Dae<input class="inp pr-days" type="number" value="${days}" style="padding:6px" oninput="prRecalc(this)"></label>
+          <label>Dae<input class="inp pr-days" type="number" value="${days}" style="padding:6px" oninput="prRecalc(this)">
+            ${daysMismatch?`<span style="display:block;font-size:.66rem;color:#C62828;font-weight:700;margin-top:2px">⚠️ Werklik ${fetchedDays} dae (was ${rec.days})</span>`:''}
+          </label>
           <label>Totaal<input class="inp pr-totaal" value="R${totaal.toFixed(2)}" disabled style="padding:6px;background:var(--bg)"></label>
           <label>UIF<input class="inp pr-uif" type="number" value="${uif}" style="padding:6px" oninput="prRecalc(this)"></label>
           <label>Leen afbetaal<input class="inp pr-leen" type="number" value="${loanNew}" style="padding:6px" oninput="prRecalc(this)"></label>
@@ -3094,7 +3169,10 @@ async function renderWages(ct){
         <div class="ovc"><div class="v">R${groupNetto[g.id].toFixed(0)}</div><div class="l">Netto vir hierdie groep</div></div>
       </div>
       <div id="pr-body">${groupHtml[g.id]}</div>
-      <button class="btn" style="margin-top:12px" onclick="savePayrollWeek('${wkKey}')">💾 Stoor week / Save week</button>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn" style="flex:1" onclick="savePayrollWeek('${wkKey}')">💾 Stoor week / Save week</button>
+        <button class="btn-sec btn" style="flex:1;background:var(--g8);color:#fff" onclick="printAllPayslipsForGroup('${g.id}','${wkKey}')">🖨️ Druk almal (4/bladsy)</button>
+      </div>
     `;
     return;
   }
@@ -3110,14 +3188,10 @@ async function renderWages(ct){
       <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET=0;PAY_OPEN_GROUP=null;renderWagesInto()">Hierdie week</button>
       <button class="btn-sec btn" style="flex:1" onclick="PAY_WEEK_OFFSET++;PAY_OPEN_GROUP=null;renderWagesInto()">Volgende week →</button>
     </div>
-    <div class="ovgrid">
-      <div class="ovc"><div class="v">R${grandNetto.toFixed(0)}</div><div class="l">Totale lone (netto)</div></div>
-      <div class="ovc"><div class="v">R${grandUIF.toFixed(0)}</div><div class="l">UIF totaal</div></div>
-      <div class="ovc"><div class="v">R${grandLeen.toFixed(0)}</div><div class="l">Leen afbetaal</div></div>
-    </div>
     ${loanSummaryHtml}
     <div class="divlbl" style="margin-top:12px">BAKKIES <span style="font-weight:400;color:var(--t3)">· tik om oop te maak</span></div>
     <div id="pr-folders" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+    <button class="btn-sec btn" style="width:100%;margin-top:8px;background:#FFF3CD;border-color:#FFE082;color:#856404" onclick="showFixMissingLoanEntries()">🔧 Herstel ontbrekende leen-inskrywings</button>
   `;
   const fc=document.getElementById('pr-folders');
   groups.forEach(g=>{
@@ -3283,6 +3357,76 @@ async function sharePayslipPDF(encKey, wkKey){
   await shareOrDownloadPDF(blob, `Loonstrokie_${key.replace(/[^a-z0-9]+/gi,'_')}_${wkKey}.pdf`,
     'Loonstrokie', key+' — R'+netto.toFixed(2));
   toast('🖨️ Loonstrokie PDF gereed');
+}
+// Every person currently drilled into (one bakkie/office group) gets their
+// own compact payslip, 4 to a page in a 2×2 grid with a dashed cut-line
+// around each one — meant to be printed, cut along the dashed lines, and
+// dropped straight into envelopes, instead of one full page per person.
+async function printAllPayslipsForGroup(groupId, wkKey){
+  const rows=[...document.querySelectorAll('#pr-body .pr-row')];
+  if(rows.length===0){ toast('Geen ry gevind nie'); return; }
+  const people=rows.map(row=>{
+    const key=decodeURIComponent(row.dataset.emp);
+    const rate=parseFloat(row.querySelector('.pr-rate').value)||0;
+    const days=parseFloat(row.querySelector('.pr-days').value)||0;
+    const uif=parseFloat(row.querySelector('.pr-uif').value)||0;
+    const leen=parseFloat(row.querySelector('.pr-leen').value)||0;
+    const deductions=PR_DEDUCTIONS[key]||[];
+    const anderTotal=deductions.reduce((s,d)=>s+(Number(d.amount)||0),0);
+    const totaal=rate*days;
+    const netto=totaal-(uif+leen+anderTotal);
+    return {key, rate, days, uif, leen, deductions, totaal, netto};
+  });
+
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF();
+  const pageW=210, pageH=297, marginOuter=8;
+  const cellW=(pageW-marginOuter*2)/2;
+  const cellH=(pageH-marginOuter*2)/2;
+
+  people.forEach((p,idx)=>{
+    const slot=idx%4;
+    if(idx>0 && slot===0) doc.addPage();
+    const col=slot%2, rowPos=Math.floor(slot/2);
+    const x0=marginOuter+col*cellW, y0=marginOuter+rowPos*cellH;
+
+    doc.setDrawColor(160,160,160);
+    doc.setLineDashPattern([1.5,1.5], 0);
+    doc.rect(x0+2, y0+2, cellW-4, cellH-4);
+    doc.setLineDashPattern([], 0);
+
+    let y=y0+11;
+    const x=x0+8, xRight=x0+cellW-8;
+    doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(20,20,20);
+    doc.text('LOONSTROKIE',x,y); y+=6;
+    doc.setFont('helvetica','normal'); doc.setFontSize(8.5);
+    doc.text(doc.splitTextToSize(p.key,cellW-16),x,y); y+=5;
+    doc.text('Week: '+wkKey,x,y); y+=7;
+
+    doc.setFont('helvetica','bold'); doc.setFontSize(8);
+    doc.text('Koers/dag',x,y); doc.text('R'+p.rate.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
+    doc.setFont('helvetica','normal');
+    doc.text('Dae gewerk',x,y); doc.text(String(p.days),xRight,y,{align:'right'}); y+=4.5;
+    doc.setFont('helvetica','bold');
+    doc.text('Bruto',x,y); doc.text('R'+p.totaal.toFixed(2),xRight,y,{align:'right'}); y+=6;
+
+    doc.setFont('helvetica','normal');
+    doc.text('UIF',x,y); doc.text('-R'+p.uif.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
+    if(p.leen>0){ doc.text('Leen afbetaal',x,y); doc.text('-R'+p.leen.toFixed(2),xRight,y,{align:'right'}); y+=4.5; }
+    p.deductions.forEach(d=>{
+      if(y>y0+cellH-14) return; // out of room in this cell — keep the netto line safe rather than overflow into the next payslip
+      doc.text((d.reason||'Ander').slice(0,22),x,y); doc.text('-R'+(Number(d.amount)||0).toFixed(2),xRight,y,{align:'right'}); y+=4.5;
+    });
+    y+=2;
+    doc.setDrawColor(210,210,210); doc.line(x,y,xRight,y); y+=6;
+    doc.setFont('helvetica','bold'); doc.setFontSize(11);
+    doc.text('NETTO',x,y); doc.text('R'+p.netto.toFixed(2),xRight,y,{align:'right'});
+  });
+
+  const blob=doc.output('blob');
+  await shareOrDownloadPDF(blob, `Loonstrokies_${(groupId||'span').replace(/[^a-z0-9]+/gi,'_')}_${wkKey}.pdf`,
+    'Loonstrokies', 'Week '+wkKey);
+  toast('🖨️ Loonstrokies PDF gereed — druk en sny volgens die kolle');
 }
 
 async function openLoanLedger(nameEnc){
@@ -3747,7 +3891,7 @@ async function submitQuoteRequest(){
     assignedDriver:driverId,
     scheduledDate,
     requestNote:document.getElementById('qr-note').value.trim(),
-    quotedAmount:0, tasks:'', durationHrs:'', durationMin:'', frequency:'Weekliks',
+    quotedAmount:0, tasks:'', durationHrs:'', durationMin:'',
     status:'assigned',
     createdBy: S.driver||(S.isOffice?'office':'bestuur'),
     createdByName: S.driver?DRIVERS[S.driver].name:(S.isOffice?'Jan':'Bestuur'),
@@ -5021,11 +5165,107 @@ function togWorker(n){
   S.workers[n].present=!S.workers[n].present;
   saveProgress(); renderDriverTab('workers');
 }
+let LOAN_SYNC_TIMERS={};
+// This used to only ever update that one day's Dagstaat record — a loan
+// typed in here never actually reached the worker's own persistent
+// Leen-boek at all, which only ever moved when a weekly wage slip was
+// finalized or someone manually adjusted it from the Leen-boek screen
+// itself. Debounced (rather than syncing on every keystroke) since this
+// now writes to Firestore; the tag on each synced entry makes editing the
+// same day's amount again update that one entry instead of stacking a new
+// one every time, so this is safe to fire repeatedly as someone types.
 function setLoan(n,v){
   if(!S.workers[n]) S.workers[n]={present:true,loan:''};
   S.workers[n].loan=v; saveProgress();
   const t=document.getElementById('loan-tot');
   if(t) t.textContent='R'+Object.values(S.workers).reduce((s,w)=>s+(parseFloat(w.loan)||0),0).toFixed(2);
+
+  clearTimeout(LOAN_SYNC_TIMERS[n]);
+  const driverId=S.driver, dateKey=S.workDate||todayKey();
+  LOAN_SYNC_TIMERS[n]=setTimeout(()=>{ syncDailyLoanToLedger(n, driverId, dateKey, v); }, 900);
+}
+// Idempotent: re-running this for the same worker/driver/date replaces
+// that one tagged entry instead of adding another, so it's safe to call
+// repeatedly (every debounced edit, or a backfill scan over old data)
+// without ever double-counting the same day's loan.
+async function syncDailyLoanToLedger(name, driverId, dateKey, amount){
+  const l=await getLoanLedger(name);
+  const tag='daily_'+driverId+'_'+dateKey;
+  const idx=l.entries.findIndex(e=>e.tag===tag);
+  const amt=parseFloat(amount)||0;
+  if(idx>=0){
+    if(amt<=0) l.entries.splice(idx,1);
+    else { l.entries[idx].amount=amt; l.entries[idx].date=dateKey; l.entries[idx].note='Leen geneem (Dagstaat)'; }
+  } else if(amt>0){
+    l.entries.push({date:dateKey, amount:amt, note:'Leen geneem (Dagstaat)', tag});
+  }
+  // Recomputed from every entry in order, rather than adjusted by a delta
+  // — safer against this running more than once for the same day (which
+  // both the debounce and the backfill tool below can legitimately do).
+  l.entries.sort((a,b)=>(a.date||'').localeCompare(b.date||''));
+  let running=0;
+  l.entries.forEach(e=>{ running=Math.round((running+(e.amount||0))*100)/100; e.balanceAfter=running; });
+  l.balance=running;
+  return await sSet('loanledger_'+name, l);
+}
+// Backfill for loans logged before this fix existed — scans a date range
+// across every driver's saved Dagstaat records and syncs any daily loan
+// amount found into that worker's Leen-boek, using the exact same tagged,
+// idempotent path above, so running this more than once (or over an
+// overlapping range) never double-counts anything.
+async function scanAndFixMissingLoanEntries(fromDate, toDate){
+  const dateKeys=[];
+  let d=new Date(fromDate+'T00:00:00');
+  const end=new Date(toDate+'T00:00:00');
+  while(d<=end){ dateKeys.push(d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')); d.setDate(d.getDate()+1); }
+
+  let synced=0, checked=0;
+  for(const driverId of Object.keys(DRIVERS)){
+    for(const dk of dateKeys){
+      let prog;
+      try{ prog=await sGet('progress_'+driverId+'_'+dk, null); }
+      catch(e){ continue; }
+      if(!prog||!prog.workers) continue;
+      for(const [name,w] of Object.entries(prog.workers)){
+        const amt=parseFloat(w.loan)||0;
+        checked++;
+        if(amt>0){ await syncDailyLoanToLedger(name, driverId, dk, amt); synced++; }
+      }
+    }
+  }
+  return {synced, checked};
+}
+function showFixMissingLoanEntries(){
+  document.getElementById('fix-loans-modal')?.remove();
+  const bg=el('div','mbg'); bg.id='fix-loans-modal';
+  const today=todayKey();
+  const monthAgo=(()=>{ const d=sastNow(); d.setDate(d.getDate()-30); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); })();
+  bg.innerHTML=`<div class="modal">
+    <div class="mhdr">🔧 Herstel leen-inskrywings
+      <button class="mclose" onclick="document.getElementById('fix-loans-modal').remove()">✕</button>
+    </div>
+    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
+      Deursoek elke bestuurder se gestoorde Dagstaat-rekords vir hierdie periode en trek enige leen wat 'n werker geneem het (maar wat nog nie in hul Leen-boek verskyn nie) daarin in. Veilig om meer as een keer te loop — dit sal nooit dieselfde dag se leen dubbel tel nie.
+    </p>
+    <div><div class="flbl" style="margin-bottom:5px">Van datum</div>
+      <input class="inp" id="fl-from" type="date" value="${monthAgo}"></div>
+    <div style="margin-top:8px"><div class="flbl" style="margin-bottom:5px">Tot datum</div>
+      <input class="inp" id="fl-to" type="date" value="${today}"></div>
+    <button class="btn" style="margin-top:10px" onclick="runFixMissingLoanEntries()">🔍 Deursoek en herstel</button>
+    <div id="fl-results"></div>
+  </div>`;
+  bg.onclick=e=>{if(e.target===bg)bg.remove();};
+  document.body.appendChild(bg);
+}
+async function runFixMissingLoanEntries(){
+  const from=document.getElementById('fl-from').value;
+  const to=document.getElementById('fl-to').value;
+  if(!from||!to){ alert('Kies albei datums'); return; }
+  const results=document.getElementById('fl-results');
+  results.innerHTML='<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Besig om te deursoek — dit kan \'n rukkie neem vir \'n lang periode…</p>';
+  const {synced, checked}=await scanAndFixMissingLoanEntries(from, to);
+  results.innerHTML=`<p style="color:var(--g8);font-weight:700;padding:10px 0">✓ ${synced} leen-inskrywing(s) herstel/bygewerk (${checked} dag-rekords nagegaan).</p>`;
+  toast(`✓ ${synced} leen-inskrywings herstel`);
 }
 
 // ══════════════════ SUMMARY TAB ════════════════════════════════════════════════
@@ -8255,12 +8495,6 @@ function buildQuotePDF(q){
   // off the client-facing PDF — Bestuur/Pierre/Jan still see both on
   // screen (the quote card and detail popup), this just keeps them off
   // the document itself.
-  if(q.frequency){
-    if(y>260){ doc.addPage(); y=20; }
-    doc.setFont('helvetica','bold'); doc.text('Frekwensie',15,y); y+=6;
-    doc.setFont('helvetica','normal');
-    doc.text(q.frequency,15,y); y+=10;
-  }
 
   if(y>250){ doc.addPage(); y=20; }
   // A single combined total only gets shown when there's no itemized
@@ -8481,13 +8715,6 @@ function showQuoteForm(editId){
         <input class="inp" id="q-durhrs" type="number" min="0" placeholder="Ure" style="flex:1" value="${q?.durationHrs||''}">
         <input class="inp" id="q-durmin" type="number" min="0" max="59" placeholder="Minute" style="flex:1" value="${q?.durationMin||''}">
       </div></div>
-    <div><div class="flbl" style="margin-bottom:5px">Frekwensie / Frequency</div>
-      <select class="inp" id="q-freq">
-        <option value="Weekliks" ${q?.frequency==='Weekliks'?'selected':''}>Weekliks</option>
-        <option value="2-Weekliks" ${q?.frequency==='2-Weekliks'?'selected':''}>2-Weekliks</option>
-        <option value="Maandeliks" ${q?.frequency==='Maandeliks'?'selected':''}>Maandeliks</option>
-        <option value="Eenmalig" ${q?.frequency==='Eenmalig'?'selected':''}>Eenmalig / Once-off</option>
-      </select></div>
     <div><div class="flbl" style="margin-bottom:5px">Werk benodig / Work needed</div>
       <textarea class="inp" id="q-tasks" rows="2" style="resize:none" placeholder="bv. Gras sny, beddings skoonmaak…">${q?.tasks||''}</textarea></div>
     <div><div class="flbl" style="margin-bottom:5px">Persoonlike boodskap (opsioneel) / Personalized message</div>
@@ -8516,7 +8743,6 @@ async function submitQuote(editId){
         phone:document.getElementById('q-phone').value.trim(),
         quotedAmount:parseFloat(document.getElementById('q-amt').value)||0,
         durationHrs, durationMin,
-        frequency:document.getElementById('q-freq').value,
         tasks:document.getElementById('q-tasks').value.trim(),
         customMessage:document.getElementById('q-custommsg').value.trim(),
       };
@@ -8536,7 +8762,6 @@ async function submitQuote(editId){
     phone:document.getElementById('q-phone').value.trim(),
     quotedAmount:parseFloat(document.getElementById('q-amt').value)||0,
     durationHrs, durationMin,
-    frequency:document.getElementById('q-freq').value,
     tasks:document.getElementById('q-tasks').value.trim(),
     customMessage:document.getElementById('q-custommsg').value.trim(),
     status:'pending',
