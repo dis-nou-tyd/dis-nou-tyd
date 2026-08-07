@@ -1128,7 +1128,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-06-88'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-06-93'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -1179,21 +1179,40 @@ function startPolling(){
           S.route=remote.route; S.vehicle=remote.vehicle||S.vehicle; S.workers=remote.workers||S.workers;
           CACHE.progress[ck]=remote;
           if(S.driverTab==='route') refresh();
-        } else if(remote && remote.route && remote.route.length){
+        } else if(remote && remote.route){
           // This device may have a "newer" local timestamp simply because
           // the driver's been actively working — which used to mean a
           // garden Bestuur/Jan pushed onto this list in the meantime got
           // silently discarded the next time this device saved, since a
           // full overwrite from local state has no way to know it exists.
           // An entry present on the server but missing here can only ever
-          // be a genuine addition (nothing locally ever removes one by
-          // id), so it's always safe to fold in, regardless of which
-          // timestamp is "newer." Re-saving immediately makes the merge
-          // stick, closing the gap rather than leaving it to be rediscovered.
+          // be a genuine addition, so it's always safe to fold in,
+          // regardless of which timestamp is "newer."
+          //
+          // The reverse also needs handling: an entry missing on the
+          // server but still present here means Bestuur/Jan removed it
+          // (schedRemoveClient) after this device already had it loaded —
+          // this used to never get picked up at all, since only additions
+          // were being merged, leaving a removed garden stuck showing on
+          // the driver's live list for the rest of the day. Dropping it
+          // locally too closes that gap, but only when it's still
+          // untouched (not completed/active) — the exact same safety net
+          // the server-side removal itself already uses, so a job the
+          // driver had already started or finished is never silently
+          // erased by a removal request that arrived after the fact.
           const haveIds=new Set(S.route.map(g=>g.id).filter(Boolean));
+          const remoteIds=new Set(remote.route.map(g=>g.id).filter(Boolean));
           const missing=remote.route.filter(g=>g.id && !haveIds.has(g.id));
-          if(missing.length){
-            S.route=[...S.route, ...missing];
+          // Guarded by remote.route.length so an anomalous empty array
+          // server-side (e.g. a doc saved before the day's route was ever
+          // populated) can never be misread as "everything got removed"
+          // and wipe out a real local list.
+          const removedIds=remote.route.length
+            ? S.route.filter(g=>g.id && !g.completed && !g.active && !remoteIds.has(g.id)).map(g=>g.id)
+            : [];
+          if(missing.length || removedIds.length){
+            const removedSet=new Set(removedIds);
+            S.route=[...S.route.filter(g=>!removedSet.has(g.id)), ...missing];
             saveProgress();
             if(S.driverTab==='route') refresh();
           }
@@ -1983,14 +2002,28 @@ function fridaysInMonth(year, monthIdx){
 // Sums a person's recurring monthly items into that week's total slice,
 // e.g. R5280 Huur in a 5-Friday month is R1056/week, R1320/week in a
 // 4-Friday month — same monthly total either way, just split correctly.
+// Each item also carries how much of this month's total is left after
+// this week's slice, for the payslip note (same idea as the loan note:
+// what's owed, minus what's being paid now, equals what's left).
+function fridayOrdinalInMonth(fri){
+  let ord=0;
+  for(let d=1; d<=fri.getDate(); d++){
+    if(new Date(fri.getFullYear(), fri.getMonth(), d).getDay()===5) ord++;
+  }
+  return ord;
+}
 function weeklyRecurringTotal(name, monday){
   const profile=getEmpProfile(name);
   if(!profile.recurring || !profile.recurring.length) return {items:[], total:0};
   const fri=new Date(monday); fri.setDate(monday.getDate()+4);
   const fridayCount=fridaysInMonth(fri.getFullYear(), fri.getMonth());
-  const items=profile.recurring.filter(r=>Number(r.monthly)>0).map(r=>({
-    label:r.label, weekly: Math.round((Number(r.monthly)/fridayCount)*100)/100
-  }));
+  const ordinal=fridayOrdinalInMonth(fri);
+  const items=profile.recurring.filter(r=>Number(r.monthly)>0).map(r=>{
+    const weekly=Math.round((Number(r.monthly)/fridayCount)*100)/100;
+    const paidSoFar=Math.round(weekly*ordinal*100)/100;
+    const remaining=Math.round((Number(r.monthly)-paidSoFar)*100)/100;
+    return {label:r.label, weekly, monthly:Number(r.monthly), remaining};
+  });
   return {items, total: items.reduce((s,i)=>s+i.weekly,0)};
 }
 
@@ -2225,6 +2258,9 @@ async function renderKleinkas(ct){
         <input class="inp" type="number" id="kk-amount" placeholder="0"></div>
       <div style="margin-top:8px"><div class="flbl" style="margin-bottom:4px">Rede</div>
         <input class="inp" id="kk-category" placeholder="bv. koeldrank vir werkers"></div>
+      <div id="kk-diesel-row" style="margin-top:8px;display:${KLEINKAS_FORM_TYPE==='out'?'flex':'none'};align-items:center;gap:6px">
+        <input type="checkbox" id="kk-is-diesel" style="width:auto"><label for="kk-is-diesel" style="font-size:.8rem">⛽ Dit is vir diesel — tel by Uitgawes se Diesel/Petrol totaal</label>
+      </div>
       <button class="btn" style="margin-top:10px" onclick="submitKleinkasEntry()">Stoor</button>
     </div>
 
@@ -2259,7 +2295,7 @@ async function renderKleinkas(ct){
         const bal=runningByEntry.get(e);
         return `<div style="display:grid;grid-template-columns:65px 1fr 75px 65px 26px;padding:9px 12px;border-bottom:1px solid var(--brd);font-size:.78rem;align-items:center">
           <span style="color:var(--t2)">${e.date}</span>
-          <span style="padding:0 6px">${e.category}${e.desc?' — '+e.desc:''}</span>
+          <span style="padding:0 6px">${e.category}${e.isDiesel?' ⛽':''}${e.desc?' — '+e.desc:''}</span>
           <span style="text-align:right;font-weight:700;color:${e.type==='in'?'var(--g8)':'var(--red)'}">${e.type==='in'?'+':'-'}R${e.amount.toFixed(2)}</span>
           <span style="text-align:right;font-weight:700;color:${bal<0?'var(--red)':'var(--t2)'}">R${bal.toFixed(2)}</span>
           <button onclick="deleteKleinkasEntry('${e.id}')" title="Verwyder"
@@ -2271,6 +2307,8 @@ async function renderKleinkas(ct){
 function setKleinkasFormType(type){
   KLEINKAS_FORM_TYPE=type;
   highlightKleinkasTypeButtons();
+  const row=document.getElementById('kk-diesel-row');
+  if(row) row.style.display = type==='out' ? 'flex' : 'none';
 }
 function highlightKleinkasTypeButtons(){
   const inBtn=document.getElementById('kk-type-in'), outBtn=document.getElementById('kk-type-out');
@@ -2286,10 +2324,11 @@ async function submitKleinkasEntry(){
   const date=document.getElementById('kk-date').value;
   const amount=parseFloat(document.getElementById('kk-amount').value);
   const category=document.getElementById('kk-category').value.trim();
+  const isDiesel=KLEINKAS_FORM_TYPE==='out' && !!document.getElementById('kk-is-diesel')?.checked;
   if(!date){ alert('Kies \'n datum'); return; }
   if(isNaN(amount) || amount<=0){ alert('Voer \'n geldige bedrag in'); return; }
   if(!category){ alert('Voer \'n rede in'); return; }
-  const entry={ id:'kk_'+Date.now(), date, type:KLEINKAS_FORM_TYPE, amount, category, desc:'', ts:Date.now() };
+  const entry={ id:'kk_'+Date.now(), date, type:KLEINKAS_FORM_TYPE, amount, category, desc:'', isDiesel, ts:Date.now() };
   const ok=await saveKleinkas([...getKleinkas(), entry]);
   if(!ok) return;
   toast('✓ Kleinkas inskrywing gestoor');
@@ -2419,16 +2458,33 @@ async function renderExpenses(ct){
   if(EXP_FILTER.driverId==='__general__') filtered=filtered.filter(e=>!e.driverId);
   else if(EXP_FILTER.driverId) filtered=filtered.filter(e=>e.driverId===EXP_FILTER.driverId);
 
+  // Diesel paid for straight out of Kleinkas is real Uitgawe money too —
+  // folded into the Diesel/Petrol bucket here so the category card and
+  // the drilled-in total always agree with each other.
+  const kleinkasDieselTotal = (EXP_FILTER.driverId ? 0 : getKleinkas()
+    .filter(e=>e.type==='out' && e.isDiesel && dateInRange(e.date,from,to))
+    .reduce((s,e)=>s+(e.amount||0),0));
+
   const byCat={};
   filtered.forEach(e=>{ byCat[e.category]=(byCat[e.category]||0)+(e.amount||0); });
+  if(kleinkasDieselTotal>0) byCat['Diesel/Petrol']=(byCat['Diesel/Petrol']||0)+kleinkasDieselTotal;
   const catRows=Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
-  const total=filtered.reduce((s,e)=>s+(e.amount||0),0);
+  const total=filtered.reduce((s,e)=>s+(e.amount||0),0)+kleinkasDieselTotal;
 
   // ── Folder open: show ONLY this category, clean and drilled-in ──
   if(EXP_FILTER.category){
     const catItems=filtered.filter(e=>e.category===EXP_FILTER.category).slice().sort((a,b)=>b.date.localeCompare(a.date));
-    const catTotal=catItems.reduce((s,e)=>s+(e.amount||0),0);
     const isDiesel=EXP_FILTER.category==='Diesel/Petrol';
+    // Diesel bought with cash handed out of Kleinkas is the same real
+    // expense as a Diesel/Petrol Uitgawe entry — pulling those in here
+    // (rather than also letting the driver's Dagstaat figure get
+    // confirmed as a SECOND, separate Uitgawe entry below) is what keeps
+    // this total from double-counting money that only actually left the
+    // business once.
+    const kleinkasDiesel = isDiesel
+      ? getKleinkas().filter(e=>e.type==='out' && e.isDiesel && dateInRange(e.date,from,to))
+      : [];
+    const catTotal=catItems.reduce((s,e)=>s+(e.amount||0),0) + kleinkasDiesel.reduce((s,e)=>s+(e.amount||0),0);
     let dieselChartHtml='';
     if(isDiesel){
       // Diesel usage over time, per bakkie — the specific graph asked for
@@ -2448,12 +2504,22 @@ async function renderExpenses(ct){
       <div class="ovhdr"><h2>${CATEGORY_ICONS[EXP_FILTER.category]||'📦'} ${EXP_FILTER.category}</h2><p>${rangeLbl}</p></div>
       <div class="ovgrid">
         <div class="ovc"><div class="v" style="color:#C62828">R${catTotal.toFixed(0)}</div><div class="l">Totaal</div></div>
-        <div class="ovc"><div class="v">${catItems.length}</div><div class="l">Aantal items</div></div>
+        <div class="ovc"><div class="v">${catItems.length+kleinkasDiesel.length}</div><div class="l">Aantal items</div></div>
       </div>
       ${dieselChartHtml}
       <button class="btn btn-blue" style="margin:10px 0" onclick="showAddExpense()">＋ Voeg uitgawe by</button>
       <div class="divlbl">TRANSAKSIES</div>
-      <div id="exp-list"></div>`;
+      <div id="exp-list"></div>
+      ${kleinkasDiesel.length?`
+      <div class="divlbl" style="margin-top:12px">⛽ UIT KLEINKAS (${kleinkasDiesel.length})</div>
+      <p style="font-size:.76rem;color:var(--t2);margin:-4px 0 8px">Kontant wat direk uit kleinkas vir diesel gegee is — reeds in die totaal hierbo. Wysig/verwyder in die Kleinkas-oortjie.</p>
+      <div style="background:var(--card);border-radius:12px;border:2px solid var(--brd);overflow:hidden">
+        ${kleinkasDiesel.slice().sort((a,b)=>b.date.localeCompare(a.date)).map(e=>`
+        <div style="display:flex;justify-content:space-between;padding:9px 12px;border-bottom:1px solid var(--brd);font-size:.82rem">
+          <span>${e.date} · ${e.category}</span>
+          <span style="font-weight:700;color:#C62828">R${e.amount.toFixed(2)}</span>
+        </div>`).join('')}
+      </div>`:''}`;
     renderExpenseList(catItems);
     return;
   }
@@ -2494,8 +2560,8 @@ async function renderExpenses(ct){
     <div class="divlbl" style="margin-top:12px">PER KATEGORIE</div>
     <div style="border:1px solid var(--brd);border-radius:10px;padding:10px;margin-bottom:12px">${svgBarChart(chartData)}</div>` : ''}
     ${dieselSuggestions.length?`
-    <div class="divlbl" style="margin-top:12px">⛽ VOORGESTELDE DIESEL-UITGAWES (${dieselSuggestions.length})</div>
-    <p style="font-size:.78rem;color:var(--t2);margin:-4px 0 8px">Uit wat bestuurders al in Dagstaat ingetik het — tik ✓ om by te voeg.</p>
+    <div class="divlbl" style="margin-top:12px">⛽ DIESEL UIT DAGSTAAT (${dieselSuggestions.length})</div>
+    <p style="font-size:.78rem;color:var(--t2);margin:-4px 0 8px">Bestuurders het dié bedrae in hul Dagstaat ingetik. Maak seker dit stem ooreen met wat uit Kleinkas gegee is (tik "⛽ Dit is vir diesel" daar) — dit word nie hier as 'n aparte uitgawe bygevoeg nie, om te verhoed dat dieselfde diesel twee keer getel word.</p>
     <div id="diesel-sugg"></div>` : ''}
     <div class="divlbl" style="margin-top:12px">KATEGORIEË <span style="font-weight:400;color:var(--t3)">· tik om oop te maak</span></div>
     <div id="exp-cat-folders" style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px"></div>
@@ -2534,10 +2600,7 @@ async function renderExpenses(ct){
           <div style="font-weight:700">${DRIVERS[s.driverId].name} · ${s.date} ${s.source==='equip'?'· 🔧 Toerusting':'· 🚗 Voertuig'}</div>
           <div style="font-size:.78rem;color:var(--t2)">${s.liters?s.liters+' L · ':''}R${s.amount.toFixed(2)}</div>
         </div>
-        <div style="display:flex;gap:6px;flex-shrink:0">
-          <button class="btn-sec btn" style="padding:6px 10px;font-size:.78rem" onclick="dismissDieselSuggestion('${s.driverId}','${s.date}','${s.source}')">✕</button>
-          <button class="btn" style="padding:6px 12px;font-size:.78rem;background:var(--g8)" onclick="confirmDieselSuggestion('${s.driverId}','${s.date}',${s.amount},'${s.source}')">✓ Bevestig</button>
-        </div>`;
+        <button class="btn-sec btn" style="padding:6px 12px;font-size:.78rem" onclick="dismissDieselSuggestion('${s.driverId}','${s.date}','${s.source}')">✓ Nagegaan</button>`;
       sc.appendChild(row);
     });
   }
@@ -2802,10 +2865,18 @@ async function shareExpenseReportPDF(){
   if(EXP_FILTER.driverId==='__general__') filtered=filtered.filter(e=>!e.driverId);
   else if(EXP_FILTER.driverId) filtered=filtered.filter(e=>e.driverId===EXP_FILTER.driverId);
   filtered.sort((a,b)=>a.date.localeCompare(b.date));
-  const total=filtered.reduce((s,e)=>s+(e.amount||0),0);
+
+  // Same reasoning as the on-screen Diesel/Petrol view — cash paid for
+  // diesel straight out of Kleinkas is folded into this report's totals
+  // so it isn't left out of the picture (or double-counted separately).
+  const kleinkasDiesel = (!EXP_FILTER.driverId && (!EXP_FILTER.category || EXP_FILTER.category==='Diesel/Petrol'))
+    ? getKleinkas().filter(e=>e.type==='out' && e.isDiesel && dateInRange(e.date,from,to))
+    : [];
+  const total=filtered.reduce((s,e)=>s+(e.amount||0),0)+kleinkasDiesel.reduce((s,e)=>s+(e.amount||0),0);
 
   const byCat={};
   filtered.forEach(e=>{ byCat[e.category]=(byCat[e.category]||0)+(e.amount||0); });
+  if(kleinkasDiesel.length) byCat['Diesel/Petrol']=(byCat['Diesel/Petrol']||0)+kleinkasDiesel.reduce((s,e)=>s+(e.amount||0),0);
   const catRows=Object.entries(byCat).sort((a,b)=>b[1]-a[1]);
 
   const {jsPDF}=window.jspdf;
@@ -2819,7 +2890,7 @@ async function shareExpenseReportPDF(){
   doc.setFont('helvetica','bold'); doc.setFontSize(12);
   doc.text('Totale uitgawes',15,y); doc.text('R'+total.toFixed(2),195,y,{align:'right'}); y+=6;
   doc.setFont('helvetica','normal'); doc.setFontSize(10);
-  doc.text(filtered.length+' item(s)',15,y); y+=10;
+  doc.text((filtered.length+kleinkasDiesel.length)+' item(s)'+(kleinkasDiesel.length?' (incl. '+kleinkasDiesel.length+' uit Kleinkas)':''),15,y); y+=10;
 
   doc.setFont('helvetica','bold'); doc.text('Per kategorie',15,y); y+=6;
   doc.setFont('helvetica','normal');
@@ -2836,6 +2907,10 @@ async function shareExpenseReportPDF(){
     if(y>275){ doc.addPage(); y=20; }
     const drvName=e.driverId&&DRIVERS[e.driverId]?' ('+DRIVERS[e.driverId].name+')':'';
     doc.text(e.date+' · '+e.category+drvName,15,y); doc.text('R'+e.amount.toFixed(2),195,y,{align:'right'}); y+=5.5;
+  });
+  kleinkasDiesel.forEach(e=>{
+    if(y>275){ doc.addPage(); y=20; }
+    doc.text(e.date+' · '+e.category+' (uit Kleinkas)',15,y); doc.text('R'+e.amount.toFixed(2),195,y,{align:'right'}); y+=5.5;
   });
 
   const blob=doc.output('blob');
@@ -2971,19 +3046,6 @@ async function markDieselHandled(driverId,date,source){
   done.push(driverId+'_'+date+'_'+(source||'veh'));
   await sSet('diesel_exp_done', done);
   DIESEL_SUGG_CACHE={ts:0, data:null}; // this one just got actioned — don't let the cache keep showing it
-}
-async function confirmDieselSuggestion(driverId,date,amount,source){
-  const list=getExpenses();
-  const isEquip=source==='equip';
-  list.push({
-    id:'exp_'+Date.now(), date, category:isEquip?'Tuintoerusting':'Diesel/Petrol', amount,
-    note:DRIVERS[driverId].name+(isEquip?' — toerusting brandstof':' — voertuig diesel')+' — outo-voorgestel uit Dagstaat',
-    driverId,
-  });
-  saveExpenses(list);
-  await markDieselHandled(driverId,date,source);
-  toast('✓ Uitgawe bygevoeg');
-  renderExpensesInto();
 }
 async function dismissDieselSuggestion(driverId,date,source){
   await markDieselHandled(driverId,date,source);
@@ -3224,7 +3286,7 @@ function autoSuggestBankDriver(txnId){
   if(guess) driverSel.value=guess;
 }
 
-function allocateBankIncome(txnId){
+async function allocateBankIncome(txnId){
   const sel=document.getElementById('bank-client-'+txnId);
   const clientKey=sel?sel.value:'';
   if(!clientKey){ alert('Kies eers n kliënt'); return; }
@@ -3233,7 +3295,8 @@ function allocateBankIncome(txnId){
   const txns=getBankTxns();
   const t=txns.find(x=>x.id===txnId);
   if(!t) return;
-  addPayment(clientKey, t.amount, t.date, 'Bank', driverId);
+  const ok=await addPayment(clientKey, t.amount, t.date, 'Bank', driverId);
+  if(!ok){ alert('⚠️ Kon nie die betaling by die kliënt se rekening voeg nie — kontroleer die internetverbinding en probeer weer. Die transaksie is NIE as toegeken gemerk nie.'); return; }
   t.status='income'; t.clientKey=clientKey; t.driverId=driverId;
   saveBankTxns(txns);
   toast('✓ R'+t.amount.toFixed(2)+' toegeken aan kliënt se staat');
@@ -3872,7 +3935,12 @@ async function sharePayslipPDF(encKey, wkKey){
     doc.setFontSize(10); doc.setTextColor(20,20,20);
   }
   recurringItems.forEach(it=>{
-    doc.text(it.label,15,y); doc.text('R'+it.weekly.toFixed(2),195,y,{align:'right'}); y+=6;
+    doc.text(it.label,15,y); doc.text('R'+it.weekly.toFixed(2),195,y,{align:'right'}); y+=5;
+    if(it.monthly>0){
+      doc.setFontSize(7.5); doc.setTextColor(120,120,120);
+      doc.text(`R${it.monthly.toFixed(2)}/maand − R${it.weekly.toFixed(2)} hierdie week = R${it.remaining.toFixed(2)} oorblywend hierdie maand`,15,y); y+=6.5;
+      doc.setFontSize(10); doc.setTextColor(20,20,20);
+    } else { y+=1; }
   });
   deductions.forEach(d=>{
     doc.text(d.reason||'Ander',15,y); doc.text('R'+(Number(d.amount)||0).toFixed(2),195,y,{align:'right'}); y+=6;
@@ -3919,10 +3987,12 @@ async function buildPayslipsGridPDF(people, wkKey){
     doc.rect(x0+2, y0+2, cellW-4, cellH-4);
     doc.setLineDashPattern([], 0);
 
-    // Company logo, top-left of each payslip.
-    try{ doc.addImage(LOGO_PDF_B64,'PNG', x0+4, y0+4, 11, 11); }catch(e){}
+    // Company logo, top-left of each payslip. The source image is a wide
+    // rectangle (~2.3:1), not square — forcing it into an 11x11 box like
+    // before was what squished it. Sized to keep its real proportions.
+    try{ doc.addImage(LOGO_PDF_B64,'PNG', x0+4, y0+4, 16, 7); }catch(e){}
 
-    let y=y0+11+11;
+    let y=y0+11+9;
     const x=x0+8, xRight=x0+cellW-8;
     doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(20,20,20);
     doc.text('PAYSLIP',x,y); y+=6;
@@ -3953,7 +4023,12 @@ async function buildPayslipsGridPDF(people, wkKey){
     }
     (p.recurringItems||[]).forEach(it=>{
       if(y>y0+cellH-14) return;
-      doc.text(it.label.slice(0,22),x,y); doc.text('-R'+it.weekly.toFixed(2),xRight,y,{align:'right'}); y+=4.5;
+      doc.text(it.label.slice(0,22),x,y); doc.text('-R'+it.weekly.toFixed(2),xRight,y,{align:'right'}); y+=3.8;
+      if(it.monthly>0 && y<y0+cellH-14){
+        doc.setFontSize(6); doc.setTextColor(120,120,120);
+        doc.text(`R${it.monthly.toFixed(0)}/mnd − R${it.weekly.toFixed(0)} = R${it.remaining.toFixed(0)} oorblywend`,x,y); y+=4.2;
+        doc.setFontSize(8); doc.setTextColor(20,20,20);
+      } else { y+=0.7; }
     });
     p.deductions.forEach(d=>{
       if(y>y0+cellH-14) return;
@@ -4645,21 +4720,36 @@ function finishGarden(id,e){
 async function deleteInvoiceAndReverseLedger(invId){
   const removedInv = getInvoices().find(i=>i.id===invId) || null;
   if(!removedInv) return null;
-  await collDelete('invoices', invId);
+  try{
+    await collDelete('invoices', invId);
+  }catch(e){
+    console.error('Kon nie faktuur skrap nie:', e);
+    return {failed:true, reason:'delete', removedInv:null};
+  }
   CACHE.invoices = getInvoices().filter(i=>i.id!==invId);
 
   const key = Object.keys(getLedger()).find(k=>invoiceMatchesClient(removedInv, getLedger()[k]));
   if(key){
-    const client = await withTimeout(FSTransaction(async (transaction)=>{
-      const ref=FS_DB.collection('ledger').doc(key);
-      const doc=await transaction.get(ref);
-      if(!doc.exists) return null;
-      const c=doc.data();
-      c.entries=(c.entries||[]).filter(e2=>e2.invId!==removedInv.id);
-      c.balance=c.entries.reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
-      transaction.set(ref, c);
-      return c;
-    }), 8000, 'deleteInvoice-ledger-transaction');
+    let client;
+    try{
+      client = await withTimeout(FSTransaction(async (transaction)=>{
+        const ref=FS_DB.collection('ledger').doc(key);
+        const doc=await transaction.get(ref);
+        if(!doc.exists) return null;
+        const c=doc.data();
+        c.entries=(c.entries||[]).filter(e2=>e2.invId!==removedInv.id);
+        c.balance=c.entries.reduce((s,e2)=>s+(e2.debit||0)-(e2.credit||0),0);
+        transaction.set(ref, c);
+        return c;
+      }), 8000, 'deleteInvoice-ledger-transaction');
+    }catch(e){
+      console.error('Faktuur is geskrap, maar kon nie die kliënt se saldo bywerk nie:', e);
+      // The invoice itself is already gone at this point — surfacing this
+      // so Bestuur knows to run "Herstel rekening" on this client rather
+      // than the balance/statement silently staying wrong with no sign
+      // anything went wrong.
+      return {failed:true, reason:'ledger', removedInv};
+    }
     if(client) CACHE.ledger={...CACHE.ledger, [key]:client};
   } else {
     // This used to fail completely silently — the invoice would be gone
@@ -4669,6 +4759,7 @@ async function deleteInvoiceAndReverseLedger(invId){
     // is at least traceable; the "Herstel rekening" button on a client's
     // ledger detail cleans up any leftovers from this happening in the past.
     console.error('Kon nie kliënt kry vir geskrapte faktuur nie — saldo dalk nie bygewerk nie:', removedInv.id, removedInv.address);
+    return {failed:true, reason:'nomatch', removedInv};
   }
   return removedInv;
 }
@@ -4684,7 +4775,14 @@ async function confirmDeleteInvoice(id){
     ? 'Hierdie faktuur is reeds gestuur — die kliënt het dit dalk al gesien. Oorweeg eerder \'n Krediet Nota as die bedrag net verkeerd is.\n\nSkrap in elk geval? Dit word ook van die kliënt se staat verwyder.'
     : 'Skrap hierdie faktuur permanent? Dit word ook van die kliënt se staat verwyder.';
   if(!confirm(msg+'\n\n'+inv.address+' — R'+inv.amount.toFixed(2))) return;
-  await deleteInvoiceAndReverseLedger(id);
+  const result=await deleteInvoiceAndReverseLedger(id);
+  if(result && result.failed){
+    if(result.reason==='delete'){
+      alert('⚠️ Kon nie die faktuur skrap nie — kontroleer die internetverbinding en probeer weer.');
+      return;
+    }
+    alert('⚠️ Die faktuur is geskrap, maar die kliënt se saldo/staat kon nie outomaties bygewerk word nie.\n\nGaan na die kliënt se rekening en tik "🔧 Herstel rekening" om dit reg te maak.');
+  }
   toast('🗑 Faktuur geskrap');
   refreshInvoiceViews(inv);
 }
@@ -5036,23 +5134,38 @@ async function addLedgerEntry(inv){
 
 async function addPayment(clientKey,amount,date,method,driverId){
   const dateStr=new Date(date).toLocaleDateString('af-ZA',{day:'numeric',month:'long',year:'numeric'});
-  const client = await withTimeout(FSTransaction(async (transaction)=>{
-    const ref=FS_DB.collection('ledger').doc(clientKey);
-    const doc=await transaction.get(ref);
-    if(!doc.exists) return null;
-    const c=doc.data();
-    c.entries=(c.entries||[]).slice();
-    c.entries.push({
-      date, dateStr, type:'payment',
-      desc:'Betaling ontvang ('+method+')',
-      debit:0, credit:amount,
-      driverId:driverId||'',
-    });
-    c.balance=(c.balance||0)-amount;
-    transaction.set(ref, c);
-    return c;
-  }), 8000, 'addPayment-transaction');
-  if(client) CACHE.ledger={...CACHE.ledger, [clientKey]:client};
+  // This used to be fire-and-forget everywhere it was called — the caller
+  // moved on (re-rendering, marking a bank transaction as allocated)
+  // before this transaction had actually finished, so the balance shown
+  // right after recording a payment could still be the old figure, and a
+  // failed save (network hiccup) had nowhere to surface at all. Returning
+  // true/false lets every caller wait for the real result and tell the
+  // person if it didn't actually go through.
+  let client;
+  try{
+    client = await withTimeout(FSTransaction(async (transaction)=>{
+      const ref=FS_DB.collection('ledger').doc(clientKey);
+      const doc=await transaction.get(ref);
+      if(!doc.exists) return null;
+      const c=doc.data();
+      c.entries=(c.entries||[]).slice();
+      c.entries.push({
+        date, dateStr, type:'payment',
+        desc:'Betaling ontvang ('+method+')',
+        debit:0, credit:amount,
+        driverId:driverId||'',
+      });
+      c.balance=(c.balance||0)-amount;
+      transaction.set(ref, c);
+      return c;
+    }), 8000, 'addPayment-transaction');
+  }catch(e){
+    console.error('Kon nie betaling stoor nie:', e);
+    return false;
+  }
+  if(!client) return false;
+  CACHE.ledger={...CACHE.ledger, [clientKey]:client};
+  return true;
 }
 
 
@@ -6817,7 +6930,7 @@ function buildCreditNotePDF(cn){
 
   doc.setFont('helvetica','bold'); doc.text('Kliënt',15,y); y+=6;
   doc.setFont('helvetica','normal');
-  doc.text(cn.address+(cn.name?' ('+cn.name+')':''),15,y); y+=10;
+  y=pdfClientBlock(doc, cn.address, cn.name, 15, y, 150)+5;
 
   doc.setFont('helvetica','bold'); doc.text('Gekrediteerde items',15,y); y+=6;
   doc.setFont('helvetica','normal');
@@ -7085,13 +7198,32 @@ function buildDayReportPDF(driverName, dateLbl, route, vehicle, workers){
   return doc.output('blob');
 }
 
+// Some clients need their full registered business name/address on
+// invoices and statements — potentially several lines, not just a short
+// name in parentheses after the address. This renders the address, then
+// the name (if any) as its own block below it, honoring explicit line
+// breaks she's typed in AND wrapping any line that's still too long for
+// the page — returning the y position to carry on from.
+function pdfClientBlock(doc, address, name, x, y, maxWidth){
+  doc.text(address, x, y); y+=6;
+  const rawLines=(name||'').split('\n').map(l=>l.trim()).filter(l=>l.length);
+  rawLines.forEach(line=>{
+    const wrapped=doc.splitTextToSize(line, maxWidth||150);
+    doc.text(wrapped, x, y);
+    y+=wrapped.length*5.5;
+  });
+  return y;
+}
 function pdfLetterhead(doc,y){
   try{
-    doc.addImage(LOGO_PDF_B64,'PNG',15,y-8,16,16);
+    // Logo source image is a wide rectangle (~2.3:1), not square — forcing
+    // it into a 16x16 square was squishing it. This keeps its real
+    // proportions instead of distorting it.
+    doc.addImage(LOGO_PDF_B64,'PNG',15,y-7,24,10.5);
     doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.setTextColor(46,125,50);
-    doc.text('Dis Nou Tyd Garden Service',35,y);
+    doc.text('Dis Nou Tyd Garden Service',43,y);
     doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(90,90,90);
-    doc.text('Tuindienste · Velddrif, Vredenburg, Saldanha, Dwarskersbos, St Helena Bay',35,y+6);
+    doc.text('Tuindienste · Velddrif, Vredenburg, Saldanha, Dwarskersbos, St Helena Bay',43,y+6);
   }catch(e){
     doc.setFont('helvetica','bold'); doc.setFontSize(16); doc.setTextColor(46,125,50);
     doc.text('Dis Nou Tyd Garden Service',15,y);
@@ -7114,7 +7246,7 @@ function buildInvoicePDF(inv){
 
   doc.setFont('helvetica','bold'); doc.text('Kliënt',15,y); y+=6;
   doc.setFont('helvetica','normal');
-  doc.text(inv.address+(inv.name?' ('+inv.name+')':''),15,y); y+=8;
+  y=pdfClientBlock(doc, inv.address, inv.name, 15, y, 150)+3;
 
   if(inv.lineItems && inv.lineItems.length>0){
     doc.setFont('helvetica','bold'); doc.text('Diens',15,y); y+=6;
@@ -7710,7 +7842,8 @@ async function renderLedger(ct){
   bottomRow.style.cssText='display:flex;gap:14px;justify-content:center;margin-top:14px';
   bottomRow.innerHTML=`
     <button onclick="showMergeClientsModal()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">🔀 Merge kliënte</button>
-    <button onclick="showAgeAnalysisModal()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">📊 Age Analysis</button>`;
+    <button onclick="showAgeAnalysisModal()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">📊 Age Analysis</button>
+    <button onclick="reconcileAllLedgers()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">🔧 Herstel alle rekeninge</button>`;
   ct.appendChild(bottomRow);
 }
 function setLedgerView(v){
@@ -7849,7 +7982,8 @@ function showEditClientModal(encKey){
     <div><div class="flbl" style="margin-bottom:5px">Adres / Address *</div>
       <input class="inp" id="ecl-addr" value="${c.address.replace(/"/g,'&quot;')}"></div>
     <div><div class="flbl" style="margin-bottom:5px">Naam (opsioneel) / Name (optional)</div>
-      <input class="inp" id="ecl-name" value="${(c.name||'').replace(/"/g,'&quot;')}"></div>
+      <p style="font-size:.74rem;color:var(--t2);margin:0 0 4px">Vir besighede wat 'n volledige naam/adres op fakture en state moet wys — druk Enter vir 'n nuwe reël.</p>
+      <textarea class="inp" id="ecl-name" rows="2" style="resize:vertical;font-family:inherit">${(c.name||'').replace(/</g,'&lt;')}</textarea></div>
     <button class="btn" onclick="submitEditClient('${encKey}')">✓ Stoor / Save</button>
     <button class="btn btn-sec" onclick="document.getElementById('editcl-modal').remove()">Kanselleer</button>
   </div>`;
@@ -7898,6 +8032,44 @@ async function submitEditClient(encKey){
   }
 }
 
+// Runs the same per-client repair reconcileClientLedger does, but across
+// every client in one pass — for catching up any accounts left with a
+// stuck balance from before invoice deletion reliably matched every
+// client (rather than needing to open each client one at a time).
+async function reconcileAllLedgers(){
+  if(!confirm('Dit gaan elke kliënt se rekening nagaan en enige inskrywings wat na geskrapte fakture verwys, verwyder — en die saldo herbereken. Dit kan \'n rukkie neem. Voortgaan?')) return;
+  const led=getLedger();
+  const liveInvIds=new Set(getInvoices().map(i=>i.id));
+  const keys=Object.keys(led);
+  let fixed=0, failed=0;
+  for(const key of keys){
+    const c=led[key];
+    const hasStaleEntry=(c.entries||[]).some(e=>e.invId && !liveInvIds.has(e.invId));
+    if(!hasStaleEntry) continue;
+    try{
+      const client = await withTimeout(FSTransaction(async (transaction)=>{
+        const ref=FS_DB.collection('ledger').doc(key);
+        const doc=await transaction.get(ref);
+        if(!doc.exists) return null;
+        const cc=doc.data();
+        cc.entries=(cc.entries||[]).filter(e=>!e.invId || liveInvIds.has(e.invId));
+        cc.balance=cc.entries.reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
+        transaction.set(ref, cc);
+        return cc;
+      }), 8000, 'reconcileAll-'+key);
+      if(client){ CACHE.ledger={...CACHE.ledger, [key]:client}; fixed++; }
+      else failed++;
+    }catch(e){
+      console.error('Kon nie herstel nie:', key, e);
+      failed++;
+    }
+  }
+  toast(fixed===0 ? '✓ Niks om reg te maak nie' : `✓ ${fixed} rekening(e) herstel${failed?`, ${failed} het misluk`:''}`);
+  if(S.screen==='parent' && S.parentTab==='ledger'){
+    renderLedger(document.getElementById('p-content'));
+  }
+}
+
 function renderLedgerList(ct){
   if(ledgerFilterActive()){ renderLedgerFilteredInvoices(ct); return; }
   const led=getLedger();
@@ -7917,8 +8089,9 @@ function renderLedgerList(ct){
     const lastDone=getLastDoneDate(c.code, c.address);
     card.innerHTML=`
       <div class="cl-top">
-        <div>
-          <div class="cl-name">${c.address} <button onclick="event.stopPropagation();showEditClientModal('${encodeURIComponent(key)}')" title="Wysig kliënt / Edit client" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:.78rem;padding:2px 4px;vertical-align:middle">✏️</button></div>
+        <button onclick="event.stopPropagation();showEditClientModal('${encodeURIComponent(key)}')" title="Wysig kliënt / Edit client" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:.85rem;padding:2px 6px 2px 0;flex-shrink:0;align-self:flex-start">✏️</button>
+        <div style="flex:1;min-width:0">
+          <div class="cl-name">${c.address}</div>
           <div class="cl-code">${c.code||''} ${c.name?'· '+c.name:''}</div>
           <div style="font-size:.72rem;color:var(--t3);margin-top:2px">Laaste gedoen: ${lastDone||'Nog nooit nie'}</div>
         </div>
@@ -8070,9 +8243,7 @@ function showClientLedger(key,c){
       <select class="inp" id="cl-stmt-month" style="flex:1;padding:7px;font-size:.82rem">
         ${monthOpts.map(o=>`<option value="${o.offset}">${o.label}</option>`).join('')}
       </select>
-      <button onclick="viewStatementPDF('${key}',parseInt(document.getElementById('cl-stmt-month').value))" title="Bekyk" style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;padding:8px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">👁</button>
-      <button onclick="downloadStatementPDF('${key}',parseInt(document.getElementById('cl-stmt-month').value))" title="Laai af" style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;padding:8px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">⬇️</button>
-      <button onclick="shareStatementPDF('${key}',parseInt(document.getElementById('cl-stmt-month').value))" style="background:var(--g8);color:#fff;border:none;border-radius:100px;padding:8px 14px;font-size:.8rem;font-weight:700">📄 Stuur</button>
+      <button onclick="viewStatementPDF('${key}',parseInt(document.getElementById('cl-stmt-month').value))" style="background:var(--g8);color:#fff;border:none;border-radius:100px;padding:8px 14px;font-size:.8rem;font-weight:700">📄 Genereer</button>
     </div>
     <div class="divlbl">TRANSAKSIES / TRANSACTIONS</div>
     <div style="background:var(--card);border-radius:12px;border:2px solid var(--brd);overflow:hidden">
@@ -8258,13 +8429,14 @@ function showPaymentForm(key){
   document.body.appendChild(bg);
 }
 
-function submitPayment(key){
+async function submitPayment(key){
   const amt=parseFloat(document.getElementById('pay-amt').value)||0;
   const date=document.getElementById('pay-date').value;
   const method=document.getElementById('pay-method').value;
   const driverId=document.getElementById('pay-driver')?.value||'';
   if(!amt||amt<=0){alert('Voer n geldige bedrag in');return;}
-  addPayment(key,amt,date,method,driverId);
+  const ok=await addPayment(key,amt,date,method,driverId);
+  if(!ok){ alert('⚠️ Kon nie die betaling stoor nie — kontroleer die internetverbinding en probeer weer.'); return; }
   document.getElementById('pay-modal').remove();
   renderParentTab('ledger');
   toast('✓ Betaling van R'+amt.toFixed(2)+' geskryf');
@@ -8446,14 +8618,22 @@ async function shareAgeAnalysisPDF(){
   doc.setDrawColor(200,200,200); doc.line(15,y,195,y); y+=5;
   doc.setFont('helvetica','normal');
   rows.forEach(r=>{
-    if(y>275){ doc.addPage(); y=20; }
-    doc.text(doc.splitTextToSize(r.c.address+(r.c.name?' ('+r.c.name+')':''),90),15,y);
+    if(y>270){ doc.addPage(); y=20; }
+    const addrLines=doc.splitTextToSize(r.c.address+(r.c.name?' ('+r.c.name+')':''),90);
+    doc.text(addrLines,15,y);
     doc.text(r.buckets.cur>0.005?r.buckets.cur.toFixed(0):'–',110,y,{align:'right'});
     doc.text(r.buckets.d30>0.005?r.buckets.d30.toFixed(0):'–',132,y,{align:'right'});
     doc.text(r.buckets.d60>0.005?r.buckets.d60.toFixed(0):'–',154,y,{align:'right'});
     doc.text(r.buckets.d90>0.005?r.buckets.d90.toFixed(0):'–',176,y,{align:'right'});
     doc.text(r.buckets.d120>0.005?r.buckets.d120.toFixed(0):'–',195,y,{align:'right'});
-    y+=5.5;
+    // A thin rule under every client, not just the header/footer — with
+    // 100+ clients on one report, a wall of numbers with nothing marking
+    // where one client ends and the next begins is hard to track by eye
+    // (or by finger) down the page.
+    const rowBottom=y+(addrLines.length-1)*4.2+2.5;
+    doc.setDrawColor(230,230,230);
+    doc.line(15,rowBottom,195,rowBottom);
+    y=rowBottom+3;
   });
   y+=3;
   doc.setDrawColor(200,200,200); doc.line(15,y,195,y); y+=6;
@@ -8708,9 +8888,7 @@ async function renderMonthBrowserBody(){
             ${c?`<div class="stmt-bal ${bal<=0?'paid':''}">R${Math.abs(bal).toFixed(2)}</div>`:''}
           </div>
           ${c?`<div class="stmt-actions">
-            <button class="inv-wa" style="background:var(--g8);flex:1" onclick="shareStatementPDF('${key}',${offset})">📄 Stuur Staat (PDF)</button>
-            <button onclick="viewStatementPDF('${key}',${offset})" style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">👁</button>
-            <button onclick="downloadStatementPDF('${key}',${offset})" style="background:var(--bg);border:2px solid var(--brd);border-radius:100px;padding:9px 12px;font-size:.8rem;font-weight:700;color:var(--t2)">⬇️</button>
+            <button class="inv-wa" style="background:var(--g8);flex:1" onclick="shareStatementPDF('${key}',${offset})">📄 Genereer Staat (PDF)</button>
           </div>`:`<p style="font-size:.72rem;color:var(--red);margin:4px 0 0">⚠️ Kon nie met 'n kliëntrekord gepaar word nie — kyk of die adres presies ooreenstem in Kliënte.</p>`}`;
         ct.appendChild(card);
       });
@@ -8788,7 +8966,7 @@ function drawStatementIntoDoc(doc,c,monthInvs,bal,monthPays){
 
   doc.setFont('helvetica','bold'); doc.text('Kliënt',15,y); y+=6;
   doc.setFont('helvetica','normal');
-  doc.text(c.address+(c.name?' ('+c.name+')':''),15,y); y+=10;
+  y=pdfClientBlock(doc, c.address, c.name, 15, y, 150)+5;
 
   doc.setDrawColor(220,220,220); doc.line(15,y,195,y); y+=8;
   doc.setFont('helvetica','bold'); doc.setFontSize(10);
@@ -9233,6 +9411,7 @@ async function schedPreviewFinalList(){
   try{ overrides=await getDateOverrides(driverId, nextDate); }catch(e){ console.error('Kon nie oorskrywings laai nie:', e); }
   if(Object.keys(overrides).length) route=route.map(g=>overrides[g.schedId]?{...g,...overrides[g.schedId]}:g);
   const skippedCount=totalBeforeSkip-route.length;
+  const listTotal=route.reduce((s,g)=>s+(Number(g.cost)||0)+(Number(g.extraWorkAmount)||0),0);
 
   document.getElementById('sched-preview-modal')?.remove();
   const bg=el('div','mbg'); bg.id='sched-preview-modal';
@@ -9243,6 +9422,10 @@ async function schedPreviewFinalList(){
     <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
       ${route.length} kliënte sal werklik besoek word${skippedCount>0?` · ${skippedCount} oorgeslaan (nie op hierdie lys nie)`:''}
     </p>
+    <div style="background:var(--g1);border-radius:10px;padding:10px 14px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:.8rem;font-weight:700;color:var(--t2)">TOTAAL / TOTAL</span>
+      <span style="font-size:1.1rem;font-weight:800;color:var(--g8)">R${listTotal.toFixed(0)}</span>
+    </div>
     <div style="max-height:400px;overflow-y:auto;display:flex;flex-direction:column;gap:8px">
       ${route.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:20px 0">Geen kliënte oor nie — almal oorgeslaan of geen lys nie.</p>':''}
       ${route.map((g,i)=>`<div style="border:1px solid var(--brd);border-radius:10px;padding:10px 12px">
@@ -9482,9 +9665,13 @@ async function schedRemoveClient(clientId){
   const idx=arr.findIndex(c=>c.id===clientId);
   if(idx>-1) arr.splice(idx,1);
   await saveSchedule();
-  await schedPatchLiveIfToday(driverId,week,day,clientId,null,'remove');
+  const liveResult=await schedPatchLiveIfToday(driverId,week,day,clientId,null,'remove');
   renderScheduleEditor();
-  toast('✓ Verwyder / Removed');
+  if(liveResult==='already-started'){
+    toast('✓ Verwyder uit rooster — maar dit wys steeds op vandag se lys, want die bestuurder het reeds daarmee begin/klaar gemaak');
+  } else {
+    toast('✓ Verwyder / Removed');
+  }
 }
 // Undoes a Transfer — pulls one client back out of a driver's one-time
 // "borrowed" list for that specific date. Doesn't touch the recurring
@@ -9606,21 +9793,25 @@ async function undoSkipOnce(clientId, dateKey){
 // started — a job already begun/finished today is left alone so real work
 // done isn't erased by a later schedule edit.
 async function schedPatchLiveIfToday(driverId,week,day,schedId,newItem,mode){
-  if(week!==currentWeekKey()||day!==todayWeekday()) return;
+  if(week!==currentWeekKey()||day!==todayWeekday()) return 'not-today';
   const dk=todayKey(), ck=driverId+'_'+dk;
   let prog=CACHE.progress[ck]||await fetchDriverProgress(driverId);
-  if(!prog||!prog.route) return; // driver hasn't started today yet — next login pulls fresh schedule anyway
+  if(!prog||!prog.route) return 'no-route'; // driver hasn't started today yet — next login pulls fresh schedule anyway
   let route=prog.route.slice();
+  let result='ok';
   if(mode==='remove'){
     const idx=route.findIndex(g=>g.schedId===schedId);
-    if(idx>-1&&!route[idx].completed&&!route[idx].active) route.splice(idx,1);
+    if(idx>-1){
+      if(!route[idx].completed&&!route[idx].active) route.splice(idx,1);
+      else result='already-started'; // job's already underway/done today — can't retroactively unshow it
+    }
   } else {
     const idx=route.findIndex(g=>g.schedId===schedId);
     if(idx>-1){
       if(!route[idx].completed&&!route[idx].active){
         route[idx]={...route[idx],address:newItem.address,name:newItem.name,cost:newItem.cost,
           notes:newItem.notes,belangrik:newItem.belangrik,tydNote:newItem.tydNote};
-      }
+      } else result='already-started';
     } else if(!schedId){
       route.push({...makeFresh(driverId,[newItem],false)[0]});
     }
@@ -9629,6 +9820,7 @@ async function schedPatchLiveIfToday(driverId,week,day,schedId,newItem,mode){
   CACHE.progress[ck]=payload;
   await sSet('progress_'+driverId+'_'+dk,payload);
   if(S.screen==='driver'&&S.driver===driverId&&S.driverTab==='route') refresh();
+  return result;
 }
 
 // ══════════════════ QUOTES (kwotasies) ═════════════════════════════════════════
@@ -9866,33 +10058,51 @@ function renderPierreQuotesView(ct){
   const all=getQuotes();
   const assigned=all.filter(q=>q.status==='assigned');
   const pending=all.filter(q=>q.status==='pending');
-  const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned');
   ct.innerHTML=`
     <button class="btn btn-sec" onclick="showQuoteRequestForm()">📍 Stuur drywer vir kwotasie</button>
-    <div class="divlbl">WAG VIR BESOEK (${assigned.length}) <span style="font-weight:400;color:var(--t3)">· bestuurder moet nog gaan kyk</span></div>
-    ${assigned.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen versoeke wat wag nie.</p>':assigned.map(q=>quoteCardHtml(q,false,true)).join('')}
-    <div class="divlbl">WAG OP BESLUIT (${pending.length})</div>
-    ${pending.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen kwotasies wat wag nie.</p>':pending.map(q=>quoteCardHtml(q,false,true)).join('')}
-    ${rest.length?`<div class="divlbl">VERLEDE</div>${rest.map(q=>quoteCardHtml(q,false,true)).join('')}`:''}`;
+    ${quoteSectionHtml('assigned','WAG VIR BESOEK',' · bestuurder moet nog gaan kyk',assigned,false,true,'Geen versoeke wat wag nie.')}
+    ${quoteSectionHtml('pending','WAG OP BESLUIT','',pending,false,true,'Geen kwotasies wat wag nie.')}`;
+}
+// Which of the three sections are expanded — all open by default so this
+// looks and behaves the same as before until she actually taps a heading
+// to tidy it up.
+let QUOTES_OPEN_SECTIONS=new Set(['assigned','pending','accepted']);
+function toggleQuoteSection(key){
+  if(QUOTES_OPEN_SECTIONS.has(key)) QUOTES_OPEN_SECTIONS.delete(key);
+  else QUOTES_OPEN_SECTIONS.add(key);
+  refreshQuotesScreen();
+}
+function quoteSectionHtml(key, title, subtitle, items, canFinalize, hidePrice, emptyMsg){
+  const isOpen=QUOTES_OPEN_SECTIONS.has(key);
+  const hdr=`<div class="divlbl" style="cursor:pointer;display:flex;align-items:center;gap:4px" onclick="toggleQuoteSection('${key}')">
+    <span>${isOpen?'▾':'▸'} ${title} (${items.length})</span>${subtitle?`<span style="font-weight:400;color:var(--t3)">${subtitle}</span>`:''}
+  </div>`;
+  if(!isOpen) return hdr;
+  return hdr + (items.length===0
+    ? `<p style="color:var(--t2);font-size:.85rem;padding:10px 0">${emptyMsg}</p>`
+    : items.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join(''));
 }
 function renderQuotesParent(ct){
   const all=getQuotes();
   const assigned=all.filter(q=>q.status==='assigned');
   const pending=all.filter(q=>q.status==='pending');
   const accepted=all.filter(q=>q.status==='accepted');
-  const rest=all.filter(q=>q.status!=='pending'&&q.status!=='assigned'&&q.status!=='accepted');
   const canFinalize=!S.isOffice; // only Bestuur prices/decides — Jan can send drivers for quotes but not price them
   const hidePrice=!!S.isOffice;
+  // Declined quotes and ones already accepted-and-scheduled were piling up
+  // in a "VERLEDE" section forever with no way to clear them — she already
+  // keeps the PDF for her own records, so once a quote is fully resolved
+  // one way or the other it just drops off this screen instead of sitting
+  // here indefinitely. Nothing is deleted from storage — declining already
+  // asks for confirmation first, so there's no accidental-tap risk this
+  // removes any protection against; the record itself is just no longer
+  // surfaced here once it's done.
   ct.innerHTML=`
     ${canFinalize?'<button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>':''}
     <button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Stuur drywer vir kwotasie</button>
-    <div class="divlbl">WAG VIR BESOEK (${assigned.length}) <span style="font-weight:400;color:var(--t3)">· bestuurder moet nog gaan kyk</span></div>
-    ${assigned.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen versoeke wat wag nie.</p>':assigned.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
-    <div class="divlbl">WAG OP BESLUIT (${pending.length})</div>
-    ${pending.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen kwotasies wat wag nie.</p>':pending.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
-    <div class="divlbl">✓ AANVAARDE KWOTASIES (${accepted.length}) <span style="font-weight:400;color:var(--t3)">· werk wat gedoen moet word — nog nie ingesorteer nie</span></div>
-    ${accepted.length===0?'<p style="color:var(--t2);font-size:.85rem;padding:10px 0">Geen aanvaarde kwotasies wat wag om ingesorteer te word nie.</p>':accepted.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}
-    ${rest.length?`<div class="divlbl">VERLEDE</div>${rest.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join('')}`:''}`;
+    ${quoteSectionHtml('assigned','WAG VIR BESOEK',' · bestuurder moet nog gaan kyk',assigned,canFinalize,hidePrice,'Geen versoeke wat wag nie.')}
+    ${quoteSectionHtml('pending','WAG OP BESLUIT','',pending,canFinalize,hidePrice,'Geen kwotasies wat wag nie.')}
+    ${quoteSectionHtml('accepted','✓ AANVAARDE KWOTASIES',' · werk wat gedoen moet word — nog nie ingesorteer nie',accepted,canFinalize,hidePrice,'Geen aanvaarde kwotasies wat wag om ingesorteer te word nie.')}`;
 }
 
 function showQuoteForm(editId){
