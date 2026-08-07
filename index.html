@@ -96,7 +96,7 @@ input,select,textarea{font-family:inherit;font-size:.95rem;color:var(--text)}
 .tabs.compact .tab{padding:6px 9px;font-size:.68rem}
 
 /* ── CONTENT ── */
-.content{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
+.content{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:14px;display:flex;flex-direction:column;gap:12px}
 .content>*{flex-shrink:0}
 .content::-webkit-scrollbar{width:12px}
 .content::-webkit-scrollbar-track{background:transparent}
@@ -318,7 +318,8 @@ input[type=number]{-moz-appearance:textfield}
   display:flex;align-items:flex-end;justify-content:center}
 .modal{background:var(--card);border-radius:24px 24px 0 0;
   padding:22px 18px 36px;width:100%;max-width:640px;
-  max-height:88vh;overflow-y:auto;display:flex;flex-direction:column;gap:13px}
+  max-height:88vh;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain;touch-action:pan-y;display:flex;flex-direction:column;gap:13px}
 .mhdr{display:flex;align-items:center;justify-content:space-between;
   font-size:1.05rem;font-weight:800}
 .mclose{width:30px;height:30px;border-radius:50%;background:var(--brd);
@@ -580,6 +581,52 @@ window.addEventListener('beforeunload', (e)=>{
     return e.returnValue;
   }
 });
+
+// ══════════════════ FILTER/OLIE ONDERHOUD HERINNERING (elke bestuurder) ═════
+// Fixed maintenance-check dates for the whole fleet, taken straight from
+// Pierre's paper schedule. Deliberately NOT stored in Firestore — it's
+// static and known months ahead, so comparing today's date against a
+// plain array costs nothing extra to load or sync, unlike a stored list
+// that would need its own read on every login. The banner only ever
+// matches on the exact calendar day it's for; the next day it simply
+// stops matching and disappears on its own — nothing to clean up,
+// dismiss, or delete afterward, and nothing else on screen shows this
+// list at all.
+const FILTER_CHECK_DATES=[
+  '2026-07-08','2026-07-22','2026-08-05','2026-08-19','2026-09-02','2026-09-16',
+  '2026-09-30','2026-10-14','2026-10-28','2026-11-11','2026-11-25','2026-12-09',
+  '2027-01-13',
+];
+const OIL_CHECK_DATES=[
+  '2026-07-08','2026-07-29','2026-08-19','2026-09-09','2026-09-30','2026-10-21',
+  '2026-11-11','2026-12-02','2027-01-06',
+];
+function updateMaintenanceReminderBanner(){
+  let bar=document.getElementById('maint-reminder-banner');
+  // Every driver's own profile (bakkie) — not just Pierre's — since each
+  // bakkie needs its own filters/oil checked. Bestuur and Jan don't drive
+  // a bakkie day to day, so the banner stays off their screens.
+  const isDriver = S.screen==='driver' && !!S.driver;
+  const today = isDriver ? todayKey() : null;
+  const msgs=[];
+  if(isDriver){
+    if(FILTER_CHECK_DATES.includes(today)) msgs.push('🔧 Check FILTERS vandag / Check filters today');
+    if(OIL_CHECK_DATES.includes(today)) msgs.push('🛢️ Check OLIE vandag / Check oil today');
+  }
+  if(!msgs.length){ if(bar) bar.remove(); return; }
+  if(!bar){
+    bar=document.createElement('div');
+    bar.id='maint-reminder-banner';
+    document.body.appendChild(bar);
+  }
+  // Sits just under the sync-fail banner (z-index one lower, offset down)
+  // on the rare day both would apply at once, rather than the two
+  // overlapping exactly on top of each other.
+  bar.style.cssText='position:fixed;left:0;right:0;top:'+(STORAGE_OK?'0':'40px')+';z-index:99996;'
+    +'background:var(--gold);color:#5D4037;padding:10px 14px;text-align:center;font-weight:800;'
+    +'font-size:.82rem;box-shadow:0 2px 8px rgba(0,0,0,.2)';
+  bar.innerHTML=msgs.join(' &nbsp;·&nbsp; ');
+}
 
 // If anything blocks a Firestore call without actually erroring it —
 // confirmed possible with Microsoft Edge's Tracking Prevention feature,
@@ -1381,6 +1428,7 @@ document.addEventListener('visibilitychange', ()=>{
   if(document.hidden) return;
   if(S.screen==='parent') renderParentTab(S.parentTab);
   else if(S.screen==='driver' && S.driver) renderDriverTab(S.driverTab);
+  updateMaintenanceReminderBanner(); // re-check the date in case midnight passed while the tablet sat idle
 });
 // Chrome (and others) will silently bump a focused number input's value up
 // or down when the mouse wheel scrolls over it — completely standard
@@ -1846,6 +1894,7 @@ async function loginDriver(id){
   }
   renderDriverTab('route');
   startPolling();
+  updateMaintenanceReminderBanner();
 }
 
 async function loginParent(){
@@ -1861,6 +1910,7 @@ async function loginParent(){
   applyRoleTabs();
   renderParentTab('overview');
   startPolling();
+  updateMaintenanceReminderBanner();
 }
 
 async function loginOffice(){
@@ -1878,6 +1928,7 @@ async function loginOffice(){
   applyRoleTabs();
   renderParentTab('overview');
   startPolling();
+  updateMaintenanceReminderBanner();
 }
 
 // Shows/hides bookkeeping-only tabs depending on role.
@@ -4128,6 +4179,7 @@ async function loanLedgerAdd(nameEnc,sign){
 function logout(){
   stopPolling();
   S.driver=null; S.route=[]; S.expanded=null; S.isOffice=false;
+  updateMaintenanceReminderBanner();
   document.querySelector('#s-parent h2').textContent='Bestuur';
   document.querySelector('#s-parent .tbi').textContent='👑';
   show('login');
@@ -4159,7 +4211,7 @@ function renderDriverTab(tab){
   if(tab==='vordering')   renderVorderingTab(c);
   if(tab==='spanne')      renderSpanneTab(c);
   if(tab==='inspeksies')  renderInspeksiesTab(c);
-  if(tab==='masjiene')    renderPlaceholderTab(c,'🔧 Masjiene','Kom binnekort.');
+  if(tab==='masjiene')    renderMasjieneTab(c);
   if(tab==='summary')     renderSummary(c);
 }
 // Toggles Pierre's extra tabs (Spanne, Inspeksies, Masjiene) — nobody
@@ -5602,8 +5654,342 @@ async function shareInspectionPDF(monthKey){
 // Equipment/machine fuel — Pierre's responsibility alone, and moved off
 // his Dagstaat too, same reasoning as Spanne: his Dagstaat should be a
 // plain match for every other driver's, not carry extra admin fields.
-// (Masjiene tab content will be specified separately — left as a plain
-// placeholder for now, see renderPlaceholderTab.)
+//
+// One list per bakkie/driver (Jasper, Johan, Nickey, Gordon, Pierre
+// himself), for the CURRENT month only — matches the paper version Pierre
+// already uses. Once a month ends its list stops being editable/visible
+// here entirely; from then on it only exists as a PDF (combining every
+// driver's list for that month with totals), reachable from the "Vorige
+// maande" picker below. Nothing is deleted — sList('masjiene_') still
+// finds it — it's just not rendered as a live list any more.
+let MASJ_DATA_CACHE={};
+let MASJ_OPEN_DRIVERS=new Set();
+const MASJ_DRIVER_KEYS=['jasper','johan','nickey','gordon','pierre'];
+const MASJIEN_TYPE_LABELS={brushcutter:'Brushcutter',kettingsaag:'Kettingsaag',blower:'Blower',hedgetrimmer:'Heiningsnyer',grassnyer:'Grassnyer'};
+const MASJIEN_TYPES_ORDER=['brushcutter','kettingsaag','blower','hedgetrimmer','grassnyer'];
+const MASJ_LITER_LABELS={vol:'Vol','3/4':'3/4',half:'Half','1/4':'1/4'};
+const MASJ_LITER_ORDER=['vol','3/4','half','1/4'];
+// Liters actually poured in per fuel fill, by machine + how full the
+// tank/mix bottle was marked as. 2-stroke mix (brushcutter, kettingsaag,
+// blower, hedgetrimmer) and straight/"skoon" petrol (grassnyer) are kept
+// as two completely separate running totals since they're bought and
+// tracked separately. The 1/4 figures weren't given directly — each is
+// taken as half of that machine's "half" figure, following the same
+// vol→3/4→half progression already given; adjust the table here if that
+// assumption turns out to be wrong for any machine.
+const MASJIEN_LITER_VALUES={
+  brushcutter:{vol:0.8,'3/4':0.6,half:0.4,'1/4':0.2},
+  kettingsaag:{vol:0.5,'3/4':0.375,half:0.25,'1/4':0.125},
+  blower:{vol:1,'3/4':0.75,half:0.5,'1/4':0.25},
+  hedgetrimmer:{vol:0.5,'3/4':0.375,half:0.25,'1/4':0.125},
+  grassnyer:{vol:1,'3/4':0.75,half:0.5,'1/4':0.25},
+};
+const MASJ_TWO_STROKE=['brushcutter','kettingsaag','blower','hedgetrimmer'];
+const MASJ_SKOON=['grassnyer'];
+function masjLiterValue(masjien,liters){
+  if(!masjien||!liters) return null;
+  const t=MASJIEN_LITER_VALUES[masjien];
+  return (t && t[liters]!=null) ? t[liters] : null;
+}
+function masjIsTwoStroke(m){ return MASJ_TWO_STROKE.includes(m); }
+function masjIsSkoon(m){ return MASJ_SKOON.includes(m); }
+// Compact D/M/YY display to match the paper log's own date format,
+// stored internally as a plain dateKey (YYYY-MM-DD) like everywhere else.
+function masjDateShort(dk){
+  if(!dk) return '';
+  const [y,m,d]=dk.split('-').map(Number);
+  return d+'/'+m+'/'+String(y).slice(2);
+}
+function sastTimeNow(){
+  return new Intl.DateTimeFormat('en-GB',{timeZone:'Africa/Johannesburg',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date());
+}
+async function getMasjieneMonth(monthKey){
+  if(MASJ_DATA_CACHE[monthKey]) return MASJ_DATA_CACHE[monthKey];
+  const data=await sGet('masjiene_'+monthKey,{});
+  MASJ_DATA_CACHE[monthKey]=data;
+  return data;
+}
+async function saveMasjieneMonth(monthKey,data){
+  MASJ_DATA_CACHE[monthKey]=data;
+  const ok=await sSet('masjiene_'+monthKey,data);
+  if(!ok) alert('⚠️ Kon nie stoor nie — kontroleer die internetverbinding en probeer weer.');
+  return ok;
+}
+function masjDriverTotals(rows){
+  let twoStroke=0, skoon=0;
+  (rows||[]).forEach(r=>{
+    const v=masjLiterValue(r.masjien,r.liters);
+    if(v==null) return;
+    if(masjIsTwoStroke(r.masjien)) twoStroke+=v;
+    else if(masjIsSkoon(r.masjien)) skoon+=v;
+  });
+  return {twoStroke,skoon};
+}
+function masjCombinedTotals(data){
+  let twoStroke=0, skoon=0;
+  MASJ_DRIVER_KEYS.forEach(dk=>{
+    const t=masjDriverTotals(data[dk]);
+    twoStroke+=t.twoStroke; skoon+=t.skoon;
+  });
+  return {twoStroke,skoon};
+}
+
+async function renderMasjieneTab(ct){
+  ct.innerHTML='<div class="loadmsg">Laai... / Loading...</div>';
+  const curMK=inspMonthKey(0);
+  const curData=await getMasjieneMonth(curMK);
+  const combined=masjCombinedTotals(curData);
+
+  const monthsResult=await sList('masjiene_');
+  const pastMonths=monthsResult.keys.map(k=>k.replace('masjiene_','')).filter(mk=>mk!==curMK).sort().reverse();
+
+  ct.innerHTML=`
+    <div class="ovhdr">
+      <h2>🔧 Masjiene — Petrol</h2>
+      <p>${monthLabelForYM(curMK)} · een lys per bakkie — tik die datum/tyd-blokkies om vinnig in te vul</p>
+    </div>
+    <div class="ovgrid">
+      <div class="ovc"><div class="v">${combined.twoStroke.toFixed(2)} L</div><div class="l">2-TAK PETROL (MENGSEL)</div></div>
+      <div class="ovc"><div class="v">${combined.skoon.toFixed(2)} L</div><div class="l">SKOON PETROL (GRASSNYERS)</div></div>
+    </div>
+    <div id="masj-drivers"></div>
+    <button class="btn-sec btn" style="margin-top:10px" onclick="viewMasjienePDFFor('${curMK}')">📄 PDF (hierdie maand tot dusver)</button>
+
+    <div class="divlbl" style="margin-top:20px;border-top:1px solid var(--brd);padding-top:12px">VORIGE MAANDE — PDF</div>
+    <p style="font-size:.78rem;color:var(--t2);margin:2px 0 8px">Sodra 'n maand verby is, is die lys nie meer hier wysigbaar nie — kyk of stuur die PDF hieronder.</p>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select class="inp" id="masj-past-month" style="flex:1">
+        ${pastMonths.length ? pastMonths.map(mk=>`<option value="${mk}">${monthLabelForYM(mk)}</option>`).join('') : '<option value="">Geen vorige maande nie</option>'}
+      </select>
+      <button class="btn-sec btn" style="flex-shrink:0;width:auto;padding:10px 16px" ${pastMonths.length?'':'disabled'} onclick="viewMasjienePastPDF()">📄 Wys PDF</button>
+    </div>
+    ${pastMonths.length?`<div style="display:flex;gap:8px;margin-top:8px">
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="downloadMasjienePastPDF()">⬇️ Laai af</button>
+      <button class="btn" style="flex:1;font-size:.8rem" onclick="shareMasjienePastPDF()">📤 Stuur</button>
+    </div>`:''}
+  `;
+
+  const holder=document.getElementById('masj-drivers');
+  MASJ_DRIVER_KEYS.forEach(dk=>{
+    const d=DRIVERS[dk];
+    const rows=curData[dk]||[];
+    const isOpen=MASJ_OPEN_DRIVERS.has(dk);
+    const totals=masjDriverTotals(rows);
+
+    const hdr=el('div');
+    hdr.style.cssText='display:flex;justify-content:space-between;align-items:center;cursor:pointer;background:var(--g1);border:2px solid var(--g2);border-radius:var(--r);padding:12px 16px;margin-top:10px';
+    hdr.innerHTML=`<div style="font-weight:800;font-size:.92rem">${isOpen?'▾':'▸'} ${d?d.icon:'🔧'} ${d?d.name:dk}</div>
+      <div style="font-size:.7rem;color:var(--t2);font-weight:700">${rows.length} inskrywing(s)</div>`;
+    hdr.onclick=()=>{ if(MASJ_OPEN_DRIVERS.has(dk)) MASJ_OPEN_DRIVERS.delete(dk); else MASJ_OPEN_DRIVERS.add(dk); renderMasjieneTab(document.getElementById('d-content')); };
+    holder.appendChild(hdr);
+    if(!isOpen) return;
+
+    const box=el('div');
+    box.style.cssText='margin-top:2px;background:var(--card);border:1px solid var(--brd);border-top:none;border-radius:0 0 10px 10px;overflow:hidden';
+    box.innerHTML=`
+      <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">
+        <div style="min-width:664px">
+          <div style="display:grid;grid-template-columns:24px 62px 54px 110px 118px 74px 58px 58px 46px 54px;gap:4px;padding:6px 4px;background:var(--bg);font-size:.6rem;font-weight:800;color:var(--t2)">
+            <span></span><span>DATUM</span><span>TYD</span><span>NAAM</span><span>MASJIEN</span><span>LITERS</span><span style="font-size:.52rem;line-height:1.15;white-space:normal">Netheid v. masjien</span><span style="font-size:.52rem;line-height:1.15;white-space:normal">Netheid v. persoon</span><span>FOUTE</span><span>L</span>
+          </div>
+          <div id="masj-body-${dk}">${rows.length?rows.map((r,idx)=>masjRowHtml(dk,idx,r)).join(''):'<div style="padding:14px 10px;text-align:center;color:var(--t2);font-size:.8rem">Nog geen inskrywings vir hierdie maand nie.</div>'}</div>
+        </div>
+      </div>
+      <div style="padding:9px 12px;border-top:1px solid var(--brd);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+        <button class="btn-sec btn" style="width:auto;padding:8px 16px;font-size:.8rem" onclick="masjAddRow('${dk}')">＋ Voeg ry by</button>
+        <div style="font-size:.76rem;font-weight:700;color:var(--g8)">2-tak: ${totals.twoStroke.toFixed(2)} L · Skoon: ${totals.skoon.toFixed(2)} L</div>
+      </div>`;
+    holder.appendChild(box);
+  });
+}
+function masjRowHtml(driverKey, idx, r){
+  const v=masjLiterValue(r.masjien,r.liters);
+  const avgTxt=v!=null ? v.toFixed(2)+'L' : '—';
+  const chkBtn=(field,val)=>{
+    const label=val==='check'?'✓':val==='cross'?'✗':'—';
+    const color=val==='check'?'var(--g8)':val==='cross'?'var(--red)':'var(--t3)';
+    return `<button onclick="masjCycleCheck('${driverKey}',${idx},'${field}')" style="width:100%;padding:5px 0;border:1px solid var(--brd);border-radius:6px;background:var(--bg);color:${color};font-weight:800;font-size:.85rem">${label}</button>`;
+  };
+  return `<div style="display:grid;grid-template-columns:24px 62px 54px 110px 118px 74px 58px 58px 46px 54px;gap:4px;padding:6px 4px;border-top:1px solid var(--brd);align-items:center;font-size:.74rem">
+    <button onclick="masjRemoveRow('${driverKey}',${idx})" title="Verwyder ry" style="width:20px;height:20px;border-radius:50%;background:var(--bg);border:1px solid var(--brd);color:var(--red);font-size:.62rem;padding:0">✕</button>
+    <button onclick="masjToggleDate('${driverKey}',${idx})" style="padding:5px 2px;border:1px solid var(--brd);border-radius:6px;background:var(--bg);font-size:.7rem;color:${r.date?'var(--text)':'var(--t3)'}">${r.date?masjDateShort(r.date):'tik'}</button>
+    <button onclick="masjToggleTime('${driverKey}',${idx})" style="padding:5px 2px;border:1px solid var(--brd);border-radius:6px;background:var(--bg);font-size:.7rem;color:${r.time?'var(--text)':'var(--t3)'}">${r.time||'tik'}</button>
+    <input class="inp" value="${(r.name||'').replace(/"/g,'&quot;')}" placeholder="Naam" style="padding:5px;font-size:.72rem" onchange="masjUpdateField('${driverKey}',${idx},'name',this.value)">
+    <select class="inp" style="padding:5px;font-size:.7rem" onchange="masjUpdateField('${driverKey}',${idx},'masjien',this.value)">
+      <option value="" ${!r.masjien?'selected':''}>—</option>
+      ${MASJIEN_TYPES_ORDER.map(mk=>`<option value="${mk}" ${r.masjien===mk?'selected':''}>${MASJIEN_TYPE_LABELS[mk]}</option>`).join('')}
+    </select>
+    <select class="inp" style="padding:5px;font-size:.7rem" onchange="masjUpdateField('${driverKey}',${idx},'liters',this.value)">
+      <option value="" ${!r.liters?'selected':''}>—</option>
+      ${MASJ_LITER_ORDER.map(lk=>`<option value="${lk}" ${r.liters===lk?'selected':''}>${MASJ_LITER_LABELS[lk]}</option>`).join('')}
+    </select>
+    ${chkBtn('netMasjien', r.netMasjien)}
+    ${chkBtn('netPersoon', r.netPersoon)}
+    ${chkBtn('foute', r.foute)}
+    <div style="text-align:center;font-weight:700;color:var(--g8)">${avgTxt}</div>
+  </div>`;
+}
+async function masjAddRow(driverKey){
+  const mk=inspMonthKey(0);
+  const data=await getMasjieneMonth(mk);
+  if(!data[driverKey]) data[driverKey]=[];
+  data[driverKey].push({date:'',time:'',name:'',masjien:'',liters:'',netMasjien:'',netPersoon:'',foute:''});
+  MASJ_OPEN_DRIVERS.add(driverKey);
+  const ok=await saveMasjieneMonth(mk,data);
+  if(ok) renderMasjieneTab(document.getElementById('d-content'));
+}
+async function masjRemoveRow(driverKey, idx){
+  if(!confirm('Verwyder hierdie ry?')) return;
+  const mk=inspMonthKey(0);
+  const data=await getMasjieneMonth(mk);
+  if(data[driverKey]) data[driverKey].splice(idx,1);
+  const ok=await saveMasjieneMonth(mk,data);
+  if(ok) renderMasjieneTab(document.getElementById('d-content'));
+}
+async function masjUpdateField(driverKey, idx, field, value){
+  const mk=inspMonthKey(0);
+  const data=await getMasjieneMonth(mk);
+  if(!data[driverKey]||!data[driverKey][idx]) return;
+  data[driverKey][idx][field]=value;
+  const ok=await saveMasjieneMonth(mk,data);
+  if(ok) renderMasjieneTab(document.getElementById('d-content'));
+}
+async function masjToggleDate(driverKey, idx){
+  const mk=inspMonthKey(0);
+  const data=await getMasjieneMonth(mk);
+  const row=data[driverKey]&&data[driverKey][idx];
+  if(!row) return;
+  row.date = row.date ? '' : todayKey();
+  const ok=await saveMasjieneMonth(mk,data);
+  if(ok) renderMasjieneTab(document.getElementById('d-content'));
+}
+async function masjToggleTime(driverKey, idx){
+  const mk=inspMonthKey(0);
+  const data=await getMasjieneMonth(mk);
+  const row=data[driverKey]&&data[driverKey][idx];
+  if(!row) return;
+  row.time = row.time ? '' : sastTimeNow();
+  const ok=await saveMasjieneMonth(mk,data);
+  if(ok) renderMasjieneTab(document.getElementById('d-content'));
+}
+async function masjCycleCheck(driverKey, idx, field){
+  const mk=inspMonthKey(0);
+  const data=await getMasjieneMonth(mk);
+  const row=data[driverKey]&&data[driverKey][idx];
+  if(!row) return;
+  const order=['','check','cross'];
+  row[field]=order[(order.indexOf(row[field]||'')+1)%order.length];
+  const ok=await saveMasjieneMonth(mk,data);
+  if(ok) renderMasjieneTab(document.getElementById('d-content'));
+}
+// One combined PDF per month — every driver's list one after another,
+// each with its own 2-tak/skoon subtotal, then a grand total for the
+// whole month across all bakkies. This is also the ONLY way to see a
+// past month's list again once it's rolled over, per how the live tab
+// works above.
+function buildMasjienePDF(monthKey, data){
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF();
+  let y=pdfLetterhead(doc,18);
+  const label=monthLabelForYM(monthKey);
+  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(20,20,20);
+  doc.text('MASJIENE — PETROL LYS — '+label,15,y); y+=10;
+
+  let grandTwoStroke=0, grandSkoon=0;
+  const chk=s=>s==='check'?'✓':s==='cross'?'✗':'—';
+
+  MASJ_DRIVER_KEYS.forEach(dk=>{
+    const rows=data[dk]||[];
+    const driverLabel=DRIVERS[dk]?DRIVERS[dk].name:dk;
+    if(y>255){ doc.addPage(); y=20; }
+    doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(27,94,32);
+    doc.text(driverLabel,15,y); y+=6;
+    doc.setDrawColor(200,200,200); doc.line(15,y,195,y); y+=5;
+
+    if(!rows.length){
+      doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(140,140,140);
+      doc.text('Geen inskrywings nie.',15,y); y+=10;
+      return;
+    }
+
+    doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(90,90,90);
+    doc.text('Datum',15,y); doc.text('Tyd',32,y); doc.text('Naam',48,y); doc.text('Masjien',80,y);
+    doc.text('Liters',112,y); doc.text('Foute',156,y); doc.text('L',172,y);
+    // These two headers are the full words, not initials — too long for
+    // their column at the normal header size, so they're shrunk and
+    // wrapped onto two lines instead of being cut down to abbreviations.
+    doc.setFontSize(5.3);
+    doc.text(doc.splitTextToSize('Netheid v. masjien',13),126,y-2);
+    doc.text(doc.splitTextToSize('Netheid v. persoon',13),140,y-2);
+    doc.setFontSize(7.5);
+    y+=7;
+    doc.setDrawColor(230,230,230); doc.line(15,y,195,y); y+=4;
+
+    let driverTwoStroke=0, driverSkoon=0;
+    doc.setFont('helvetica','normal'); doc.setFontSize(7.5); doc.setTextColor(20,20,20);
+    rows.forEach(r=>{
+      if(y>278){ doc.addPage(); y=20; }
+      const v=masjLiterValue(r.masjien,r.liters);
+      if(v!=null){
+        if(masjIsTwoStroke(r.masjien)) driverTwoStroke+=v;
+        else if(masjIsSkoon(r.masjien)) driverSkoon+=v;
+      }
+      doc.text(masjDateShort(r.date)||'—',15,y);
+      doc.text(r.time||'—',32,y);
+      doc.text(doc.splitTextToSize(r.name||'—',28),48,y);
+      doc.text(MASJIEN_TYPE_LABELS[r.masjien]||'—',80,y);
+      doc.text(MASJ_LITER_LABELS[r.liters]||'—',112,y);
+      doc.text(chk(r.netMasjien),128,y);
+      doc.text(chk(r.netPersoon),142,y);
+      doc.text(chk(r.foute),156,y);
+      doc.text(v!=null?v.toFixed(2):'—',172,y);
+      y+=5.5;
+    });
+    doc.setDrawColor(220,220,220); doc.line(15,y-1,195,y-1); y+=4;
+    doc.setFont('helvetica','bold'); doc.setFontSize(8.5); doc.setTextColor(20,20,20);
+    doc.text(`Totaal — 2-tak: ${driverTwoStroke.toFixed(2)} L · Skoon: ${driverSkoon.toFixed(2)} L`,15,y); y+=10;
+
+    grandTwoStroke+=driverTwoStroke; grandSkoon+=driverSkoon;
+  });
+
+  if(y>260){ doc.addPage(); y=20; }
+  doc.setDrawColor(27,94,32); doc.setLineWidth(0.6); doc.line(15,y,195,y); y+=8;
+  doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(27,94,32);
+  doc.text(`MAAND TOTAAL — 2-tak: ${grandTwoStroke.toFixed(2)} L · Skoon petrol: ${grandSkoon.toFixed(2)} L`,15,y);
+
+  return doc.output('blob');
+}
+async function getMasjienePdfBlobFor(monthKey){
+  const data=MASJ_DATA_CACHE[monthKey] || await sGet('masjiene_'+monthKey, {});
+  return buildMasjienePDF(monthKey, data);
+}
+async function viewMasjienePDFFor(monthKey){ viewPDFBlob(await getMasjienePdfBlobFor(monthKey)); }
+async function downloadMasjienePDFFor(monthKey){ downloadPDF(await getMasjienePdfBlobFor(monthKey), 'Masjiene_'+monthKey+'.pdf'); }
+async function shareMasjienePDFFor(monthKey){
+  const blob=await getMasjienePdfBlobFor(monthKey);
+  const label=monthLabelForYM(monthKey);
+  await shareOrDownloadPDF(blob,'Masjiene_'+monthKey+'.pdf','Masjiene petrol — '+label,label);
+  toast('📄 Masjiene PDF gereed');
+}
+function masjSelectedPastMonth(){
+  const sel=document.getElementById('masj-past-month');
+  return sel && sel.value ? sel.value : null;
+}
+async function viewMasjienePastPDF(){
+  const mk=masjSelectedPastMonth();
+  if(!mk){ toast('Geen vorige maande nie'); return; }
+  await viewMasjienePDFFor(mk);
+}
+async function downloadMasjienePastPDF(){
+  const mk=masjSelectedPastMonth();
+  if(!mk) return;
+  await downloadMasjienePDFFor(mk);
+}
+async function shareMasjienePastPDF(){
+  const mk=masjSelectedPastMonth();
+  if(!mk) return;
+  await shareMasjienePDFFor(mk);
+}
 
 async function renderPierreTeamAdmin(ct){
   await ensureWorkerRosterSeeded();
@@ -7205,7 +7591,16 @@ function buildDayReportPDF(driverName, dateLbl, route, vehicle, workers){
 // breaks she's typed in AND wrapping any line that's still too long for
 // the page — returning the y position to carry on from.
 function pdfClientBlock(doc, address, name, x, y, maxWidth){
-  doc.text(address, x, y); y+=6;
+  // Address can now include line breaks too (multi-line addresses via
+  // Shift+Enter in the edit-client form), so it is split and wrapped the
+  // same way the name lines already are below, instead of being handed
+  // to doc.text() as one raw string.
+  const addrLines=(address||'').split('\n').map(l=>l.trim()).filter(l=>l.length);
+  addrLines.forEach(line=>{
+    const wrapped=doc.splitTextToSize(line, maxWidth||150);
+    doc.text(wrapped, x, y);
+    y+=wrapped.length*6;
+  });
   const rawLines=(name||'').split('\n').map(l=>l.trim()).filter(l=>l.length);
   rawLines.forEach(line=>{
     const wrapped=doc.splitTextToSize(line, maxWidth||150);
@@ -7980,7 +8375,8 @@ function showEditClientModal(encKey){
       'n Verandering hier word op elke bestaande faktuur en staat vir hierdie kliënt reggemaak — nie net op nuwes vorentoe nie.
     </p>
     <div><div class="flbl" style="margin-bottom:5px">Adres / Address *</div>
-      <input class="inp" id="ecl-addr" value="${c.address.replace(/"/g,'&quot;')}"></div>
+      <p style="font-size:.74rem;color:var(--t2);margin:0 0 4px">Shift + Enter vir 'n nuwe reël, langer adresse / Shift + Enter for a new line, longer addresses.</p>
+      <textarea class="inp" id="ecl-addr" rows="2" style="resize:vertical;font-family:inherit" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();submitEditClient('${encKey}');}">${c.address.replace(/</g,'&lt;')}</textarea></div>
     <div><div class="flbl" style="margin-bottom:5px">Naam (opsioneel) / Name (optional)</div>
       <p style="font-size:.74rem;color:var(--t2);margin:0 0 4px">Vir besighede wat 'n volledige naam/adres op fakture en state moet wys — druk Enter vir 'n nuwe reël.</p>
       <textarea class="inp" id="ecl-name" rows="2" style="resize:vertical;font-family:inherit">${(c.name||'').replace(/</g,'&lt;')}</textarea></div>
@@ -8056,7 +8452,7 @@ async function reconcileAllLedgers(){
         cc.balance=cc.entries.reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
         transaction.set(ref, cc);
         return cc;
-      }), 8000, 'reconcileAll-'+key);
+      }), 15000, 'reconcileAll-'+key);
       if(client){ CACHE.ledger={...CACHE.ledger, [key]:client}; fixed++; }
       else failed++;
     }catch(e){
@@ -8306,21 +8702,33 @@ function showClientLedger(key,c){
 async function reconcileClientLedger(key){
   if(!confirm('Dit verwyder enige rekening-inskrywings wat na fakture verwys wat nie meer bestaan nie (bv. reeds geskrap), en herbereken die saldo. Ander inskrywings (betalings, regstellings, krediet notas) word nie geraak nie. Voortgaan?')) return;
   const liveInvIds=new Set(getInvoices().map(i=>i.id));
+  const runOnce=(ms)=>withTimeout(FSTransaction(async (transaction)=>{
+    const ref=FS_DB.collection('ledger').doc(key);
+    const doc=await transaction.get(ref);
+    if(!doc.exists) return null;
+    const c=doc.data();
+    c.entries=(c.entries||[]).filter(e=>!e.invId || liveInvIds.has(e.invId));
+    c.balance=c.entries.reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
+    transaction.set(ref, c);
+    return c;
+  }), ms, 'reconcileLedger-transaction');
+  // This is a manual, one-off repair (not something run repeatedly in a
+  // sequence like login), so it can afford a much longer wait than the
+  // usual 3s storage timeout — on a slow connection a transaction can
+  // genuinely still be in flight past 8s without anything being wrong.
+  // A single quiet retry with an even longer allowance catches that case
+  // instead of immediately reporting failure on the first slow attempt.
   let client;
   try{
-    client = await withTimeout(FSTransaction(async (transaction)=>{
-      const ref=FS_DB.collection('ledger').doc(key);
-      const doc=await transaction.get(ref);
-      if(!doc.exists) return null;
-      const c=doc.data();
-      c.entries=(c.entries||[]).filter(e=>!e.invId || liveInvIds.has(e.invId));
-      c.balance=c.entries.reduce((s,e)=>s+(e.debit||0)-(e.credit||0),0);
-      transaction.set(ref, c);
-      return c;
-    }), 8000, 'reconcileLedger-transaction');
+    try{
+      client = await runOnce(15000);
+    }catch(firstErr){
+      if(!/^Timeout:/.test(firstErr&&firstErr.message||'')) throw firstErr;
+      client = await runOnce(30000);
+    }
   }catch(e){
     console.error('Herstel rekening het misluk:', e);
-    alert('Kon nie die rekening herstel nie.\n\nRede / Reason: '+(e&&e.message?e.message:e)+'\n\nStuur asb hierdie boodskap aan — dit help om die probleem reg te maak.');
+    alert('Kon nie die rekening herstel nie — dit duur te lank, waarskynlik swak internetverbinding.\n\nRede / Reason: '+(e&&e.message?e.message:e)+'\n\nKontroleer die internetverbinding en probeer weer. Stuur asb hierdie boodskap aan as dit steeds misluk — dit help om die probleem reg te maak.');
     return;
   }
   if(!client){ alert('Kon nie hierdie kliënt se rekening kry nie.'); return; }
@@ -9956,7 +10364,9 @@ function showQuoteDetail(id){
   document.getElementById('quote-detail-modal')?.remove();
   const hidePrice=_quoteHidePriceForViewer(q);
   const priceKnown = q.status!=='assigned' && (q.quotedAmount||0)>0;
-  const canFinalize=!S.isOffice; // only Bestuur prices/decides — Jan can send drivers for quotes but not price them
+  // Accepting/declining/undoing is a Bestuur-or-Jan decision, not tied to
+  // who can see or set the price — Jan decides without seeing the amount.
+  const canDecide=S.screen==='parent';
   const durTxt = (q.durationHrs||q.durationMin) ?
     `${q.durationHrs?q.durationHrs+'u ':''}${q.durationMin?q.durationMin+'min':''}`.trim() : '';
   const row=(label,val)=> val?`<div style="padding:8px 0;border-bottom:1px solid var(--brd)">
@@ -9970,7 +10380,7 @@ function showQuoteDetail(id){
     </div>
     <div style="margin-bottom:6px;display:flex;align-items:center;gap:6px">
       ${quoteStatusBadge(q)}
-      ${canFinalize&&q.status==='declined'?`<button onclick="unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
+      ${canDecide&&q.status==='declined'?`<button onclick="unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
           style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
                  background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
     </div>
@@ -9995,7 +10405,7 @@ function showQuoteDetail(id){
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
   document.body.appendChild(bg);
 }
-function quoteCardHtml(q,canFinalize,hidePrice){
+function quoteCardHtml(q,canDecide,canPrice,hidePrice){
   const durTxt = (q.durationHrs||q.durationMin) ?
     `${q.durationHrs?q.durationHrs+'u ':''}${q.durationMin?q.durationMin+'min':''}`.trim() : '';
   const priceKnown = q.status!=='assigned' && (q.quotedAmount||0)>0;
@@ -10015,10 +10425,10 @@ function quoteCardHtml(q,canFinalize,hidePrice){
         ${!hidePrice?(priceKnown?`<div style="font-weight:800;font-size:1.05rem">R${q.quotedAmount||0}</div>`:`<div style="font-size:.72rem;color:var(--t3)">Nog nie geprys nie</div>`):''}
         <div style="margin-top:4px;display:flex;align-items:center;gap:4px;justify-content:flex-end">
           ${quoteStatusBadge(q)}
-          ${canFinalize&&q.status==='declined'?`<button onclick="event.stopPropagation();unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
+          ${canDecide&&q.status==='declined'?`<button onclick="event.stopPropagation();unDeclineQuote('${q.id}')" title="Herstel kwotasie / Undo"
               style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
                      background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
-          ${canFinalize&&q.status==='accepted'?`<button onclick="event.stopPropagation();unAcceptQuote('${q.id}')" title="Terug na wag op besluit / Undo"
+          ${canDecide&&q.status==='accepted'?`<button onclick="event.stopPropagation();unAcceptQuote('${q.id}')" title="Terug na wag op besluit / Undo"
               style="width:auto;flex-shrink:0;padding:2px 7px;font-size:.68rem;font-weight:700;color:var(--blue);
                      background:var(--bg);border:1.5px solid var(--brd);border-radius:100px">↩</button>`:''}
         </div>
@@ -10029,16 +10439,19 @@ function quoteCardHtml(q,canFinalize,hidePrice){
       <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:8px 10px;font-size:.76rem" onclick="viewQuotePDF('${q.id}')">👁</button>
       <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:8px 10px;font-size:.76rem" onclick="downloadQuotePDF('${q.id}')">⬇️</button>
     </div>`:''}
-    ${canFinalize&&q.status==='pending'&&!priceKnown?`<div style="display:flex;gap:8px;margin-top:8px">
+    ${canPrice&&q.status==='pending'&&!priceKnown?`<div style="display:flex;gap:8px;margin-top:8px">
       <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="showQuoteForm('${q.id}')">💰 Formaliseer prys</button>
+      ${canDecide?`<button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="declineQuote('${q.id}')">✕ Verwerp</button>`:''}
+    </div>`:''}
+    ${!canPrice&&canDecide&&q.status==='pending'&&!priceKnown?`<div style="display:flex;gap:8px;margin-top:8px">
       <button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
     </div>`:''}
-    ${canFinalize&&priceKnown&&q.status==='pending'?`<div style="display:flex;gap:6px;margin-top:8px">
-      <button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:12px;font-size:.78rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig prys</button>
-      <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="acceptQuote('${q.id}')">✓ Aanvaar</button>
-      <button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800;color:var(--red)" onclick="declineQuote('${q.id}')">✕ Verwerp</button>
+    ${priceKnown&&q.status==='pending'&&(canPrice||canDecide)?`<div style="display:flex;gap:6px;margin-top:8px">
+      ${canPrice?`<button class="btn-sec btn" style="width:auto;flex-shrink:0;padding:12px;font-size:.78rem" onclick="showQuoteForm('${q.id}')">✏️ Wysig prys</button>`:''}
+      ${canDecide?`<button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="acceptQuote('${q.id}')">✓ Aanvaar</button>
+      <button class="btn btn-sec" style="flex:1;padding:12px;font-size:.9rem;font-weight:800;color:var(--red)" onclick="declineQuote('${q.id}')">✕ Verwerp</button>`:''}
     </div>`:''}
-    ${canFinalize&&q.status==='accepted'?`<div style="display:flex;gap:6px;margin-top:8px">
+    ${canDecide&&q.status==='accepted'?`<div style="display:flex;gap:6px;margin-top:8px">
       <button class="btn btn-blue" style="flex:1;padding:12px;font-size:.9rem;font-weight:800" onclick="openClientForm({fromQuote:'${q.id}'})">📅 Sorteer in / Voeg by rooster</button>
     </div>`:''}
   </div>`;
@@ -10049,7 +10462,7 @@ function renderQuotesDriver(ct){
   ct.innerHTML=`
     <button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>
     ${mine.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:30px 0">Geen kwotasies opgeneem nie.</p>':
-      mine.map(q=>quoteCardHtml(q,false,q.createdBy!==S.driver)).join('')}`;
+      mine.map(q=>quoteCardHtml(q,false,false,q.createdBy!==S.driver)).join('')}`;
 }
 // Pierre can send any driver out for a quote and track what's happening
 // with all of them, but — like Jan — never sets or sees the price. Only
@@ -10060,8 +10473,8 @@ function renderPierreQuotesView(ct){
   const pending=all.filter(q=>q.status==='pending');
   ct.innerHTML=`
     <button class="btn btn-sec" onclick="showQuoteRequestForm()">📍 Stuur drywer vir kwotasie</button>
-    ${quoteSectionHtml('assigned','WAG VIR BESOEK',' · bestuurder moet nog gaan kyk',assigned,false,true,'Geen versoeke wat wag nie.')}
-    ${quoteSectionHtml('pending','WAG OP BESLUIT','',pending,false,true,'Geen kwotasies wat wag nie.')}`;
+    ${quoteSectionHtml('assigned','WAG VIR BESOEK',' · bestuurder moet nog gaan kyk',assigned,false,false,true,'Geen versoeke wat wag nie.')}
+    ${quoteSectionHtml('pending','WAG OP BESLUIT','',pending,false,false,true,'Geen kwotasies wat wag nie.')}`;
 }
 // Which of the three sections are expanded — all open by default so this
 // looks and behaves the same as before until she actually taps a heading
@@ -10072,7 +10485,7 @@ function toggleQuoteSection(key){
   else QUOTES_OPEN_SECTIONS.add(key);
   refreshQuotesScreen();
 }
-function quoteSectionHtml(key, title, subtitle, items, canFinalize, hidePrice, emptyMsg){
+function quoteSectionHtml(key, title, subtitle, items, canDecide, canPrice, hidePrice, emptyMsg){
   const isOpen=QUOTES_OPEN_SECTIONS.has(key);
   const hdr=`<div class="divlbl" style="cursor:pointer;display:flex;align-items:center;gap:4px" onclick="toggleQuoteSection('${key}')">
     <span>${isOpen?'▾':'▸'} ${title} (${items.length})</span>${subtitle?`<span style="font-weight:400;color:var(--t3)">${subtitle}</span>`:''}
@@ -10080,14 +10493,19 @@ function quoteSectionHtml(key, title, subtitle, items, canFinalize, hidePrice, e
   if(!isOpen) return hdr;
   return hdr + (items.length===0
     ? `<p style="color:var(--t2);font-size:.85rem;padding:10px 0">${emptyMsg}</p>`
-    : items.map(q=>quoteCardHtml(q,canFinalize,hidePrice)).join(''));
+    : items.map(q=>quoteCardHtml(q,canDecide,canPrice,hidePrice)).join(''));
 }
 function renderQuotesParent(ct){
   const all=getQuotes();
   const assigned=all.filter(q=>q.status==='assigned');
   const pending=all.filter(q=>q.status==='pending');
   const accepted=all.filter(q=>q.status==='accepted');
-  const canFinalize=!S.isOffice; // only Bestuur prices/decides — Jan can send drivers for quotes but not price them
+  // Pricing (setting/editing the amount) stays Bestuur-only, but deciding
+  // — accept, decline, undo, and sorting an accepted quote into the
+  // schedule — is now something Jan can do too, same as Bestuur. Jan just
+  // never sees the rand amount while doing it.
+  const canPrice=!S.isOffice;
+  const canDecide=true;
   const hidePrice=!!S.isOffice;
   // Declined quotes and ones already accepted-and-scheduled were piling up
   // in a "VERLEDE" section forever with no way to clear them — she already
@@ -10098,11 +10516,11 @@ function renderQuotesParent(ct){
   // removes any protection against; the record itself is just no longer
   // surfaced here once it's done.
   ct.innerHTML=`
-    ${canFinalize?'<button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>':''}
+    ${canPrice?'<button class="btn btn-blue" onclick="showQuoteForm()">＋ Nuwe kwotasie / New quote</button>':''}
     <button class="btn btn-sec" style="margin-top:8px" onclick="showQuoteRequestForm()">📍 Stuur drywer vir kwotasie</button>
-    ${quoteSectionHtml('assigned','WAG VIR BESOEK',' · bestuurder moet nog gaan kyk',assigned,canFinalize,hidePrice,'Geen versoeke wat wag nie.')}
-    ${quoteSectionHtml('pending','WAG OP BESLUIT','',pending,canFinalize,hidePrice,'Geen kwotasies wat wag nie.')}
-    ${quoteSectionHtml('accepted','✓ AANVAARDE KWOTASIES',' · werk wat gedoen moet word — nog nie ingesorteer nie',accepted,canFinalize,hidePrice,'Geen aanvaarde kwotasies wat wag om ingesorteer te word nie.')}`;
+    ${quoteSectionHtml('assigned','WAG VIR BESOEK',' · bestuurder moet nog gaan kyk',assigned,canDecide,canPrice,hidePrice,'Geen versoeke wat wag nie.')}
+    ${quoteSectionHtml('pending','WAG OP BESLUIT','',pending,canDecide,canPrice,hidePrice,'Geen kwotasies wat wag nie.')}
+    ${quoteSectionHtml('accepted','✓ AANVAARDE KWOTASIES',' · werk wat gedoen moet word — nog nie ingesorteer nie',accepted,canDecide,canPrice,hidePrice,'Geen aanvaarde kwotasies wat wag om ingesorteer te word nie.')}`;
 }
 
 function showQuoteForm(editId){
