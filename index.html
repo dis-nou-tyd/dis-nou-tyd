@@ -1129,7 +1129,7 @@ let POLL_SLOW_TIMER=null;
 // same page (bypassing cache) and compares its own version string against
 // what's actually published, surfacing a reload prompt instead of the
 // person having no way to know they're behind.
-const APP_VERSION = '2026-08-06-82'; // bump this string every time the file is updated/re-uploaded
+const APP_VERSION = '2026-08-06-83'; // bump this string every time the file is updated/re-uploaded
 let LAST_VERSION_CHECK=0;
 let VERSION_BANNER_SHOWN=false;
 async function checkForNewVersion(){
@@ -2092,6 +2092,7 @@ function renderYMAccordion(host, items, dateGetter, amountGetter, openYears, sel
   host.innerHTML=''; host.appendChild(wrap);
 }
 async function renderPayroll(ct){
+  await saveOpenPayrollGroupIfAny();
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
               ['uitgawes','🧾','Uitgawes'],['kleinkas','💵','Kleinkas'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
   ct.innerHTML=`
@@ -2108,7 +2109,22 @@ async function renderPayroll(ct){
   else if(BK_SUBTAB==='fakture') renderFaktuurTools(document.getElementById('bk-body'));
   else await renderExpenses(document.getElementById('bk-body'));
 }
-function renderWagesInto(){ renderWages(document.getElementById('bk-body')); }
+// A per-row "Stoor week" or the payslip button explicitly saves before
+// generating anything — but simply navigating away another way (switching
+// to a different bakkie, a different Boekhouding sub-tab like Inkomste,
+// or a different top-nav tab entirely and back) used to just tear this
+// screen down and rebuild it from whatever was last persisted, silently
+// discarding any custom aftrekking, kommissie, or other field typed in
+// but never explicitly saved — which is exactly why those edits could
+// seem to vanish and never reach the final payslip PDF. This is called
+// right before every one of those navigations tears the DOM down, so an
+// in-progress edit is captured first instead of being lost.
+async function saveOpenPayrollGroupIfAny(){
+  if(document.querySelectorAll('#pr-body .pr-row').length===0) return;
+  const wkKey=payWeekKey(mondayOfWeek(PAY_WEEK_OFFSET));
+  await saveCurrentGroupRows(wkKey);
+}
+async function renderWagesInto(){ await saveOpenPayrollGroupIfAny(); renderWages(document.getElementById('bk-body')); }
 function renderIncomeInto(){ renderIncome(document.getElementById('bk-body')); }
 function renderExpensesInto(){ renderExpenses(document.getElementById('bk-body')); }
 function renderBankInto(){ renderBank(document.getElementById('bk-body')); }
@@ -5841,6 +5857,7 @@ document.querySelectorAll('#p-tabs .tab').forEach(t=>{
 });
 
 async function renderParentTab(tab){
+  await saveOpenPayrollGroupIfAny();
   if(S.isOffice && (tab==='statements' || tab==='ledger' || tab==='payroll')) tab='overview';
   S.parentTab=tab;
   document.querySelectorAll('#p-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===tab));
