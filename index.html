@@ -442,11 +442,12 @@ input[type=number]{-moz-appearance:textfield}
   <div class="content" id="d-content"></div>
 </div>
 
-<!-- PARENT -->
+<!-- PARENT (also used by Melizza — same screen, restricted tabs) -->
 <div id="s-parent" class="screen">
   <div class="topbar">
     <div class="tbi">👑</div>
     <div class="tbt"><h2>Bestuur</h2><p><span id="p-date">–</span> <span id="p-sync"></span></p></div>
+    <button class="outbtn" id="p-refresh" style="display:none;margin-right:6px" title="Verfris data / Refresh">🔄</button>
     <button class="outbtn" id="p-out">Uitlog</button>
   </div>
   <div class="tabs" id="p-tabs">
@@ -470,6 +471,7 @@ const CLIENT_MASTER = [{"code":"3DE001","name":"3E LAAN 24 SKULD","d120":0.0,"d9
 // ══════════════════ CONFIG ════════════════════════════════════════════════════
 const PARENT_PIN = '2580';
 const OFFICE_PIN = '1987';
+const MELIZZA_PIN = '1998';
 const DRIVERS = {
   jasper: {name:'Jasper', icon:'🌿', color:'#2E7D32', pin:'1',
     workers:['Pierre Jantjies','Mervin Nero','Lionel Pieterse','Dawid Faro','Ismael'],
@@ -1761,29 +1763,37 @@ function initLogin(){
   const grid = document.getElementById('dbtn-grid');
   grid.innerHTML='';
 
-  // Parent first (full width)
+  // Admin-style roles (Bestuur/Jan/Pierre/Melizza) are sized the same small
+  // way as the driver buttons below so all of them fit neatly in the 2-col
+  // grid, instead of each taking a full-width row.
   const pb=document.createElement('button');
-  pb.className='dbtn pbtn';
+  pb.className='dbtn';
   pb.innerHTML='<div class="dav" style="background:#795548">👑</div><span>Bestuur</span>';
   pb.onclick=()=>openPin('parents');
   grid.appendChild(pb);
 
-  // Office role (Jan) - full width
+  // Office role (Jan)
   const ob=document.createElement('button');
-  ob.className='dbtn pbtn';
-  ob.innerHTML='<div class="dav" style="background:#455A64">🗂️</div><span>Jan (Kantoor)</span>';
+  ob.className='dbtn';
+  ob.innerHTML='<div class="dav" style="background:#455A64">🗂️</div><span>Jan</span>';
   ob.onclick=()=>openPin('office');
   grid.appendChild(ob);
 
-  // Pierre (Terreinbestuurder) — a supervisory role now, not just a driver,
-  // so he gets a full-width button like Bestuur/Jan, right below Jan.
+  // Pierre (Terreinbestuurder) — a supervisory role now, not just a driver.
   const prb=document.createElement('button');
-  prb.className='dbtn pbtn';
-  prb.innerHTML=`<div class="dav" style="background:${DRIVERS.pierre.color}">${DRIVERS.pierre.icon}</div><span>Pierre (Terreinbestuurder)</span>`;
+  prb.className='dbtn';
+  prb.innerHTML=`<div class="dav" style="background:${DRIVERS.pierre.color}">${DRIVERS.pierre.icon}</div><span>Pierre</span>`;
   prb.onclick=()=>openPin('pierre');
   grid.appendChild(prb);
 
-  // Drivers (Pierre excluded here — he has his own big button above, though
+  // Melizza — new admin profile, empty for now beyond login.
+  const mb=document.createElement('button');
+  mb.className='dbtn';
+  mb.innerHTML='<div class="dav" style="background:#AD1457">🌷</div><span>Melizza</span>';
+  mb.onclick=()=>openPin('melizza');
+  grid.appendChild(mb);
+
+  // Drivers (Pierre excluded here — he has his own button above, though
   // he still keeps his normal driver tabs once logged in)
   Object.entries(DRIVERS).forEach(([id,d])=>{
     if(id==='pierre') return;
@@ -1801,7 +1811,7 @@ function openPin(who){
   document.getElementById('sel').style.display='none';
   document.getElementById('pin-wrap').style.display='flex';
   document.getElementById('pin-who').textContent=
-    who==='parents'?'👑 Bestuur':who==='office'?'🗂️ Jan (Kantoor)':DRIVERS[who].name;
+    who==='parents'?'👑 Bestuur':who==='office'?'🗂️ Jan (Kantoor)':who==='melizza'?'🌷 Melizza':DRIVERS[who].name;
   const inp=document.getElementById('pin-in');
   inp.value='';
   document.getElementById('pin-err').innerHTML='';
@@ -1823,6 +1833,7 @@ document.getElementById('pin-go').onclick=()=>{
   const driverMatch=targetDriver && val===(targetDriver.password!==undefined?targetDriver.password:targetDriver.pin);
   if(PIN_TARGET==='parents' && val===PARENT_PIN){ loginParent(); }
   else if(PIN_TARGET==='office' && val===OFFICE_PIN){ loginOffice(); }
+  else if(PIN_TARGET==='melizza' && val===MELIZZA_PIN){ loginMelizza(); }
   else if(driverMatch){ loginDriver(PIN_TARGET); }
   else {
     document.getElementById('pin-err').innerHTML=
@@ -1944,17 +1955,58 @@ async function loginOffice(){
   updateMaintenanceReminderBanner();
 }
 
+// Melizza — payments/statements/kleinkas admin. Reuses the same Bestuur
+// screen (Ledger + Boekhouding already are exactly her job), just with the
+// route/quotes/history tabs and wages sub-tab hidden via applyRoleTabs()/
+// renderPayroll(). Deliberately lighter than Bestuur/Jan's login: she
+// doesn't touch routes, so there's no per-driver progress fetch, and since
+// she doesn't need live updates she gets a manual refresh button instead
+// of the polling loop that keeps Bestuur/Jan's screen auto-fresh.
+async function loginMelizza(){
+  S.isOffice=false; S.isMelizza=true;
+  document.getElementById('p-date').textContent=formatToday();
+  document.querySelector('#s-parent h2').textContent='Melizza';
+  document.querySelector('#s-parent .tbi').textContent='🌷';
+  show('parent');
+  document.getElementById('p-content').innerHTML='<div class="loadmsg">Laai … / Loading…</div>';
+  if(!CACHE.ready) await hydrateCache();
+  await ensureSchedule();
+  await ensureLedgerSeeded();
+  checkStorageHealth();
+  applyRoleTabs();
+  renderParentTab('ledger');
+}
+
+async function refreshMelizzaData(){
+  const btn=document.getElementById('p-refresh');
+  if(btn) btn.disabled=true;
+  try{
+    await refreshAllData();
+    await renderParentTab(S.parentTab||'ledger');
+    toast('✓ Bygewerk / Refreshed');
+  } finally {
+    if(btn) btn.disabled=false;
+  }
+}
+document.getElementById('p-refresh').onclick=()=>refreshMelizzaData();
+
 // Shows/hides bookkeeping-only tabs depending on role.
 // Office (Jan) may see routes/pricing/quotes/history for daily budgeting,
 // but never invoices, statements, or client account balances (ledger) —
 // those stay with Bestuur only.
 function applyRoleTabs(){
-  const restricted = ['statements','ledger','payroll'];
+  const restricted = S.isMelizza
+    // Melizza: payments/statements/kleinkas only — no routes, quotes, or history.
+    ? ['overview','quotes','history']
+    // Jan (office): everything except the finance-only tabs.
+    : ['statements','ledger','payroll'];
   document.querySelectorAll('#p-tabs .tab').forEach(t=>{
     const isRestricted = restricted.includes(t.dataset.tab);
-    t.style.display = (S.isOffice && isRestricted) ? 'none' : '';
+    t.style.display = ((S.isOffice||S.isMelizza) && isRestricted) ? 'none' : '';
   });
   applyCompactTabs('p-tabs');
+  const refreshBtn=document.getElementById('p-refresh');
+  if(refreshBtn) refreshBtn.style.display = S.isMelizza ? '' : 'none';
 }
 
 function formatToday(){
@@ -2196,8 +2248,12 @@ function renderYMAccordion(host, items, dateGetter, amountGetter, openYears, sel
 }
 async function renderPayroll(ct){
   await saveOpenPayrollGroupIfAny();
+  // Melizza handles payments/statements/kleinkas, not wages/loans — Lone
+  // stays Bestuur/Jan-only.
+  if(S.isMelizza && BK_SUBTAB==='lone') BK_SUBTAB='inkomste';
   const tabs=[['lone','💰','Lone'],['inkomste','📈','Inkomste'],
-              ['uitgawes','🧾','Uitgawes'],['kleinkas','💵','Kleinkas'],['bank','🏦','Bank'],['fakture','🔧','Fakture']];
+              ['uitgawes','🧾','Uitgawes'],['kleinkas','💵','Kleinkas'],['bank','🏦','Bank'],['fakture','🔧','Fakture']]
+              .filter(([id])=>!(S.isMelizza && id==='lone'));
   ct.innerHTML=`
     <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">
       ${tabs.map(([id,icon,label])=>`
@@ -4191,7 +4247,7 @@ async function loanLedgerAdd(nameEnc,sign){
 
 function logout(){
   stopPolling();
-  S.driver=null; S.route=[]; S.expanded=null; S.isOffice=false;
+  S.driver=null; S.route=[]; S.expanded=null; S.isOffice=false; S.isMelizza=false;
   updateMaintenanceReminderBanner();
   document.querySelector('#s-parent h2').textContent='Bestuur';
   document.querySelector('#s-parent .tbi').textContent='👑';
@@ -6415,6 +6471,7 @@ document.querySelectorAll('#p-tabs .tab').forEach(t=>{
 async function renderParentTab(tab){
   await saveOpenPayrollGroupIfAny();
   if(S.isOffice && (tab==='ledger' || tab==='payroll')) tab='overview';
+  if(S.isMelizza && (tab==='overview' || tab==='quotes' || tab==='history')) tab='ledger';
   S.parentTab=tab;
   document.querySelectorAll('#p-tabs .tab').forEach(t=>t.classList.toggle('on',t.dataset.tab===tab));
   const c=document.getElementById('p-content');
