@@ -8206,15 +8206,22 @@ function ledgerFilterActive(){
 }
 async function renderLedger(ct){
   const led=getLedger();
-  const clients=Object.entries(led).sort((a,b)=>b[1].balance-a[1].balance);
+  const clients=Object.entries(led).sort((a,b)=>(a[1].address||'').localeCompare(b[1].address||''));
 
-  const addBtn=`<button class="btn btn-blue" onclick="openClientForm()" style="margin-bottom:12px">＋ Nuwe kliënt / New client</button>`;
+  // Small action-button row — new client + the housekeeping tools that
+  // used to sit tucked away at the bottom, now all together up top.
+  const topRow=`<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+    <button class="btn btn-blue" style="flex:1;min-width:120px;padding:9px 6px;font-size:.76rem" onclick="openClientForm()">＋ Nuwe kliënt</button>
+    <button class="btn-sec btn" style="flex:1;min-width:120px;padding:9px 6px;font-size:.76rem" onclick="showMergeClientsModal()">🔀 Merge kliënte</button>
+    <button class="btn-sec btn" style="flex:1;min-width:120px;padding:9px 6px;font-size:.76rem" onclick="showAgeAnalysisModal()">📊 Age Analysis</button>
+    <button class="btn-sec btn" style="flex:1;min-width:120px;padding:9px 6px;font-size:.76rem" onclick="reconcileAllLedgers()">🔧 Herstel rekeninge</button>
+  </div>`;
 
   if(clients.length===0){
-    ct.innerHTML=addBtn+'<div class="empty"><div class="ei">📒</div><h3>Geen kliënte nog</h3><p>Kliënte verskyn hier sodra fakture gegenereer word.</p></div>';
+    ct.innerHTML=topRow+'<div class="empty"><div class="ei">📒</div><h3>Geen kliënte nog</h3><p>Kliënte verskyn hier sodra fakture gegenereer word.</p></div>';
     return;
   }
-  ct.innerHTML=addBtn;
+  ct.innerHTML=topRow;
 
   // Cash a driver logged for a past job, not tied to any garden — shown
   // here so Bestuur can match it to the real client's account. Stays
@@ -8235,64 +8242,37 @@ async function renderLedger(ct){
     ct.appendChild(pc);
   }
 
-  // Kliënte (client-first, day-to-day use) vs Volgens maand (the old State
-  // tab's monthly browse/bulk-send view) — everything that used to live on
-  // its own top-nav tab is still here, just one tap away instead of a
-  // separate tab to hunt for.
-  const viewToggle=el('div');
-  viewToggle.style.cssText='display:flex;gap:6px;margin-bottom:10px';
-  viewToggle.innerHTML=`
-    <button class="tab ${LEDGER_VIEW==='clients'?'on':''}" style="flex:1" onclick="setLedgerView('clients')">👤 Kliënte</button>
-    <button class="tab ${LEDGER_VIEW==='months'?'on':''}" style="flex:1" onclick="setLedgerView('months')">📅 Volgens maand</button>`;
-  ct.appendChild(viewToggle);
-
-  if(LEDGER_VIEW==='months'){
-    const wrap=el('div'); wrap.id='month-browser-wrap';
-    ct.appendChild(wrap);
-    await renderMonthBrowser(wrap);
-    return;
-  }
-
-  // Search
-  const srch=el('input','inp');
-  srch.placeholder='Soek kliënt / Search client…';
-  srch.style.marginBottom='0';
-  srch.value=LEDGER_SEARCH;
-  srch.oninput=()=>{ LEDGER_SEARCH=srch.value; renderLedgerList(ct); };
-  ct.appendChild(srch);
-
   // Filter panel — date range, invoice #, amount range, driver. Applying
-  // any of these switches the list below from "clients sorted by balance"
-  // into "matching invoices, whichever client they belong to" — tapping a
-  // result opens straight into that client's full screen.
+  // any of these switches the list below from "clients A-Z" into
+  // "matching invoices, whichever client they belong to" — tapping a
+  // result opens straight into that client's full screen. Always visible
+  // now (no dropdown to open first) since this is the main way to find
+  // something now that there's no separate search box.
   const f=LEDGER_FILTER;
-  const filterDet=el('details');
-  filterDet.style.cssText='margin:8px 0';
-  filterDet.open=ledgerFilterActive();
-  filterDet.innerHTML=`
-    <summary style="cursor:pointer;font-size:.8rem;color:var(--t2);font-weight:700;padding:6px 0">🔍 Filtreer fakture ${ledgerFilterActive()?'<span style="color:var(--g8)">· aktief</span>':''}</summary>
-    <div style="border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-top:6px">
-      <div style="display:flex;gap:6px;margin-bottom:6px">
-        <input class="inp" type="date" id="lf-from" value="${f.from}" placeholder="Vanaf" style="flex:1;padding:7px;font-size:.8rem">
-        <input class="inp" type="date" id="lf-to" value="${f.to}" placeholder="Tot" style="flex:1;padding:7px;font-size:.8rem">
-      </div>
-      <div style="display:flex;gap:6px;margin-bottom:6px">
-        <input class="inp" id="lf-invnum" value="${f.invNum}" placeholder="Faktuur # (bv. DNT-1234)" style="flex:1;padding:7px;font-size:.8rem">
-        <select class="inp" id="lf-driver" style="flex:1;padding:7px;font-size:.8rem">
-          <option value="">Alle bestuurders</option>
-          ${Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}" ${f.driverId===id?'selected':''}>${d.name}</option>`).join('')}
-        </select>
-      </div>
-      <div style="display:flex;gap:6px;margin-bottom:8px">
-        <input class="inp" type="number" id="lf-amtmin" value="${f.amtMin}" placeholder="Bedrag min (R)" style="flex:1;padding:7px;font-size:.8rem">
-        <input class="inp" type="number" id="lf-amtmax" value="${f.amtMax}" placeholder="Bedrag max (R)" style="flex:1;padding:7px;font-size:.8rem">
-      </div>
-      <div style="display:flex;gap:8px">
-        <button class="btn" style="flex:1;background:var(--g8);font-size:.8rem" onclick="applyLedgerFilter()">Filtreer</button>
-        <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="resetLedgerFilter()">Herstel</button>
-      </div>
+  const filterDiv=el('div');
+  filterDiv.style.cssText='border:1px solid var(--brd);border-radius:var(--r);padding:10px;margin-bottom:10px';
+  filterDiv.innerHTML=`
+    <div style="font-size:.8rem;color:var(--t2);font-weight:700;margin-bottom:8px">🔍 Filtreer fakture ${ledgerFilterActive()?'<span style="color:var(--g8)">· aktief</span>':''}</div>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <input class="inp" type="date" id="lf-from" value="${f.from}" placeholder="Vanaf" style="flex:1;padding:7px;font-size:.8rem">
+      <input class="inp" type="date" id="lf-to" value="${f.to}" placeholder="Tot" style="flex:1;padding:7px;font-size:.8rem">
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <input class="inp" id="lf-invnum" value="${f.invNum}" placeholder="Faktuur # (bv. DNT-1234)" style="flex:1;padding:7px;font-size:.8rem">
+      <select class="inp" id="lf-driver" style="flex:1;padding:7px;font-size:.8rem">
+        <option value="">Alle bestuurders</option>
+        ${Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}" ${f.driverId===id?'selected':''}>${d.name}</option>`).join('')}
+      </select>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <input class="inp" type="number" id="lf-amtmin" value="${f.amtMin}" placeholder="Bedrag min (R)" style="flex:1;padding:7px;font-size:.8rem">
+      <input class="inp" type="number" id="lf-amtmax" value="${f.amtMax}" placeholder="Bedrag max (R)" style="flex:1;padding:7px;font-size:.8rem">
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn" style="flex:1;background:var(--g8);font-size:.8rem" onclick="applyLedgerFilter()">Filtreer</button>
+      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="resetLedgerFilter()">Herstel</button>
     </div>`;
-  ct.appendChild(filterDet);
+  ct.appendChild(filterDiv);
 
   const lbl=el('div','divlbl'); lbl.id='ledger-count';
   ct.appendChild(lbl);
@@ -8301,15 +8281,6 @@ async function renderLedger(ct){
   ct.appendChild(listWrap);
 
   renderLedgerList(ct);
-
-  // Tucked away at the bottom, small — not something used often.
-  const bottomRow=el('div');
-  bottomRow.style.cssText='display:flex;gap:14px;justify-content:center;margin-top:14px';
-  bottomRow.innerHTML=`
-    <button onclick="showMergeClientsModal()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">🔀 Merge kliënte</button>
-    <button onclick="showAgeAnalysisModal()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">📊 Age Analysis</button>
-    <button onclick="reconcileAllLedgers()" style="background:none;border:none;color:var(--t3);font-size:.68rem;font-weight:700;cursor:pointer">🔧 Herstel alle rekeninge</button>`;
-  ct.appendChild(bottomRow);
 }
 function setLedgerView(v){
   LEDGER_VIEW=v;
@@ -8539,7 +8510,7 @@ async function reconcileAllLedgers(){
 function renderLedgerList(ct){
   if(ledgerFilterActive()){ renderLedgerFilteredInvoices(ct); return; }
   const led=getLedger();
-  const clients=Object.entries(led).sort((a,b)=>b[1].balance-a[1].balance);
+  const clients=Object.entries(led).sort((a,b)=>(a[1].address||'').localeCompare(b[1].address||''));
   const q=LEDGER_SEARCH.toLowerCase();
   const filtered=q?clients.filter(([k,c])=>
     c.address.toLowerCase().includes(q)||
