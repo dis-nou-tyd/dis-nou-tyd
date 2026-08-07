@@ -938,6 +938,19 @@ async function ensureWorkerRosterSeeded(){
   let changed = !existing;
   Object.entries(DRIVERS).forEach(([id,d])=>{
     if(merged[id]===undefined){ merged[id]=(d.workers||[]).slice(); changed=true; }
+    else{
+      // A name added to DRIVERS[id].workers after this driver's roster was
+      // already seeded once (e.g. Darryl added to Johan's crew later)
+      // never makes it into the live roster on its own — the block above
+      // only fires the very first time a driver has no roster doc at all.
+      // Without this, anyone added to the source list afterwards stays
+      // invisible everywhere the live roster drives things — Spanne,
+      // Dagstaat, and Payroll's Leen-boek — until someone notices and
+      // re-adds them by hand.
+      (d.workers||[]).forEach(name=>{
+        if(!merged[id].includes(name)){ merged[id].push(name); changed=true; }
+      });
+    }
   });
   CACHE.workerRoster=merged;
   if(changed) await sSet('worker_roster', merged);
@@ -5665,7 +5678,7 @@ async function shareInspectionPDF(monthKey){
 let MASJ_DATA_CACHE={};
 let MASJ_OPEN_DRIVERS=new Set();
 const MASJ_DRIVER_KEYS=['jasper','johan','nickey','gordon','pierre'];
-const MASJIEN_TYPE_LABELS={brushcutter:'Brushcutter',kettingsaag:'Kettingsaag',blower:'Blower',hedgetrimmer:'Heiningsnyer',grassnyer:'Grassnyer'};
+const MASJIEN_TYPE_LABELS={brushcutter:'Brushcutter',kettingsaag:'Kettingsaag',blower:'Blower',hedgetrimmer:'Hedgetrimmer',grassnyer:'Grassnyer'};
 const MASJIEN_TYPES_ORDER=['brushcutter','kettingsaag','blower','hedgetrimmer','grassnyer'];
 const MASJ_LITER_LABELS={vol:'Vol','3/4':'3/4',half:'Half','1/4':'1/4'};
 const MASJ_LITER_ORDER=['vol','3/4','half','1/4'];
@@ -5749,7 +5762,7 @@ async function renderMasjieneTab(ct){
       <p>${monthLabelForYM(curMK)} · een lys per bakkie — tik die datum/tyd-blokkies om vinnig in te vul</p>
     </div>
     <div class="ovgrid">
-      <div class="ovc"><div class="v">${combined.twoStroke.toFixed(2)} L</div><div class="l">2-TAK PETROL (MENGSEL)</div></div>
+      <div class="ovc"><div class="v">${combined.twoStroke.toFixed(2)} L</div><div class="l">2-STROKE PETROL (MENGSEL)</div></div>
       <div class="ovc"><div class="v">${combined.skoon.toFixed(2)} L</div><div class="l">SKOON PETROL (GRASSNYERS)</div></div>
     </div>
     <div id="masj-drivers"></div>
@@ -5797,7 +5810,7 @@ async function renderMasjieneTab(ct){
       </div>
       <div style="padding:9px 12px;border-top:1px solid var(--brd);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
         <button class="btn-sec btn" style="width:auto;padding:8px 16px;font-size:.8rem" onclick="masjAddRow('${dk}')">＋ Voeg ry by</button>
-        <div style="font-size:.76rem;font-weight:700;color:var(--g8)">2-tak: ${totals.twoStroke.toFixed(2)} L · Skoon: ${totals.skoon.toFixed(2)} L</div>
+        <div style="font-size:.76rem;font-weight:700;color:var(--g8)">2-stroke: ${totals.twoStroke.toFixed(2)} L · Skoon: ${totals.skoon.toFixed(2)} L</div>
       </div>`;
     holder.appendChild(box);
   });
@@ -5883,7 +5896,7 @@ async function masjCycleCheck(driverKey, idx, field){
   if(ok) renderMasjieneTab(document.getElementById('d-content'));
 }
 // One combined PDF per month — every driver's list one after another,
-// each with its own 2-tak/skoon subtotal, then a grand total for the
+// each with its own 2-stroke/skoon subtotal, then a grand total for the
 // whole month across all bakkies. This is also the ONLY way to see a
 // past month's list again once it's rolled over, per how the live tab
 // works above.
@@ -5947,7 +5960,7 @@ function buildMasjienePDF(monthKey, data){
     });
     doc.setDrawColor(220,220,220); doc.line(15,y-1,195,y-1); y+=4;
     doc.setFont('helvetica','bold'); doc.setFontSize(8.5); doc.setTextColor(20,20,20);
-    doc.text(`Totaal — 2-tak: ${driverTwoStroke.toFixed(2)} L · Skoon: ${driverSkoon.toFixed(2)} L`,15,y); y+=10;
+    doc.text(`Totaal — 2-stroke: ${driverTwoStroke.toFixed(2)} L · Skoon: ${driverSkoon.toFixed(2)} L`,15,y); y+=10;
 
     grandTwoStroke+=driverTwoStroke; grandSkoon+=driverSkoon;
   });
@@ -5955,7 +5968,7 @@ function buildMasjienePDF(monthKey, data){
   if(y>260){ doc.addPage(); y=20; }
   doc.setDrawColor(27,94,32); doc.setLineWidth(0.6); doc.line(15,y,195,y); y+=8;
   doc.setFont('helvetica','bold'); doc.setFontSize(11); doc.setTextColor(27,94,32);
-  doc.text(`MAAND TOTAAL — 2-tak: ${grandTwoStroke.toFixed(2)} L · Skoon petrol: ${grandSkoon.toFixed(2)} L`,15,y);
+  doc.text(`MAAND TOTAAL — 2-stroke: ${grandTwoStroke.toFixed(2)} L · Skoon petrol: ${grandSkoon.toFixed(2)} L`,15,y);
 
   return doc.output('blob');
 }
