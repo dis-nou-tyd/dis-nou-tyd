@@ -2339,7 +2339,6 @@ const EXPENSE_CATEGORIES=[
   'Salarisse (ekstra)','Verlof Uitbetaling','Jaareinde Bonusse','Ander'
 ];
 
-let KLEINKAS_MONTH_OFFSET=0;
 let KLEINKAS_FORM_TYPE='in';
 // A simple running ledger for the petty cash tin — money In (e.g. cash
 // collected from clients that gets kept as float, or a bank withdrawal to
@@ -2348,22 +2347,28 @@ let KLEINKAS_FORM_TYPE='in';
 // standalone for now — not automatically linked to invoice cashPaid
 // amounts, since how that reconciliation should actually work hasn't been
 // decided yet; this just gives a place to log it manually either way.
+//
+// The transaction history itself only ever exists as a per-month PDF
+// (see shareKleinkasMonthPDF) rather than an ever-growing on-screen list —
+// picking a month from the dropdown below generates that month's logbook
+// on demand. There's deliberately no delete here any more either: a wrong
+// entry gets corrected with an offsetting entry (same as the client
+// ledger's own "Regstelling" approach) so the log stays a true record of
+// what actually happened, rather than something that can be silently
+// edited after the fact.
 async function renderKleinkas(ct){
-  const mr=monthRange(KLEINKAS_MONTH_OFFSET);
   const all=getKleinkas().slice().sort((a,b)=> a.date===b.date ? (a.ts||0)-(b.ts||0) : a.date.localeCompare(b.date));
   const balance=all.reduce((s,e)=> s + (e.type==='in'?e.amount:-e.amount), 0);
-  const monthEntries=all.filter(e=>dateInRange(e.date, mr.from, mr.to));
+
+  // Every month that actually has an entry, newest first, grouped by year
+  // for the dropdown.
+  const months=[...new Set(all.map(e=>e.date.slice(0,7)))].sort((a,b)=>b.localeCompare(a));
+  const years=[...new Set(months.map(ym=>ym.slice(0,4)))];
 
   ct.innerHTML=`
     <div style="background:var(--g1);border:2px solid var(--g2);border-radius:var(--r);padding:16px;margin-bottom:12px;text-align:center">
       <div style="font-size:.78rem;color:var(--t2);font-weight:700">HUIDIGE KLEINKAS SALDO</div>
       <div style="font-size:1.8rem;font-weight:800;color:${balance<0?'var(--red)':'var(--g8)'}">R${balance.toFixed(2)}</div>
-    </div>
-
-    <div style="display:flex;gap:8px;margin-bottom:12px">
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="KLEINKAS_MONTH_OFFSET--;renderKleinkasInto()">← Vorige maand</button>
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem" onclick="KLEINKAS_MONTH_OFFSET=0;renderKleinkasInto()">Hierdie maand</button>
-      <button class="btn-sec btn" style="flex:1;font-size:.8rem;${KLEINKAS_MONTH_OFFSET>=0?'opacity:.4;pointer-events:none':''}" onclick="KLEINKAS_MONTH_OFFSET++;renderKleinkasInto()">Volgende →</button>
     </div>
 
     <div class="vcard" style="margin-bottom:12px">
@@ -2384,45 +2389,81 @@ async function renderKleinkas(ct){
       <button class="btn" style="margin-top:10px" onclick="submitKleinkasEntry()">Stoor</button>
     </div>
 
-    <div class="divlbl">TRANSAKSIES — ${mr.label} (${monthEntries.length})</div>
-    <div id="kk-list"></div>`;
+    <div class="divlbl">KLEINKAS-BOEK / MONTHLY LOG</div>
+    ${months.length===0?'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:16px 0">Geen kleinkas transaksies nog nie.</p>':`
+    <select class="inp" id="kk-month-select" onchange="if(this.value){shareKleinkasMonthPDF(this.value);this.value='';}">
+      <option value="">📄 Kies maand — genereer PDF / Choose month — generate PDF</option>
+      ${years.map(y=>`<optgroup label="${y}">
+        ${months.filter(ym=>ym.startsWith(y)).map(ym=>`<option value="${ym}">${monthLabelForYM(ym)}</option>`).join('')}
+      </optgroup>`).join('')}
+    </select>`}`;
 
   highlightKleinkasTypeButtons();
+}
+// Generates that month's kleinkas logbook — opening balance carried over
+// from every entry before the month, every entry within it with a running
+// balance, month totals, and the closing balance — as a PDF opened in a
+// new tab, same pattern as the Age Analysis / income reports.
+async function shareKleinkasMonthPDF(ym){
+  const all=getKleinkas().slice().sort((a,b)=> a.date===b.date ? (a.ts||0)-(b.ts||0) : a.date.localeCompare(b.date));
+  const [y,m]=ym.split('-').map(Number);
+  const from=ym+'-01';
+  const lastDay=new Date(y,m,0).getDate();
+  const to=ym+'-'+String(lastDay).padStart(2,'0');
 
-  const listEl=document.getElementById('kk-list');
-  if(monthEntries.length===0){
-    listEl.innerHTML='<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:16px 0">Geen kleinkas transaksies hierdie maand nie.</p>';
-    return;
+  let opening=0;
+  all.forEach(e=>{ if(e.date<from) opening += (e.type==='in'?e.amount:-e.amount); });
+
+  const monthEntries=all.filter(e=>e.date>=from && e.date<=to);
+  let running=opening, totalIn=0, totalOut=0;
+  const rows=monthEntries.map(e=>{
+    running += (e.type==='in'?e.amount:-e.amount);
+    if(e.type==='in') totalIn+=e.amount; else totalOut+=e.amount;
+    return {...e, runningAfter:running};
+  });
+  const closing=running;
+
+  const {jsPDF}=window.jspdf;
+  const doc=new jsPDF();
+  let yy=pdfLetterhead(doc,18);
+  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(20,20,20);
+  doc.text('KLEINKAS — '+monthLabelForYM(ym),15,yy); yy+=8;
+  doc.setFont('helvetica','normal'); doc.setFontSize(10);
+  doc.text('Openingsaldo: R'+opening.toFixed(2),15,yy); yy+=6;
+  doc.text('Totaal In: R'+totalIn.toFixed(2)+'   ·   Totaal Uit: R'+totalOut.toFixed(2),15,yy); yy+=6;
+  doc.setFont('helvetica','bold');
+  doc.text('Sluitingsaldo: R'+closing.toFixed(2),15,yy); yy+=10;
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(8.5);
+  doc.text('Datum',15,yy); doc.text('Beskrywing',40,yy);
+  doc.text('Bedrag',165,yy,{align:'right'}); doc.text('Saldo',195,yy,{align:'right'}); yy+=5;
+  doc.setDrawColor(200,200,200); doc.line(15,yy,195,yy); yy+=5;
+  doc.setFont('helvetica','normal');
+  if(rows.length===0){
+    doc.setTextColor(120,120,120);
+    doc.text('Geen transaksies hierdie maand nie.',15,yy); yy+=6;
+    doc.setTextColor(20,20,20);
   }
+  rows.forEach(e=>{
+    if(yy>270){ doc.addPage(); yy=20; }
+    const desc=e.category+(e.isDiesel?' ⛽':'')+(e.desc?' — '+e.desc:'');
+    const descLines=doc.splitTextToSize(desc,120);
+    doc.setTextColor(20,20,20);
+    doc.text(e.date,15,yy);
+    doc.text(descLines,40,yy);
+    doc.setTextColor(...(e.type==='in'?[20,110,50]:[180,30,30]));
+    doc.text((e.type==='in'?'+':'-')+'R'+e.amount.toFixed(2),165,yy,{align:'right'});
+    doc.setTextColor(20,20,20);
+    doc.text('R'+e.runningAfter.toFixed(2),195,yy,{align:'right'});
+    const rowBottom=yy+(descLines.length-1)*4.2+2.5;
+    doc.setDrawColor(230,230,230);
+    doc.line(15,rowBottom,195,rowBottom);
+    yy=rowBottom+3;
+  });
 
-  // Running balance is computed over the FULL history (not just this
-  // month's filtered slice), so the SALDO column stays accurate no matter
-  // which month you're looking at.
-  let running=0;
-  const runningByEntry=new Map();
-  all.forEach(e=>{ running += (e.type==='in'?e.amount:-e.amount); runningByEntry.set(e, running); });
-
-  listEl.innerHTML=`
-    <div style="background:var(--card);border-radius:12px;border:2px solid var(--brd);overflow:hidden">
-      <div style="display:grid;grid-template-columns:65px 1fr 75px 65px 26px;padding:8px 12px;background:var(--bg);border-bottom:1px solid var(--brd)">
-        <span style="font-size:.66rem;font-weight:800;color:var(--t2)">DATUM</span>
-        <span style="font-size:.66rem;font-weight:800;color:var(--t2);padding:0 6px">BESKRYWING</span>
-        <span style="font-size:.66rem;font-weight:800;color:var(--t2);text-align:right">BEDRAG</span>
-        <span style="font-size:.66rem;font-weight:800;color:var(--t2);text-align:right">SALDO</span>
-        <span></span>
-      </div>
-      ${monthEntries.slice().reverse().map(e=>{
-        const bal=runningByEntry.get(e);
-        return `<div style="display:grid;grid-template-columns:65px 1fr 75px 65px 26px;padding:9px 12px;border-bottom:1px solid var(--brd);font-size:.78rem;align-items:center">
-          <span style="color:var(--t2)">${e.date}</span>
-          <span style="padding:0 6px">${e.category}${e.isDiesel?' ⛽':''}${e.desc?' — '+e.desc:''}</span>
-          <span style="text-align:right;font-weight:700;color:${e.type==='in'?'var(--g8)':'var(--red)'}">${e.type==='in'?'+':'-'}R${e.amount.toFixed(2)}</span>
-          <span style="text-align:right;font-weight:700;color:${bal<0?'var(--red)':'var(--t2)'}">R${bal.toFixed(2)}</span>
-          <button onclick="deleteKleinkasEntry('${e.id}')" title="Verwyder"
-            style="width:auto;padding:2px 5px;font-size:.66rem;color:var(--red);background:none;border:1px solid var(--brd);border-radius:100px">✕</button>
-        </div>`;
-      }).join('')}
-    </div>`;
+  const blob=doc.output('blob');
+  await shareOrDownloadPDF(blob, `Kleinkas_${ym}.pdf`, 'Kleinkas', monthLabelForYM(ym));
+  toast('📄 Kleinkas PDF gereed');
 }
 function setKleinkasFormType(type){
   KLEINKAS_FORM_TYPE=type;
@@ -2522,9 +2563,6 @@ async function renderIncome(ct){
       </div>
       </div>
     </details>
-    <div style="background:#FFF8E1;border:1px solid #FFE082;border-radius:10px;padding:10px 12px;margin-bottom:10px;font-size:.78rem;color:#856404">
-      💡 'n Faktuur is nie inkomste totdat dit werklik betaal is nie — via kontant op die dag, of deur bankstate te verwerk (Boekhouding → Bank).
-    </div>
     <div class="ovgrid">
       <div class="ovc"><div class="v" style="color:var(--g8)">R${paidTotal.toFixed(0)}</div><div class="l">💰 Inkomste (werklik ontvang)</div></div>
       <div class="ovc"><div class="v" style="color:var(--t3)">R${total.toFixed(0)}</div><div class="l">Gefaktureer <span style="font-weight:400">(nog nie betaal nie)</span></div></div>
@@ -7452,23 +7490,16 @@ function makeInvCard(inv){
       </div>
     </div>
     <div class="inv-actions">
-      <button class="inv-wa" onclick="shareInvoicePDF('${inv.id}')" style="background:var(--g8);flex:1">
-        📄 Stuur Faktuur (PDF)
-      </button>
-      <button onclick="viewInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-        👁 Bekyk
-      </button>
-      <button onclick="downloadInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
-        ⬇️
+      <button onclick="shareInvoicePDF('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2);flex:1">
+        📄 Open
       </button>
       <button onclick="showEditInvoiceModal('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2)">
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--t2);flex:1">
         ✏️ Wysig
       </button>
       <button onclick="confirmDeleteInvoice('${inv.id}')" style="background:var(--bg);border:2px solid var(--brd);
-              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--red)">
+              border-radius:100px;padding:9px 14px;font-size:.82rem;font-weight:700;color:var(--red);flex:1">
         🗑
       </button>
     </div>`;
@@ -8260,7 +8291,7 @@ async function renderLedger(ct){
     <div style="display:flex;gap:6px;margin-bottom:6px">
       <input class="inp" id="lf-invnum" value="${f.invNum}" placeholder="Faktuur # (bv. DNT-1234)" style="flex:1;padding:7px;font-size:.8rem">
       <select class="inp" id="lf-driver" style="flex:1;padding:7px;font-size:.8rem">
-        <option value="">Alle bestuurders</option>
+        <option value="">Alle drywers</option>
         ${Object.entries(DRIVERS).map(([id,d])=>`<option value="${id}" ${f.driverId===id?'selected':''}>${d.name}</option>`).join('')}
       </select>
     </div>
@@ -8412,14 +8443,9 @@ function showEditClientModal(encKey){
     <div class="mhdr">✏️ Wysig kliënt
       <button class="mclose" onclick="document.getElementById('editcl-modal').remove()">✕</button>
     </div>
-    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
-      'n Verandering hier word op elke bestaande faktuur en staat vir hierdie kliënt reggemaak — nie net op nuwes vorentoe nie.
-    </p>
     <div><div class="flbl" style="margin-bottom:5px">Adres / Address *</div>
-      <p style="font-size:.74rem;color:var(--t2);margin:0 0 4px">Shift + Enter vir 'n nuwe reël, langer adresse / Shift + Enter for a new line, longer addresses.</p>
       <textarea class="inp" id="ecl-addr" rows="2" style="resize:vertical;font-family:inherit" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();submitEditClient('${encKey}');}">${c.address.replace(/</g,'&lt;')}</textarea></div>
     <div><div class="flbl" style="margin-bottom:5px">Naam (opsioneel) / Name (optional)</div>
-      <p style="font-size:.74rem;color:var(--t2);margin:0 0 4px">Vir besighede wat 'n volledige naam/adres op fakture en state moet wys — druk Enter vir 'n nuwe reël.</p>
       <textarea class="inp" id="ecl-name" rows="2" style="resize:vertical;font-family:inherit">${(c.name||'').replace(/</g,'&lt;')}</textarea></div>
     <button class="btn" onclick="submitEditClient('${encKey}')">✓ Stoor / Save</button>
     <button class="btn btn-sec" onclick="document.getElementById('editcl-modal').remove()">Kanselleer</button>
@@ -8564,7 +8590,7 @@ function showMergeClientsModal(){
       <button class="mclose" onclick="document.getElementById('merge-clients-modal').remove()">✕</button>
     </div>
     <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">
-      Vir wanneer dieselfde kliënt per ongeluk twee rekeninge het (bv. adres effens anders gespel). Alle fakture, transaksies en saldo van die eerste kliënt skuif na die tweede — dan word die eerste een verwyder. Kan nie ontdoen word nie.
+      Alle fakture, transaksies en saldo van die eerste kliënt skuif na die tweede — dan word die eerste een verwyder. Kan nie ontdoen word nie.
     </p>
     <div><div class="flbl" style="margin-bottom:5px">Skuif VAN (word verwyder) / Merge FROM (deleted)</div>
       <select class="inp" id="mrg-from"><option value="">— Kies kliënt —</option>${options}</select></div>
@@ -8656,7 +8682,7 @@ function showClientLedger(key,c){
   });
 
   bg.innerHTML=`<div class="modal">
-    <div class="mhdr">${c.address} <button onclick="document.getElementById('ledger-modal').remove();showEditClientModal('${encodeURIComponent(key)}')" title="Wysig kliënt / Edit client" style="background:none;border:none;color:var(--t3);cursor:pointer;font-size:.8rem;vertical-align:middle">✏️</button>
+    <div class="mhdr">${c.address}
       <button class="mclose" onclick="document.getElementById('ledger-modal').remove()">✕</button>
     </div>
     <div style="background:${bal>0?'var(--redp)':'var(--g1)'};border-radius:12px;
@@ -8668,11 +8694,6 @@ function showClientLedger(key,c){
         <div style="font-size:1.4rem;font-weight:900;color:${bal>0?'var(--red)':'var(--g8)'}">
           R${Math.abs(bal).toFixed(2)}
         </div>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:6px">
-        ${bal>0?`<button class="pay-btn" onclick="showPaymentForm('${key}')">+ Betaling</button>`:''}
-        <button class="btn-sec btn" style="padding:6px 12px;font-size:.78rem" onclick="showLedgerCorrection('${key}')">✏️ Regstelling / Correction</button>
-        <button class="btn-sec btn" style="padding:6px 12px;font-size:.78rem" onclick="reconcileClientLedger('${key}')">🔧 Herstel rekening</button>
       </div>
     </div>
     <div class="divlbl">MAANDSTAAT / MONTHLY STATEMENT</div>
@@ -8721,9 +8742,14 @@ function showClientLedger(key,c){
         }).join('');
       })():'<div style="padding:20px;text-align:center;color:var(--t2)">Geen transaksies</div>'}
     </div>
-    <div class="divlbl">FAKTURE (${clientInvoices.length}) <span style="font-weight:400;color:var(--t3)">· gehou tot iemand daarvoor vra</span></div>
+    <div class="divlbl">FAKTURE (${clientInvoices.length})</div>
     <div id="client-inv-cards">${clientInvoices.length?'':'<p style="color:var(--t2);font-size:.85rem;text-align:center;padding:16px 0">Geen fakture nog vir hierdie kliënt nie.</p>'}</div>
     ${clientCreditNotes.length?`<div class="divlbl">🧾 KREDIET NOTAS (${clientCreditNotes.length})</div><div id="client-cn-cards"></div>`:''}
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px">
+      ${bal>0?`<button class="btn-sec btn" style="flex:1;min-width:100px;padding:8px 6px;font-size:.74rem" onclick="showPaymentForm('${key}')">+ Betaling</button>`:''}
+      <button class="btn-sec btn" style="flex:1;min-width:100px;padding:8px 6px;font-size:.74rem" onclick="showLedgerCorrection('${key}')">✏️ Regstelling</button>
+      <button class="btn-sec btn" style="flex:1;min-width:100px;padding:8px 6px;font-size:.74rem" onclick="reconcileClientLedger('${key}')">🔧 Herstel rekening</button>
+    </div>
   </div>`;
   bg.onclick=e=>{if(e.target===bg)bg.remove();};
   document.body.appendChild(bg);
@@ -8954,7 +8980,6 @@ function showAgeAnalysisModal(){
     <div class="mhdr">📊 Age Analysis
       <button class="mclose" onclick="document.getElementById('age-modal').remove()">✕</button>
     </div>
-    <p style="font-size:.82rem;color:var(--t2);margin:-4px 0 8px">Wie skuld wat, en hoe lank reeds</p>
     <div style="border:1px solid var(--brd);border-radius:var(--r);padding:12px;margin-bottom:12px">
       <div style="display:flex;gap:8px">
         <div style="flex:1"><div class="flbl" style="margin-bottom:5px">Tot en met / As of</div>
@@ -8981,61 +9006,7 @@ function applyAgeFilter(){
 async function renderAgeBody(){
   const ct=document.getElementById('age-body');
   if(!ct) return;
-  const led=getLedger();
-  const invs=getInvoices();
-
-  // When a driver filter is set, only clients that driver has actually
-  // invoiced are included — the aging math itself still uses that
-  // client's FULL entry history (a payment doesn't know which driver's
-  // invoice it was for), so amounts stay accurate; the filter only
-  // narrows which clients are shown.
-  const clientKeys=Object.keys(led).filter(key=>{
-    if(!AGE_DRIVER) return true;
-    return invs.some(i=>i.driverId===AGE_DRIVER && invoiceMatchesClient(i,led[key]));
-  });
-
-  const rows=clientKeys.map(key=>{
-    const c=led[key];
-    const buckets=computeClientAging(c, AGE_ASOF);
-    const total=buckets.cur+buckets.d30+buckets.d60+buckets.d90+buckets.d120;
-    return {key,c,buckets,total};
-  }).filter(r=>r.total>0.005).sort((a,b)=>b.total-a.total);
-
-  const grand={cur:0,d30:0,d60:0,d90:0,d120:0,total:0};
-  rows.forEach(r=>{ grand.cur+=r.buckets.cur; grand.d30+=r.buckets.d30; grand.d60+=r.buckets.d60; grand.d90+=r.buckets.d90; grand.d120+=r.buckets.d120; grand.total+=r.total; });
-
-  ct.innerHTML=`
-    <div class="ovgrid" style="margin-bottom:12px">
-      <div class="ovc"><div class="v">R${grand.total.toFixed(0)}</div><div class="l">Totaal uitstaande</div></div>
-      <div class="ovc"><div class="v">${rows.length}</div><div class="l">Kliënte skuld</div></div>
-      <div class="ovc"><div class="v" style="color:${grand.d90+grand.d120>0?'var(--red)':'inherit'}">R${(grand.d90+grand.d120).toFixed(0)}</div><div class="l">90+ dae</div></div>
-    </div>
-    <button class="btn-sec btn" style="margin-bottom:10px;background:var(--g8);color:#fff" onclick="shareAgeAnalysisPDF()">📄 Genereer PDF-verslag</button>
-    ${rows.length===0?'<p style="color:var(--t2);text-align:center;padding:20px 0">Niemand skuld iets tans nie 🎉</p>':`
-    <div style="overflow-x:auto">
-    <div style="min-width:600px">
-      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;padding:8px 10px;background:var(--bg);border-radius:8px 8px 0 0;font-size:.68rem;font-weight:800;color:var(--t2)">
-        <span>KLIËNT</span><span style="text-align:right">0-30</span><span style="text-align:right">31-60</span><span style="text-align:right">61-90</span><span style="text-align:right">91-120</span><span style="text-align:right">120+</span>
-      </div>
-      ${rows.map(r=>`
-        <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;padding:9px 10px;border-bottom:1px solid var(--brd);font-size:.78rem;align-items:center;cursor:pointer" onclick="document.getElementById('age-modal').remove();showClientLedger('${r.key}',getLedger()['${r.key}'])">
-          <span style="font-weight:700">${r.c.address}${r.c.name?' <span style="color:var(--t3);font-weight:400">('+r.c.name+')</span>':''}</span>
-          <span style="text-align:right">${r.buckets.cur>0.005?'R'+r.buckets.cur.toFixed(0):'–'}</span>
-          <span style="text-align:right">${r.buckets.d30>0.005?'R'+r.buckets.d30.toFixed(0):'–'}</span>
-          <span style="text-align:right">${r.buckets.d60>0.005?'R'+r.buckets.d60.toFixed(0):'–'}</span>
-          <span style="text-align:right;${r.buckets.d90>0.005?'color:var(--red);font-weight:700':''}">${r.buckets.d90>0.005?'R'+r.buckets.d90.toFixed(0):'–'}</span>
-          <span style="text-align:right;${r.buckets.d120>0.005?'color:var(--red);font-weight:700':''}">${r.buckets.d120>0.005?'R'+r.buckets.d120.toFixed(0):'–'}</span>
-        </div>`).join('')}
-      <div style="display:grid;grid-template-columns:1.6fr 1fr 1fr 1fr 1fr 1fr;padding:10px;font-size:.8rem;font-weight:800;background:var(--g1)">
-        <span>TOTAAL</span>
-        <span style="text-align:right">R${grand.cur.toFixed(0)}</span>
-        <span style="text-align:right">R${grand.d30.toFixed(0)}</span>
-        <span style="text-align:right">R${grand.d60.toFixed(0)}</span>
-        <span style="text-align:right;color:var(--red)">R${grand.d90.toFixed(0)}</span>
-        <span style="text-align:right;color:var(--red)">R${grand.d120.toFixed(0)}</span>
-      </div>
-    </div>
-    </div>`}`;
+  ct.innerHTML=`<button class="btn" style="background:var(--g8)" onclick="shareAgeAnalysisPDF()">📄 Genereer PDF-verslag</button>`;
 }
 async function shareAgeAnalysisPDF(){
   const led=getLedger();
